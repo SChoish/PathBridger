@@ -188,14 +188,16 @@ def model_mean(x_n, x_0, x_T, eps_pred, n, schedule):
     scale = g2_i / jnp.sqrt(jnp.maximum(bvar_i, 1e-12))
     return x_n + theta_i * r_i + h_drift - scale * eps_pred
 
-def posterior_mean(x_n, x_0, x_T, n, schedule):
-    """Analytic linear-dynamics posterior mean  E[x_{n-1} | x_n, x_0, x_T].
+def posterior_moments(x_n, x_0, x_T, n, schedule):
+    """Analytic linear-dynamics posterior moments for ``x_{n-1} | x_n, x_0, x_T``.
 
     Combines the one-step reverse ``N(mu_back, sigma_back^2)`` with the bridge
-    marginal at step n-1 ``N(bridge_mean_{n-1}, bridge_var_{n-1})`` via Bayes.
+    marginal at step ``n-1`` ``N(bridge_mean_{n-1}, bridge_var_{n-1})`` via Bayes.
 
-    Valid for n in {1, ..., N}.  At n = 1 the bridge variance at step 0 is
-    zero, so the posterior collapses to x_0 as expected.
+    Valid for ``n in {1, ..., N}``. At ``n = 1`` the bridge variance at step 0
+    is zero, so the posterior mean collapses to ``x_0`` and the posterior
+    variance vanishes (the residual scale automatically zeroes at the
+    terminal endpoint in ``exact_residual_model_mean``).
 
     Args:
         x_n: Current bridge state, shape (B, D).
@@ -205,7 +207,8 @@ def posterior_mean(x_n, x_0, x_T, n, schedule):
         schedule: Output of ``make_dynamics_schedule``.
 
     Returns:
-        mu_{n-1} of shape (B, D).
+        mean: shape (B, D).
+        var:  shape (B, 1) -- one-step posterior variance ``Var[x_{n-1}|...]``.
     """
     k = n - 1  # 0-based index into (N,) arrays
     theta_n = schedule['theta'][k][..., None]
@@ -220,7 +223,53 @@ def posterior_mean(x_n, x_0, x_T, n, schedule):
     bw = schedule['bridge_w'][nm1][..., None]
     bmean = bw * x_0 + (1.0 - bw) * x_T
 
-    return (bvar * mu_back + sig_back2 * bmean) / (sig_back2 + bvar + 1e-12)
+    denom = sig_back2 + bvar + 1e-12
+    mean = (bvar * mu_back + sig_back2 * bmean) / denom
+    var = jnp.maximum((sig_back2 * bvar) / denom, 0.0)
+    return mean, var
+
+
+def posterior_mean(x_n, x_0, x_T, n, schedule):
+    """Analytic linear-dynamics posterior mean  ``E[x_{n-1} | x_n, x_0, x_T]``.
+
+    Thin wrapper around :func:`posterior_moments` that drops the variance.
+    Numerical output is bit-identical to the previous implementation.
+    """
+    mean, _ = posterior_moments(x_n, x_0, x_T, n, schedule)
+    return mean
+
+
+def exact_residual_model_mean(
+    x_n,
+    x_0,
+    x_T,
+    eps_pred,
+    n,
+    schedule,
+    residual_scale: float = 1.0,
+):
+    """Exact bridge posterior mean plus a learned data residual.
+
+    ``mu = posterior_mean(x_n, x_0, x_T, n) +
+            residual_scale * sqrt(max(post_var, 0)) * eps_pred``.
+
+    This is the ``exact_residual`` ablation: the analytic one-step bridge
+    posterior is used as the *base* transition, and only a data-dependent
+    residual (reusing ``eps_net``) is learned. Valid for all ``n in {1,..,N}``;
+    no boundary special case is required because the exact moments already
+    handle the terminal step (and ``post_var`` -> 0 at ``n=1``, which makes
+    the residual vanish automatically).
+
+    Returns:
+        mu: shape (B, D).
+        mu_base: shape (B, D), exact posterior mean.
+        post_var: shape (B, 1), exact posterior variance.
+    """
+    mu_base, post_var = posterior_moments(x_n, x_0, x_T, n, schedule)
+    scale = jnp.asarray(residual_scale, dtype=jnp.float32)
+    std = scale * jnp.sqrt(jnp.maximum(post_var, 0.0))
+    mu = mu_base + std * eps_pred
+    return mu, mu_base, post_var
 
 def reverse_std(n, schedule):
     """Return sqrt(g_n^2) for reverse sampling.

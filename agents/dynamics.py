@@ -21,16 +21,19 @@ from agents.critic import ScalarValueNet
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.dynamics import (
     bridge_sample,
+    exact_residual_model_mean,
     forward_bridge_coefficients,
     make_dynamics_schedule,
     model_mean,
     posterior_mean,
+    posterior_moments,
     sample_from_reverse_mean,
 )
 
 
 _VALID_PLANNER_TYPES = ('reverse_score', 'forward_bridge', 'forward_bridge_residual')
 _VALID_FORWARD_BRIDGE_MODES = ('mean', 'sample')
+_VALID_DYNAMICS_MODEL_TYPES = ('sde_euler', 'exact_residual')
 
 
 def _planner_type(config) -> str:
@@ -50,6 +53,26 @@ def _forward_bridge_mode(config) -> str:
             f'forward_bridge_mode must be one of {_VALID_FORWARD_BRIDGE_MODES}, got {mode!r}.'
         )
     return mode
+
+
+def _dynamics_model_type(config) -> str:
+    """Return the canonical dynamics_model_type string from the agent config.
+
+    - ``sde_euler``  (default): exact-bridge posterior matched against a
+      forward state-time SDE/Euler model mean (current behavior).
+    - ``exact_residual``: exact bridge posterior mean as the base transition
+      with a learned data residual; trained via path/rollout consistency.
+    """
+    mode = str(config.get('dynamics_model_type', 'sde_euler')).lower()
+    if mode not in _VALID_DYNAMICS_MODEL_TYPES:
+        raise ValueError(
+            f'dynamics_model_type must be one of {_VALID_DYNAMICS_MODEL_TYPES}, got {mode!r}.'
+        )
+    return mode
+
+
+def _dynamics_model_type_metric(config) -> float:
+    return 1.0 if _dynamics_model_type(config) == 'exact_residual' else 0.0
 
 
 from utils.inverse_dynamics import InverseDynamicsMLP, parse_hidden_dims
@@ -173,10 +196,30 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
     def _learned_reverse_mean(self, x_n, x_T, x_0, n, schedule, params=None):
         n_total = self.config['dynamics_N']
+        model_type = _dynamics_model_type(self.config)
+
+        eps = self.network.select('eps_net')(
+            x_n, x_T, x_0, n.astype(jnp.float32), params=params,
+        )
+
+        if model_type == 'exact_residual':
+            # Exact bridge posterior mean as base transition + learned residual.
+            # Valid for all n in {1, ..., N}; no boundary override needed because
+            # posterior_moments(...) already handles the terminal step.
+            mu, _, _ = exact_residual_model_mean(
+                x_n,
+                x_0,
+                x_T,
+                eps,
+                n,
+                schedule,
+                residual_scale=float(self.config.get('exact_residual_scale', 1.0)),
+            )
+            return mu, eps
+
+        # Default 'sde_euler' path. Numerically identical to previous behavior.
         n_safe = jnp.minimum(n, n_total - 1)
         is_boundary = n == n_total
-
-        eps = self.network.select('eps_net')(x_n, x_T, x_0, n.astype(jnp.float32), params=params)
         mu_inner = model_mean(x_n, x_0, x_T, eps, n_safe, schedule)
         mu_boundary = x_T + eps
         mu = jnp.where(is_boundary[..., None], mu_boundary, mu_inner)
@@ -983,7 +1026,14 @@ class DynamicsAgent(_DynamicsAgentCore):
         is_boundary = n == N
         n_safe = jnp.minimum(n, N - 1)
 
-        # --- L_dynamics ---
+        # --- L_dynamics / bridge-prior regularization ---
+        # In sde_euler mode this is the bridge posterior mean-matching loss.
+        # In exact_residual mode the model mean = posterior_mean + learned
+        # residual, so matching mu_pred -> mu_true would force the residual to
+        # zero. Instead we use a small L2 prior on the residual; the main
+        # learning signals are L_path and L_roll below.
+        model_type = _dynamics_model_type(self.config)
+
         x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
         x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
         mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
@@ -992,7 +1042,17 @@ class DynamicsAgent(_DynamicsAgentCore):
         )
         g2_n = self.schedule['g2'][n - 1]
         weight = 1.0 / (2.0 * jnp.maximum(g2_n, 1e-12))
-        loss_dynamics = (weight * jnp.abs(mu_true - mu_pred).sum(axis=-1)).mean()
+        loss_bridge_mean_match = (weight * jnp.abs(mu_true - mu_pred).sum(axis=-1)).mean()
+
+        if model_type == 'exact_residual':
+            loss_residual_reg = jnp.mean(jnp.sum(eps_pred ** 2, axis=-1))
+            loss_dynamics = (
+                float(self.config.get('exact_residual_bridge_match_weight', 0.0)) * loss_bridge_mean_match
+                + float(self.config.get('exact_residual_reg_weight', 1.0e-4)) * loss_residual_reg
+            )
+        else:
+            loss_residual_reg = jnp.array(0.0, dtype=jnp.float32)
+            loss_dynamics = loss_bridge_mean_match
 
         # --- L_path: real x_n along segment, same n ---
         row = jnp.arange(B, dtype=jnp.int32)
@@ -1048,6 +1108,8 @@ class DynamicsAgent(_DynamicsAgentCore):
         info = {
             'phase1/loss': loss,
             'phase1/loss_dynamics': loss_dynamics,
+            'phase1/loss_bridge_mean_match': loss_bridge_mean_match,
+            'phase1/loss_residual_reg': loss_residual_reg,
             'phase1/loss_path_step': loss_path,
             'phase1/loss_roll': loss_roll,
             'phase1/loss_subgoal': loss_sub,
@@ -1063,6 +1125,9 @@ class DynamicsAgent(_DynamicsAgentCore):
             'phase1/xN_minus_1_norm': xNm1_norm,
             'phase1/bridge_step_mean': n.astype(jnp.float32).mean(),
             'phase1/planner_type': jnp.asarray(0.0, dtype=jnp.float32),
+            'dynamics/model_type': jnp.asarray(
+                _dynamics_model_type_metric(self.config), dtype=jnp.float32,
+            ),
         }
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
@@ -1295,4 +1360,11 @@ def get_dynamics_config():
     c.path_eval_slice = [0, 1]
     c.idm_loss_weight = 1.0
     c.idm_hidden_dims = (512, 512, 512)
+    # Dynamics model parameterization. Default 'sde_euler' preserves current
+    # behavior bit-for-bit. 'exact_residual' replaces the learned model mean
+    # with posterior_mean + sqrt(post_var) * eps_pred (data residual).
+    c.dynamics_model_type = 'sde_euler'
+    c.exact_residual_scale = 1.0
+    c.exact_residual_reg_weight = 1.0e-4
+    c.exact_residual_bridge_match_weight = 0.0
     return c
