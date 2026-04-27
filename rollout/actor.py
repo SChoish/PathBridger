@@ -23,7 +23,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-from agents.actor import ActorAgent, get_actor_config
+from agents.actor import ActorAgent, normalize_actor_spi_config, get_actor_config
 from agents.dynamics import DynamicsAgent
 from utils.datasets import Dataset
 from utils.env_utils import make_env_and_datasets
@@ -63,11 +63,6 @@ def _load_actor_config_from_flags(flags_path: Path) -> dict:
     for k, v in act.items():
         base[k] = v
     d = dict(base)
-    # Saved runs may only have legacy ``spi_goal_conditioning``; defaults still set
-    # ``spi_conditioned='subgoal'`` from ``get_actor_config()``, so merge ``spi_conditioned``
-    # from legacy when the run did not write the canonical key.
-    if 'spi_conditioned' not in act and 'spi_goal_conditioning' in act:
-        d['spi_conditioned'] = str(act['spi_goal_conditioning']).strip().lower()
     return d
 
 
@@ -98,7 +93,6 @@ def rollout_dynamics_actor_env(
     actor_horizon: int,
     env_action_dim: int,
     record_env_rgb: bool = True,
-    spi_conditioned: str = 'subgoal',
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None]:
     cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
     goal = np.asarray(s_g, dtype=np.float32).reshape(-1)
@@ -129,14 +123,9 @@ def rollout_dynamics_actor_env(
         if goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol)):
             reached = True
             break
-        # ``pred`` (dynamics subgoal) is always computed for the optional plot overlay; the
-        # actor conditioning vector ``actor_cond`` follows ``spi_conditioned`` to mirror
-        # training so π sees the same input distribution it was trained on.
-        #   'subgoal' → actor sees predicted subgoal; hats = subgoal trail.
-        #   'goal'    → actor sees the global goal directly; hats = goal repeated so the
-        #              video honestly shows what the actor is conditioned on.
+        # ``pred`` (dynamics subgoal) is the actor conditioning vector (matches training).
         pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-        actor_cond = pred if str(spi_conditioned).lower() == 'subgoal' else goal
+        actor_cond = pred
         chunk = np.asarray(actor_agent.sample_actions(obs, actor_cond), dtype=np.float32).reshape(actor_horizon, -1)
         chunk_done = False
         for _i in range(int(chunk.shape[0])):
@@ -269,6 +258,7 @@ def main() -> None:
     actor_agent = ActorAgent.create(int(args.seed), ex, actor_cfg, ex_goals=ex_goal)
     actor_pkl = actor_ckpt_dir / f'params_{actor_ep}.pkl'
     actor_agent = load_checkpoint_pkl(actor_agent, actor_pkl)
+    actor_agent = normalize_actor_spi_config(actor_agent)
     print(f'Loaded actor {actor_pkl}')
 
     from rollout.value_field import value_mesh_for_xy, load_critic_for_run
@@ -288,22 +278,12 @@ def main() -> None:
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     env_action_dim = int(low.shape[-1])
     actor_horizon = int(actor_cfg['actor_chunk_horizon'])
-    spi_conditioned = str(actor_cfg.get('spi_conditioned', 'subgoal')).lower()
     if saved_actor_dim != env_action_dim:
         print(
             f'Corrected flags actor action_dim={saved_actor_dim} to env action dim={env_action_dim} '
             'before loading the actor checkpoint.'
         )
-    print(f'Actor conditioning at inference: spi_conditioned={spi_conditioned!r} '
-          f"(actor sees {'predicted subgoal' if spi_conditioned == 'subgoal' else 'global goal'})")
-
-    spi_conditioned = str(
-        actor_cfg.get('spi_conditioned', actor_cfg.get('spi_goal_conditioning', 'subgoal'))
-    ).strip().lower()
-    print(
-        f'Actor conditioning at inference: spi_conditioned={spi_conditioned!r} '
-        f"(actor sees {'predicted subgoal' if spi_conditioned == 'subgoal' else 'global goal'})"
-    )
+    print('Actor conditioning at inference: predicted dynamics subgoal (spi_goals).')
     roll, hats, n_chunks, reached, env_frames = rollout_dynamics_actor_env(
         env,
         dynamics_agent,
@@ -318,7 +298,6 @@ def main() -> None:
         actor_horizon=actor_horizon,
         env_action_dim=env_action_dim,
         record_env_rgb=True,
-        spi_conditioned=spi_conditioned,
     )
     n_trans = max(0, int(roll.shape[0]) - 1)
     print(

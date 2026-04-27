@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from agents.critic import get_config as get_critic_config, validate_config
-from agents.actor import get_actor_config
+from agents.actor import get_actor_config, normalize_actor_spi_config
 from agents.dynamics import DynamicsAgent, get_dynamics_config
 from main import (
     _create_actor_agent,
@@ -136,6 +136,7 @@ def main() -> None:
     if not actor_pkl.is_file():
         raise FileNotFoundError(actor_pkl)
     actor_agent = load_checkpoint_pkl(actor_agent, actor_pkl)
+    actor_agent = normalize_actor_spi_config(actor_agent)
 
     task_ids = parse_int_list(args.eval_task_ids) if str(args.eval_task_ids).strip() else parse_int_list(
         str(fg.get('eval_task_ids', '1'))

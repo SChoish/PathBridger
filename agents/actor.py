@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Sequence
 
 import flax
@@ -14,23 +15,29 @@ from utils.flax_utils import TrainState, nonpytree_field
 from utils.networks import MLP
 
 
-SPI_CONDITIONED_CHOICES = ('subgoal', 'goal')
-# Backward-compat alias for the old key name (`spi_goal_conditioning`); kept so
-# already-saved checkpoints / external imports do not break.
-SPI_GOAL_CONDITIONING_CHOICES = SPI_CONDITIONED_CHOICES
+def normalize_actor_spi_config(agent: 'ActorAgent') -> 'ActorAgent':
+    """Strip deprecated ``spi_conditioned`` / ``spi_goal_conditioning`` from config.
 
-
-def validate_spi_conditioned(value: str) -> str:
-    v = str(value).strip().lower()
-    if v not in SPI_CONDITIONED_CHOICES:
-        raise ValueError(
-            f"actor.spi_conditioned must be one of {SPI_CONDITIONED_CHOICES}, got {value!r}."
+    SPI actor and critic scoring always use the dynamics-predicted subgoal as the
+    conditioning vector (``spi_goals`` in ``main``). Legacy ``goal`` mode is ignored
+    with a warning so old checkpoints and flags.json still load.
+    """
+    cfg = dict(agent.config)
+    raw = str(cfg.get('spi_conditioned', cfg.get('spi_goal_conditioning', 'subgoal'))).strip().lower()
+    if raw == 'goal':
+        logging.warning(
+            'Loaded actor config had spi_conditioned/spi_goal_conditioning=%r; '
+            'global-goal SPI conditioning was removed — using predicted subgoal only.',
+            raw,
         )
-    return v
-
-
-# Legacy name preserved for any external callers; same semantics.
-validate_spi_goal_conditioning = validate_spi_conditioned
+    elif raw not in ('subgoal', ''):
+        logging.warning(
+            'Ignoring unknown actor SPI conditioning key value %r; using predicted subgoal only.',
+            raw,
+        )
+    cfg.pop('spi_conditioned', None)
+    cfg.pop('spi_goal_conditioning', None)
+    return agent.replace(config=flax.core.FrozenDict(**cfg))
 
 
 class DeterministicChunkActor(nn.Module):
@@ -58,10 +65,9 @@ class ActorAgent(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     def _goals(self, batch: dict) -> jnp.ndarray | None:
-        # ``spi_goals`` carries whatever conditioning vector the training loop chose
-        # for this update (predicted subgoal or global goal); see ``config.spi_conditioned``
-        # and ``main._build_actor_batch_from_dynamics``. Both π and the critic scorer in
-        # ``actor_loss`` share this same vector so Q stays consistent with π.
+        # ``spi_goals`` is the dynamics-predicted subgoal (or broadcast) from
+        # ``main._build_actor_batch_from_dynamics``. π and the critic scorer in
+        # ``actor_loss`` share this vector so Q stays consistent with π.
         goals = batch.get('spi_goals', None)
         if goals is None:
             goals = batch.get('value_goals', None)
@@ -187,14 +193,19 @@ class ActorAgent(flax.struct.PyTreeNode):
         ex_goal = None if ex_goals is None else jnp.asarray(ex_goals, dtype=jnp.float32)
 
         config = dict(config)
-        # Accept the legacy key ``spi_goal_conditioning`` from older checkpoints / configs
-        # and migrate it to the canonical ``spi_conditioned`` so the rest of the agent only
-        # has to look at one key. If both are set, the canonical name wins.
-        if 'spi_conditioned' not in config and 'spi_goal_conditioning' in config:
-            config['spi_conditioned'] = config['spi_goal_conditioning']
-        config['spi_conditioned'] = validate_spi_conditioned(
-            config.get('spi_conditioned', 'subgoal')
-        )
+        raw = str(config.get('spi_conditioned', config.get('spi_goal_conditioning', 'subgoal'))).strip().lower()
+        if raw == 'goal':
+            logging.warning(
+                'actor config sets spi_conditioned/spi_goal_conditioning=%r; '
+                'global-goal mode was removed — training uses predicted subgoal only.',
+                raw,
+            )
+        elif raw not in ('subgoal', ''):
+            raise ValueError(
+                f'Unknown actor spi_conditioned/spi_goal_conditioning value {raw!r}; '
+                "only 'subgoal' is supported (legacy 'goal' is ignored with a warning)."
+            )
+        config.pop('spi_conditioned', None)
         config.pop('spi_goal_conditioning', None)
 
         actor_def = DeterministicChunkActor(
@@ -207,9 +218,6 @@ class ActorAgent(flax.struct.PyTreeNode):
         return cls(rng=rng, actor=actor, config=flax.core.FrozenDict(**config))
 
 
-SPI_CONDITIONED_CHOICES = ('subgoal', 'goal')
-
-
 def get_actor_config():
     return ml_collections.ConfigDict(
         dict(
@@ -219,15 +227,8 @@ def get_actor_config():
             spi_beta=10.0,
             spi_actor_layer_norm=True,
             spi_q_norm_eps=1e-6,
-            # Conditioning vector for both ``π(s, g)`` and ``Q(s, g, a)`` in the SPI loss.
-            #   'subgoal' (default): use dynamics ``predict_subgoal(s, g_global)``
-            #     → matches training-time subgoal teacher; π/Q see local subgoal.
-            #   'goal'   : use the (global) ``high_actor_goals`` directly
-            #     → π/Q both see the final goal; SPI prox still pulls toward dynamics
-            #       proposal chunks (which were planned to subgoals).
-            # Set in ``main._build_actor_batch_from_dynamics`` via ``spi_goals``.
-            # Legacy alias accepted from saved checkpoints: ``spi_goal_conditioning``.
-            spi_conditioned='subgoal',
+            # π and Q in the SPI loss are always conditioned on the dynamics-predicted
+            # subgoal (``spi_goals`` from ``main._build_actor_batch_from_dynamics``).
             actor_chunk_horizon=ml_collections.config_dict.placeholder(int),
             action_dim=2,
         )

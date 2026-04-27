@@ -43,4 +43,3 @@ actor:
   spi_tau: 0.1
   spi_beta: 1.0
   spi_actor_layer_norm: false
-  spi_conditioned: goal

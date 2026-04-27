@@ -23,4 +23,3 @@ actor:
   spi_tau: 20.0
   spi_beta: 1.0
   spi_actor_layer_norm: true
-  spi_conditioned: subgoal

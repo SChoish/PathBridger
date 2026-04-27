@@ -29,7 +29,7 @@ from agents.critic import (
     get_config as get_critic_config,
     validate_config,
 )
-from agents.actor import ActorAgent, get_actor_config
+from agents.actor import ActorAgent, get_actor_config, normalize_actor_spi_config
 from agents.dynamics import DynamicsAgent, get_dynamics_config
 from utils.datasets import Dataset, PathHGCDataset
 from utils.critic_sequence_dataset import CriticSequenceDataset
@@ -111,13 +111,9 @@ _SPI_ACTOR_KEYS = {
     'spi_beta',
     'spi_actor_layer_norm',
     'spi_q_norm_eps',
-    'spi_conditioned',
 }
-# Map legacy YAML keys -> canonical actor-config keys. Keeps old configs and
-# saved ``flags.json`` snapshots working after the rename.
-_ACTOR_KEY_ALIASES = {
-    'spi_goal_conditioning': 'spi_conditioned',
-}
+# Legacy YAML / flags.json keys for removed global-goal SPI mode (ignored with warning).
+_DEPRECATED_SPI_KEYS = ('spi_conditioned', 'spi_goal_conditioning')
 
 def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
     return max(1, math.ceil(dataset_size / batch_size))
@@ -205,15 +201,23 @@ def _apply_yaml_to_flags(data: dict) -> tuple[dict, dict, dict]:
         for k, v in fb.items():
             dynamics_updates.setdefault(f'forward_bridge_{k}', v)
 
-    # Migrate legacy actor key names to canonical ones (e.g., spi_goal_conditioning ->
-    # spi_conditioned) so older YAMLs and flags.json snapshots keep working.
+    # Drop removed SPI conditioning keys (legacy ``goal`` mode); warn if present.
     if isinstance(actor_updates, dict):
-        for old, new in _ACTOR_KEY_ALIASES.items():
-            if old in actor_updates and new not in actor_updates:
-                actor_updates[new] = actor_updates.pop(old)
-            elif old in actor_updates:
-                # If both are present, drop the legacy one.
-                actor_updates.pop(old, None)
+        for k in _DEPRECATED_SPI_KEYS:
+            if k not in actor_updates:
+                continue
+            v = str(actor_updates.pop(k)).strip().lower()
+            if v == 'goal':
+                logging.warning(
+                    'YAML sets %s=goal; global-goal SPI conditioning was removed — ignoring.',
+                    k,
+                )
+            elif v and v != 'subgoal':
+                logging.warning(
+                    'YAML sets %s=%r; unknown value — ignoring (subgoal-only).',
+                    k,
+                    v,
+                )
 
     # Backward-compat: legacy snapshots / configs use ``joint_horizon`` for the
     # shared horizon flag now exposed as ``horizon``.
@@ -554,25 +558,10 @@ def _build_actor_batch_from_dynamics(
     else:
         timing = {}
     dynamics_agent = dynamics_agent.replace(rng=plan_rng)
-    # ``spi_goals`` is the conditioning vector both pi(s, g) and Q(s, g, a) see in
-    # ``ActorAgent.actor_loss``. ``actor_config.spi_conditioned`` selects which
-    # (legacy alias ``spi_goal_conditioning`` is still accepted):
-    #   'subgoal' (default): use the dynamics-predicted local subgoal mean (mirrors training).
-    #   'goal'             : use the global ``high_goals`` directly.
-    # Candidate proposal chunks are unchanged in either mode (still planned to the
-    # subgoal); only the conditioning vector flips, keeping pi/Q consistent.
-    spi_cond = str(
-        actor_config.get('spi_conditioned', actor_config.get('spi_goal_conditioning', 'subgoal'))
-    ).strip().lower()
-    if spi_cond == 'goal':
-        spi_goals = high_goals
-    elif spi_cond == 'subgoal':
-        use_mean_for_actor = bool(dynamics_agent.config.get('subgoal_use_mean_for_actor_goal', True))
-        spi_goals = actor_goal_mean if use_mean_for_actor else high_goals
-    else:
-        raise ValueError(
-            f"actor.spi_conditioned must be 'subgoal' or 'goal', got {spi_cond!r}."
-        )
+    # ``spi_goals`` is always the dynamics-predicted local subgoal (mean by default);
+    # π and Q in ``ActorAgent.actor_loss`` share this vector.
+    use_mean_for_actor = bool(dynamics_agent.config.get('subgoal_use_mean_for_actor_goal', True))
+    spi_goals = actor_goal_mean if use_mean_for_actor else high_goals
     actor_batch = {
         'observations': obs,
         'spi_goals': spi_goals,
@@ -580,12 +569,10 @@ def _build_actor_batch_from_dynamics(
         # Shape: [B, N, ha, A]
         'candidate_partial_chunks': candidate_actions,
         'valids': jnp.ones((obs.shape[0], proposal_horizon), dtype=jnp.float32),
-    }
-    if spi_cond != 'goal':
-        # Per-candidate sub-goal endpoints used for critic rescoring.  In deterministic
-        # subgoal mode this is just the mean broadcast across N candidates.
+        # Per-candidate sub-goal endpoints for critic rescoring (deterministic mode: mean broadcast).
         # Shape: [B, N, D]
-        actor_batch['candidate_goals'] = candidate_goals
+        'candidate_goals': candidate_goals,
+    }
 
     nan = jnp.full((), jnp.nan, dtype=jnp.float32)
     proposal_goal_stats = _proposal_goal_stats_jit(actor_goal_mean, candidate_goals)
@@ -772,15 +759,6 @@ def _evaluate_env_tasks(
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     actor_horizon = int(actor_config['actor_chunk_horizon'])
     idm_horizon = int(critic_config['action_chunk_horizon'])
-    # Mirror training-time conditioning: 'subgoal' -> pi sees dynamics predict_subgoal(obs, g);
-    # 'goal' -> pi sees the global goal directly. IDM eval below always uses predicted
-    # subgoals because dynamics IDM is the chunk planner targeting subgoal endpoints.
-    # Accept both the canonical key and the legacy alias.
-    actor_uses_goal = (
-        str(
-            actor_config.get('spi_conditioned', actor_config.get('spi_goal_conditioning', 'subgoal'))
-        ).strip().lower() == 'goal'
-    )
     actor_task_successes = []
     idm_task_successes = []
     metrics = {}
@@ -802,8 +780,7 @@ def _evaluate_env_tasks(
                 if success or terminated or truncated:
                     break
                 predicted_subgoal = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-                actor_goal_input = goal if actor_uses_goal else predicted_subgoal
-                action_chunk = np.asarray(actor_agent.sample_actions(obs, actor_goal_input), dtype=np.float32).reshape(
+                action_chunk = np.asarray(actor_agent.sample_actions(obs, predicted_subgoal), dtype=np.float32).reshape(
                     actor_horizon, -1
                 )
                 obs, success, terminated, truncated = _execute_action_chunk(
@@ -971,6 +948,7 @@ def main(_):
         dynamics_agent = restore_agent(dynamics_agent, dynamics_ckpt_dir, resume_epoch)
         critic_agent = restore_agent(critic_agent, critic_ckpt_dir, resume_epoch)
         actor_agent = restore_agent(actor_agent, actor_ckpt_dir, resume_epoch)
+        actor_agent = normalize_actor_spi_config(actor_agent)
 
     batch_size = int(dynamics_config['batch_size'])
     spe = _steps_per_epoch(len(common_valid_starts), batch_size)

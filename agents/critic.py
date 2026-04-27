@@ -343,17 +343,6 @@ def validate_config(critic_config, actor_config=None) -> None:
         return
     if int(actor_config.get('actor_chunk_horizon', 0)) < 1:
         raise ValueError('actor_chunk_horizon must be >= 1.')
-    # Accept canonical ``spi_conditioned`` and legacy alias ``spi_goal_conditioning``.
-    spi_cond = str(
-        actor_config.get('spi_conditioned', actor_config.get('spi_goal_conditioning', 'subgoal'))
-    ).strip().lower()
-    # Lazy import to avoid circular dependency between agents.actor and agents.critic.
-    from agents.actor import SPI_CONDITIONED_CHOICES
-
-    if spi_cond not in SPI_CONDITIONED_CHOICES:
-        raise ValueError(
-            f"actor.spi_conditioned must be one of {SPI_CONDITIONED_CHOICES}, got {spi_cond!r}."
-        )
 
 
 def extract_critic_primary_score(info: dict) -> float:

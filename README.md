@@ -127,7 +127,7 @@ Critic + SPI actor:
 - Critic은 후보 action chunk를 평가합니다 (chunk + action heads).
 - SPI actor는 critic score로 만든 soft target distribution에 대해 W2-style proximal loss를 씁니다.
 - `spi_tau`가 작을수록 후보 chunk 쪽으로 더 강하게 당깁니다.
-- `spi_conditioned: subgoal`이면 actor와 critic이 predicted subgoal에 condition됩니다.
+- Actor와 critic SPI 경로는 항상 dynamics가 예측한 subgoal(`spi_goals`)에 condition됩니다.
 
 주요 dynamics 로그:
 

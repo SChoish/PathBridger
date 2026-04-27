@@ -1,8 +1,6 @@
-# Linear-SDE dynamics + critic + SPI actor (global-goal conditioning) — short 200-epoch run.
-# Same as config/antmaze_large_navigate.yaml except:
-#   - actor.spi_conditioned: goal   (pi and Q are conditioned on the global high_actor_goals
-#                                    instead of dynamics predict_subgoal(s, g_global))
-#   - train_epochs: 200             (sanity-length sweep)
+# Linear-SDE dynamics + critic + SPI actor — short 200-epoch run.
+# Same as config/antmaze_large_navigate.yaml except train_epochs: 200 (sanity-length).
+# (Legacy global-goal SPI conditioning was removed; π/Q always use predicted subgoals.)
 
 env_name: antmaze-large-navigate-v0
 seed: 0
@@ -46,4 +44,3 @@ actor:
   spi_tau: 5.0
   spi_beta: 1.0
   spi_actor_layer_norm: false
-  spi_conditioned: goal         # default 'subgoal'; 'goal' = pi/Q both see global goal

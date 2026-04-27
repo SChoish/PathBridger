@@ -1,6 +1,6 @@
 # Linear-SDE dynamics + critic + SPI actor — subgoal-conditioned SPI + bridge/subgoal clip-and-pad.
 # Enables dynamics.clip_path_to_goal: true.
-# Actor/Q use per-candidate predicted subgoals (spi_conditioned: subgoal), not the global goal.
+# Actor/Q use dynamics-predicted subgoals for SPI conditioning (same as all navigate configs).
 
 env_name: antmaze-large-navigate-v0
 seed: 0
@@ -44,4 +44,3 @@ actor:
   spi_tau: 1.0
   spi_beta: 1.0
   spi_actor_layer_norm: false
-  spi_conditioned: subgoal
