@@ -1,4 +1,4 @@
-"""Environment / maze helpers for GOUB rollout scripts (state sync, xy snap, navigator setup)."""
+"""Environment / maze helpers for dynamics rollout scripts (state sync, xy snap, navigator setup)."""
 
 from __future__ import annotations
 

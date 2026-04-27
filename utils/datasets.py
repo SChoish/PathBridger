@@ -432,7 +432,7 @@ class HGCDataset(GCDataset):
 class PathHGCDataset(HGCDataset):
     """Extends :class:`HGCDataset` with a contiguous same-episode ``trajectory_segment``.
 
-    Used by GOUB Phase-1 path supervision: for horizon ``K = subgoal_steps``, each batch row
+    Used by dynamics Phase-1 path supervision: for horizon ``K = subgoal_steps``, each batch row
     includes ``s_t, s_{t+1}, ..., s_{t+K}`` as ``trajectory_segment`` of shape ``(B, K+1, D)``.
     When ``idxs`` is omitted, starts ``t`` are resampled until ``t+K`` lies in the same episode
     (does not cross ``terminals``). ``high_actor_targets`` is overwritten to match
@@ -444,7 +444,7 @@ class PathHGCDataset(HGCDataset):
       the sampled goal ``s_{t_g}`` is. Subgoal_net teacher is ``s_{t+K}`` so it may "overshoot"
       past close goals.
     - ``True``: per-row endpoint becomes ``s_{min(t+K, t_g)}``; segment tail past ``t_g`` is
-      padded with ``s_{t_g}``. Both the GOUB bridge and the subgoal_net teacher then learn
+      padded with ``s_{t_g}``. Both the dynamics bridge and the subgoal_net teacher then learn
       to "arrive and stay" at close goals, keeping inference subgoals in-distribution.
 
     Image ``p_aug`` is only consistent when augmentations do not reshape state vectors; for

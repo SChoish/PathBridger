@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""State-space rollout only: subgoal net + GOUB ``plan`` trajectory vs one offline episode.
+"""State-space rollout only: subgoal net + dynamics ``plan`` trajectory vs one offline episode.
 
 Pipeline (no environment dynamics — open-loop in observation space). **Ant maze:** the planner
 does not know about walls; by default ``--navigator snap`` projects each virtual ``(x,y)`` into a
@@ -15,9 +15,9 @@ once with ``navigator`` disabled so a difficult maze layout can still be visuali
    when distance to ``s_g`` is at most ``--goal_tol`` (``<=``, inclusive); see ``--goal_stop``).
 
    Each **chunk**: ``predict_subgoal(s, s_g)`` once → one ``plan`` / ``sample_plan`` → append
-   ``trajectory[1:K+1]`` (``K`` from ``--action_chunk_horizon``; ``0`` → **full** ``goub_N``), clamped, capped by ``N``.
+   ``trajectory[1:K+1]`` (``K`` from ``--action_chunk_horizon``; ``0`` → **full** ``dynamics_N``), clamped, capped by ``N``.
    There is no environment simulator here, so **K=0 (default) is recommended**: walk the entire planned
-   bridge each replan. Use ``K < goub_N`` only when you want to match a shorter real-env execution horizon
+   bridge each replan. Use ``K < dynamics_N`` only when you want to match a shorter real-env execution horizon
    (e.g. IDM ``action_chunk_horizon``) for apples-to-oranges plots.
    ``K=1`` uses only ``next_step`` (``trajectory[1]``) per chunk.
 
@@ -25,7 +25,7 @@ once with ``navigator`` disabled so a difficult maze layout can still be visuali
 
 4. Plot dataset vs rollout in 2D; writes **PNG** and optional **matplotlib MP4** at ``--fps``.
 
-**Real env + IDM** rollouts live in ``rollout/idm.py``. **Joint chunk actor** rollouts:
+**Real env + IDM** rollouts live in ``rollout/idm.py``. **Chunk actor** rollouts:
 ``rollout/actor.py``.
 
 ``loss_sub_mean`` in training logs is the batch-mean of ``phase1/loss_subgoal``,
@@ -61,7 +61,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
 
-from agents.goub_dynamics import GOUBDynamicsAgent
+from agents.dynamics import DynamicsAgent
 from utils.datasets import Dataset
 from utils.env_utils import make_env_and_datasets
 from rollout.env import format_maze_navigator_log, load_maze_navigator_snap, make_xy_clamper
@@ -81,7 +81,7 @@ from utils.run_io import (
     load_checkpoint_pkl,
     load_run_flags,
     pick_epoch,
-    resolve_goub_checkpoint_dir,
+    resolve_dynamics_checkpoint_dir,
 )
 
 
@@ -154,7 +154,7 @@ def _draw_value_heatmap(
 
 
 def bridge_trajectory(
-    agent: GOUBDynamicsAgent,
+    agent: DynamicsAgent,
     s_start: np.ndarray,
     s_end: np.ndarray,
     k: int,
@@ -188,7 +188,7 @@ def bridge_trajectory(
 
 
 def rollout_subgoal(
-    agent: GOUBDynamicsAgent,
+    agent: DynamicsAgent,
     s0: np.ndarray,
     s_g: np.ndarray,
     max_steps: int,
@@ -205,7 +205,7 @@ def rollout_subgoal(
     sample_noise_scale: float = 1.0,
     action_chunk_horizon: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, int, bool]:
-    """Roll out GOUB + subgoal in state space.
+    """Roll out dynamics + subgoal in state space.
 
     Returns:
         ``roll``: shape ``(T+1, D)`` with ``roll[0]=s0`` and ``T`` planner steps
@@ -223,7 +223,7 @@ def rollout_subgoal(
     Args:
         action_chunk_horizon: After each ``predict_subgoal``, call ``plan`` (or ``sample_plan``) **once**
             and walk the first ``K`` states along its reverse trajectory — i.e. append
-            ``trajectory[1], …, trajectory[K]`` (1-based slice ``trajectory[1:K+1]``), capped by ``goub_N``.
+            ``trajectory[1], …, trajectory[K]`` (1-based slice ``trajectory[1:K+1]``), capped by ``dynamics_N``.
             Use ``1`` for legacy behaviour (only ``next_step`` / ``trajectory[1]`` per chunk, then new
             subgoal).
     """
@@ -315,7 +315,7 @@ def main():
         metavar='K',
         help=(
             'Per chunk: append first K states from plan trajectory (trajectory[1:K+1]), one plan() call. '
-            'K=0 (default): full goub_N from checkpoint (open-loop state rollout; no env cost). '
+            'K=0 (default): full dynamics_N from checkpoint (open-loop state rollout; no env cost). '
             'K>0: shorter prefix, e.g. to match real-env chunk length. Capped by N. K=1 = next_step only per chunk.'
         ),
     )
@@ -348,10 +348,10 @@ def main():
         '--value_heatmap',
         action=argparse.BooleanOptionalAction,
         default=True,
-        help='Overlay DQC scalar value V(s, goal) on the plot.',
+        help='Overlay scalar value V(s, goal) on the plot.',
     )
     p.add_argument('--value_grid_n', type=int, default=56)
-    p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = GOUB epoch used.')
+    p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = dynamics epoch used.')
     p.add_argument(
         '--navigator',
         type=str,
@@ -469,7 +469,7 @@ def main():
     if int(args.task_id) != 0 and args.segment_compare:
         p.error('--segment_compare requires offline trajectory mode (--task_id=0).')
     if int(args.action_chunk_horizon) < 0:
-        p.error('--action_chunk_horizon must be >= 0 (0 = use goub_N)')
+        p.error('--action_chunk_horizon must be >= 0 (0 = use dynamics_N)')
     if args.sample_overlay and not args.sample_seeds:
         p.error('--sample_overlay requires --sample_seeds')
 
@@ -482,7 +482,7 @@ def main():
         ckpt_epoch = int(args.checkpoint_epoch)
 
     run_dir = Path(args.run_dir).resolve()
-    ckpt_dir = resolve_goub_checkpoint_dir(run_dir)
+    ckpt_dir = resolve_dynamics_checkpoint_dir(run_dir)
     suffixes = list_checkpoint_suffixes(ckpt_dir)
     ckpt_epoch = pick_epoch(int(ckpt_epoch), suffixes)
 
@@ -563,18 +563,18 @@ def main():
     ex = jnp.zeros((1, s0.shape[-1]), dtype=jnp.float32)
     act_dim = int(np.asarray(dataset['actions']).shape[-1])
     ex_act = jnp.zeros((1, act_dim), dtype=jnp.float32)
-    agent = GOUBDynamicsAgent.create(args.seed, ex, cfg, ex_actions=ex_act)
+    agent = DynamicsAgent.create(args.seed, ex, cfg, ex_actions=ex_act)
     pkl_path = ckpt_dir / f'params_{ckpt_epoch}.pkl'
     if not pkl_path.is_file():
         raise FileNotFoundError(f'Missing checkpoint: {pkl_path}')
     agent = load_checkpoint_pkl(agent, pkl_path)
     print(f'Loaded {pkl_path}')
 
-    goub_N = int(agent.config['goub_N'])
+    dynamics_N = int(agent.config['dynamics_N'])
     raw_chunk_h = int(args.action_chunk_horizon)
-    iter_state_chunk_h = goub_N if raw_chunk_h <= 0 else raw_chunk_h
+    iter_state_chunk_h = dynamics_N if raw_chunk_h <= 0 else raw_chunk_h
     if iter_state_chunk_h < 1:
-        p.error('--action_chunk_horizon resolved to < 1 (use >= 1, or 0 for goub_N)')
+        p.error('--action_chunk_horizon resolved to < 1 (use >= 1, or 0 for dynamics_N)')
     c0 = args.clamp_dim0 if args.clamp_dim0 >= 0 else args.plot_dim0
     c1 = args.clamp_dim1 if args.clamp_dim1 >= 0 else args.plot_dim1
 
@@ -596,7 +596,7 @@ def main():
         n_planner_steps = 0
         reached = False
         print(
-            f'Bridge: plan(s_t, s_{{t+k-1}}) → reverse chain (N+1={goub_N + 1} states), '
+            f'Bridge: plan(s_t, s_{{t+k-1}}) → reverse chain (N+1={dynamics_N + 1} states), '
             f'resampled to k={k} points for alignment.'
         )
         rollouts.append((roll, hats, n_planner_steps, reached, None, False))
@@ -660,11 +660,11 @@ def main():
     heat_mesh = None
     heat_vmin = heat_vmax = None
     if bool(args.value_heatmap):
-        from rollout.value_field import dqc_value_mesh_for_xy, load_dqc_critic_joint_run
+        from rollout.value_field import value_mesh_for_xy, load_critic_for_run
 
         ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(ckpt_epoch)
         env_heat, _, _ = make_env_and_datasets(env_name, frame_stack=cfg.get('frame_stack'))
-        critic_agent = load_dqc_critic_joint_run(
+        critic_agent = load_critic_for_run(
             run_dir,
             ce,
             env_heat,
@@ -681,7 +681,7 @@ def main():
         )
         xlim_heat, ylim_heat = axis_limits(traj, heat_roll, heat_hats, d0, d1, s_g, s0, navigator=plot_nav, seg=seg)
         tpl = np.asarray(s0, dtype=np.float32).reshape(-1)
-        XX, YY, ZZ, heat_vmin, heat_vmax = dqc_value_mesh_for_xy(
+        XX, YY, ZZ, heat_vmin, heat_vmax = value_mesh_for_xy(
             critic_agent,
             tpl,
             np.asarray(s_g, dtype=np.float32).reshape(-1),
@@ -709,7 +709,7 @@ def main():
         colors = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
         summary_lines = [
             f'sample_plan overlay  noise_scale={args.sample_noise_scale:g}',
-            f'state rollout  goub_N={goub_N}  K={iter_state_chunk_h}',
+            f'state rollout  dynamics_N={dynamics_N}  K={iter_state_chunk_h}',
         ]
         for idx, (roll, _hats, n_ps, reached, plan_seed, _stoch) in enumerate(rollouts):
             c = colors[idx % len(colors)]
@@ -889,7 +889,7 @@ def main():
                 if seg_mode == 'bridge':
                     title = (
                         f'epoch={ckpt_epoch}  {source_label}  true vs h-transform bridge  '
-                        f'k={_k}, t={segment_t}..{segment_t + _k - 1}  (N={goub_N}→resample→{_k})'
+                        f'k={_k}, t={segment_t}..{segment_t + _k - 1}  (N={dynamics_N}→resample→{_k})'
                     )
                 else:
                     title = (
@@ -919,7 +919,7 @@ def main():
                 if seg_mode == 'bridge':
                     text_lines = [
                         f'true = traj[t:t+k]  (k={_k2} states)\n'
-                        f'bridge: 1× plan() (N={goub_N}) → {_k2} pts'
+                        f'bridge: 1× plan() (N={dynamics_N}) → {_k2} pts'
                     ]
                 else:
                     text_lines = [
@@ -942,8 +942,8 @@ def main():
                 text_lines.append(f'sample_plan  noise_scale={args.sample_noise_scale:g}  seed={plan_seed}')
             if seg_metrics is not None:
                 text_lines.append(
-                    f"mean ‖true−GOUB‖₂ (full): {seg_metrics['mean_l2_full']:.3f}\n"
-                    f"mean ‖true−GOUB‖₂ (xy): {seg_metrics['mean_l2_xy']:.3f}"
+                    f"mean ‖true−dyn‖₂ (full): {seg_metrics['mean_l2_full']:.3f}\n"
+                    f"mean ‖true−dyn‖₂ (xy): {seg_metrics['mean_l2_xy']:.3f}"
                 )
             ax.text(
                 0.02,

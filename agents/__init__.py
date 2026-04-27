@@ -1,6 +1,6 @@
 """Agents subpackage.
 
-Import concrete agents explicitly, e.g. ``from agents.critic import DQCCriticAgent``,
+Import concrete agents explicitly, e.g. ``from agents.critic import CriticAgent``,
 to avoid pulling optional dependencies through this ``__init__``.
 """
 

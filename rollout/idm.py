@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Real-environment rollout: GOUB planner + inverse dynamics (IDM).
+"""Real-environment rollout: dynamics planner + inverse dynamics (IDM).
 
 This script is **separate** from ``rollout/subgoal.py`` (pure state-space trajectory plots).
 Each replan: ``predict_subgoal`` → ``plan`` or stochastic ``sample_plan`` (see
 ``--planner_noise_scale``) → IDM actions for up to ``--action_chunk_horizon`` env steps
-(capped at ``goub_N``), then repeat.
+(capped at ``dynamics_N``), then repeat.
 
 Headless RGB: if ``DISPLAY`` is unset, ``MUJOCO_GL`` defaults to ``egl`` (see ``--mujoco_gl``).
 
@@ -17,8 +17,8 @@ Example::
         --max_steps=1000 \\
         --out_path=idm_rollout.png
 
-``--idm_checkpoint`` is optional: when omitted, weights are read from ``idm_net`` inside the GOUB
-``params_<epoch>.pkl``. Use a standalone IDM pickle only for older GOUB runs without ``idm_net``.
+``--idm_checkpoint`` is optional: when omitted, weights are read from ``idm_net`` inside the dynamics
+``params_<epoch>.pkl``. Use a standalone IDM pickle only for older runs without ``idm_net``.
 
 OGBench-style evaluation goals: pass ``--task_id`` in ``[1, num_tasks]`` (typically 5). The script
 calls ``env.reset(options=dict(task_id=..., render_goal=False))`` and uses the returned observation
@@ -37,7 +37,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from agents.goub_dynamics import GOUBDynamicsAgent
+from agents.dynamics import DynamicsAgent
 from utils.env_utils import make_env_and_datasets
 from utils.run_io import (
     goal_within_tol,
@@ -45,7 +45,7 @@ from utils.run_io import (
     load_checkpoint_pkl,
     load_run_flags,
     pick_epoch,
-    resolve_goub_checkpoint_dir,
+    resolve_dynamics_checkpoint_dir,
 )
 from rollout.env import (
     configure_mujoco_gl,
@@ -65,9 +65,9 @@ from utils.inverse_dynamics import InverseDynamicsMLP
 from rollout.maze_navigator import MazeNavigatorMap
 
 
-def rollout_goub_idm_env(
+def rollout_dynamics_idm_env(
     env,
-    agent: GOUBDynamicsAgent,
+    agent: DynamicsAgent,
     idm_model: InverseDynamicsMLP,
     idm_params,
     s0: np.ndarray,
@@ -88,11 +88,11 @@ def rollout_goub_idm_env(
     planner_noise_scale: float = 0.0,
     planner_seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray]:
-    """Chunked GOUB bridge + inverse dynamics in the real environment.
+    """Chunked dynamics bridge + inverse dynamics in the real environment.
 
     Note: ``navigator`` / ``xy_clamper`` are used only for visualization outputs
     (subgoal markers and planned state-space trajectories). The actual rollout
-    policy runs on the raw environment observations / GOUB predictions so this
+    policy runs on the raw environment observations / dynamics predictions so this
     path stays aligned with training-time evaluation in ``main.py``.
     """
     g_np = np.asarray(s_g, dtype=np.float32)
@@ -191,7 +191,7 @@ def main() -> None:
         '--checkpoint_epoch',
         type=int,
         default=1000,
-        help='GOUB params_<n>.pkl suffix (default 1000). If missing, nearest available is used.',
+        help='Dynamics params_<n>.pkl suffix (default 1000). If missing, nearest available is used.',
     )
     p.add_argument(
         '--task_id',
@@ -204,7 +204,7 @@ def main() -> None:
         '--idm_checkpoint',
         type=str,
         default='',
-        help='Standalone inverse dynamics params_*.pkl. Empty → use idm_net inside GOUB checkpoint.',
+        help='Standalone inverse dynamics params_*.pkl. Empty → use idm_net inside dynamics checkpoint.',
     )
     p.add_argument('--action_chunk_horizon', type=int, default=5)
     p.add_argument(
@@ -239,14 +239,14 @@ def main() -> None:
         '--value_heatmap',
         action=argparse.BooleanOptionalAction,
         default=True,
-        help='Overlay DQC scalar value V(s, goal) on the right XY panel (requires joint checkpoints/critic/).',
+        help='Overlay scalar value V(s, goal) on the right XY panel (requires checkpoints/critic/).',
     )
     p.add_argument('--value_grid_n', type=int, default=56, help='Square grid resolution for value heatmap.')
     p.add_argument(
         '--critic_epoch',
         type=int,
         default=-1,
-        help='Critic params_<n>.pkl suffix; -1 = same suffix as GOUB --checkpoint_epoch.',
+        help='Critic params_<n>.pkl suffix; -1 = same suffix as --checkpoint_epoch.',
     )
     args = p.parse_args()
 
@@ -260,7 +260,7 @@ def main() -> None:
     planner_seed = int(args.seed) if int(args.planner_seed) < 0 else int(args.planner_seed)
 
     run_dir = Path(args.run_dir).resolve()
-    ckpt_dir = resolve_goub_checkpoint_dir(run_dir)
+    ckpt_dir = resolve_dynamics_checkpoint_dir(run_dir)
     ckpt_epoch = pick_epoch(int(args.checkpoint_epoch), list_checkpoint_suffixes(ckpt_dir))
 
     cfg, env_name = load_run_flags(run_dir)
@@ -297,12 +297,12 @@ def main() -> None:
     ex = jnp.zeros((1, s0.shape[-1]), dtype=jnp.float32)
     act_dim = int(np.prod(env.action_space.shape))
     ex_act = jnp.zeros((1, act_dim), dtype=jnp.float32)
-    agent = GOUBDynamicsAgent.create(args.seed, ex, cfg, ex_actions=ex_act)
+    agent = DynamicsAgent.create(args.seed, ex, cfg, ex_actions=ex_act)
     pkl_path = ckpt_dir / f'params_{ckpt_epoch}.pkl'
     agent = load_checkpoint_pkl(agent, pkl_path)
-    goub_N = int(agent.config['goub_N'])
+    dynamics_N = int(agent.config['dynamics_N'])
     print(
-        f'Loaded GOUB {pkl_path}  goub_N={goub_N}  '
+        f'Loaded dynamics {pkl_path}  dynamics_N={dynamics_N}  '
         f'planner_noise_scale={float(args.planner_noise_scale)}  planner_seed={planner_seed}'
     )
 
@@ -316,7 +316,7 @@ def main() -> None:
             idm_params = ptree['modules_idm_net']
         else:
             raise FileNotFoundError(
-                'GOUB checkpoint has no idm_net / modules_idm_net '
+                'Dynamics checkpoint has no idm_net / modules_idm_net '
                 '(train with embedded IDM or pass --idm_checkpoint).'
             )
         idm_model = InverseDynamicsMLP(
@@ -324,7 +324,7 @@ def main() -> None:
             action_dim=int(agent.config['idm_action_dim']),
             hidden_dims=tuple(int(x) for x in agent.config['idm_hidden_dims']),
         )
-        print('Using idm_net from GOUB checkpoint')
+        print('Using idm_net from dynamics checkpoint')
     else:
         idm_ckpt_path = Path(idm_ck_stripped).resolve()
         if not idm_ckpt_path.is_file():
@@ -353,10 +353,10 @@ def main() -> None:
         navigator_edge_inset=float(args.navigator_edge_inset),
     )
 
-    from rollout.value_field import dqc_value_mesh_for_xy, load_dqc_critic_joint_run
+    from rollout.value_field import value_mesh_for_xy, load_critic_for_run
 
     ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(ckpt_epoch)
-    critic_agent = load_dqc_critic_joint_run(
+    critic_agent = load_critic_for_run(
         run_dir,
         ce,
         env,
@@ -366,7 +366,7 @@ def main() -> None:
     critic_value_params = critic_agent.network.params.get('modules_value', None)
     print(f'Loaded critic for IDM inference/value heatmap (epoch suffix {ce})')
 
-    roll, hats, n_chunks, reached, env_frames, frame_plan_trajs = rollout_goub_idm_env(
+    roll, hats, n_chunks, reached, env_frames, frame_plan_trajs = rollout_dynamics_idm_env(
         env,
         agent,
         idm_model,
@@ -385,7 +385,7 @@ def main() -> None:
     )
     n_trans = max(0, int(roll.shape[0]) - 1)
     action_chunk_horizon = int(args.action_chunk_horizon)
-    steps_per_replan = min(action_chunk_horizon, goub_N)
+    steps_per_replan = min(action_chunk_horizon, dynamics_N)
     print(
         f'IDM rollout: {n_chunks} replans × up to {steps_per_replan} env steps/replan → '
         f'{roll.shape[0]} obs ({n_trans} transitions), goal_reached={reached}'
@@ -399,7 +399,7 @@ def main() -> None:
     if bool(args.value_heatmap):
         xlim, ylim = axis_limits(traj, roll, hats, d0, d1, s_g, s0, navigator=plot_nav, seg=None)
         tpl = np.asarray(roll[0], dtype=np.float32).reshape(-1)
-        XX, YY, ZZ, heat_vmin, heat_vmax = dqc_value_mesh_for_xy(
+        XX, YY, ZZ, heat_vmin, heat_vmax = value_mesh_for_xy(
             critic_agent,
             tpl,
             np.asarray(s_g, dtype=np.float32).reshape(-1),
@@ -415,7 +415,7 @@ def main() -> None:
         mp4_out = Path(args.out_mp4.strip()) if str(args.out_mp4).strip() else Path(args.out_path).with_suffix('.mp4')
         mp4_out.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _pf = min(action_chunk_horizon, goub_N)
+            _pf = min(action_chunk_horizon, dynamics_N)
             frames = overlay_rgb_frames_obs2d_panel(
                 env_frames,
                 traj,

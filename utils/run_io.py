@@ -12,7 +12,7 @@ import flax
 import numpy as np
 from ml_collections import ConfigDict
 
-from agents.goub_dynamics import get_dynamics_config
+from agents.dynamics import get_dynamics_config
 from utils.datasets import Dataset
 from utils.flax_utils import merge_checkpoint_state_dict
 
@@ -44,7 +44,7 @@ def pick_epoch(requested: int, suffixes: list[int], *, label: str = 'checkpoint'
 
 
 def load_checkpoint_pkl(agent: Any, pkl_path: Path) -> Any:
-    """Load ``params_*.pkl`` (joint runs save under ``{'agent': state_dict}``) into ``agent``."""
+    """Load ``params_*.pkl`` (training runs save under ``{'agent': state_dict}``) into ``agent``."""
     with open(pkl_path, 'rb') as f:
         load_dict = pickle.load(f)
     template = flax.serialization.to_state_dict(agent)
@@ -52,18 +52,18 @@ def load_checkpoint_pkl(agent: Any, pkl_path: Path) -> Any:
     return flax.serialization.from_state_dict(agent, merged)
 
 
-def resolve_goub_checkpoint_dir(run_dir: Path) -> Path:
-    """Return the directory holding GOUB ``params_*.pkl`` (joint runs use ``checkpoints/goub/``)."""
+def resolve_dynamics_checkpoint_dir(run_dir: Path) -> Path:
+    """Return the directory holding dynamics ``params_*.pkl`` (runs save under ``checkpoints/dynamics/``)."""
     base = Path(run_dir) / 'checkpoints'
     if not base.is_dir():
         raise FileNotFoundError(f'No checkpoints/ under {run_dir}')
     if list_checkpoint_suffixes(base):
         return base
-    nested = base / 'goub'
+    nested = base / 'dynamics'
     if nested.is_dir() and list_checkpoint_suffixes(nested):
         return nested
     raise FileNotFoundError(
-        f'No params_*.pkl under {base} or {nested} (expected GOUB checkpoints).'
+        f'No params_*.pkl under {base} or {nested} (expected dynamics checkpoints).'
     )
 
 
@@ -89,7 +89,7 @@ def resolve_actor_checkpoint_dir(run_dir: Path, *, required: bool = False) -> Pa
 
 
 def load_run_flags(run_dir: Path) -> tuple[ConfigDict, str]:
-    """Return ``(merged GOUB config, env_name)`` from ``flags.json`` in ``run_dir``."""
+    """Return ``(merged dynamics config, env_name)`` from ``flags.json`` in ``run_dir``."""
     flags_path = Path(run_dir) / 'flags.json'
     if not flags_path.is_file():
         raise FileNotFoundError(f'Missing flags.json under {run_dir}')
@@ -105,8 +105,8 @@ def load_run_flags(run_dir: Path) -> tuple[ConfigDict, str]:
     if agent_updates:
         for k, v in agent_updates.items():
             cfg[k] = v
-    elif isinstance(flags.get('goub'), dict):
-        for k, v in flags['goub'].items():
+    elif isinstance(flags.get('dynamics'), dict):
+        for k, v in flags['dynamics'].items():
             cfg[k] = v
     return cfg, env_name
 
@@ -166,7 +166,7 @@ __all__ = [
     'list_checkpoint_suffixes',
     'pick_epoch',
     'load_checkpoint_pkl',
-    'resolve_goub_checkpoint_dir',
+    'resolve_dynamics_checkpoint_dir',
     'resolve_critic_checkpoint_dir',
     'resolve_actor_checkpoint_dir',
     'load_run_flags',

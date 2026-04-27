@@ -1,4 +1,4 @@
-"""Smoke tests for the GOUB ``forward_bridge`` planner mode.
+"""Smoke tests for the linear-SDE dynamics ``forward_bridge`` planner mode.
 
 Covers:
 1. ``forward_bridge_coefficients`` returns ``(K+1,)`` arrays with exact
@@ -12,7 +12,7 @@ Covers:
    ``planner_type='forward_bridge_residual'`` go through ``plan()`` /
    ``sample_plan()`` without raising and produce endpoint-respecting
    paths.
-5. ``GOUBDynamicsAgent.update`` runs one step in each planner mode
+5. ``DynamicsAgent.update`` runs one step in each planner mode
    without NaNs.
 """
 
@@ -26,8 +26,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from utils.goub import forward_bridge_coefficients
-from agents.goub_dynamics import GOUBDynamicsAgent, get_dynamics_config
+from utils.dynamics import forward_bridge_coefficients
+from agents.dynamics import DynamicsAgent, get_dynamics_config
 
 
 STATE_DIM = 4
@@ -37,7 +37,7 @@ BATCH = 8
 
 def _make_agent(planner_type: str = 'reverse_score'):
     cfg = get_dynamics_config()
-    cfg.goub_N = 4
+    cfg.dynamics_N = 4
     cfg.subgoal_steps = 4
     cfg.rollout_horizon = 2
     cfg.eps_hidden_dims = (32, 32)
@@ -48,7 +48,7 @@ def _make_agent(planner_type: str = 'reverse_score'):
     cfg.planner_type = planner_type
     ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
     ex_act = np.zeros((BATCH, ACTION_DIM), dtype=np.float32)
-    return GOUBDynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
+    return DynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
 
 
 def _make_batch(K: int):
@@ -104,7 +104,7 @@ def test_forward_bridge_coefficients_endpoints():
 
 def test_forward_bridge_plan_shapes_and_endpoints():
     agent = _make_agent('forward_bridge')
-    K = int(agent.config['goub_N'])
+    K = int(agent.config['dynamics_N'])
     z0 = jnp.asarray(np.random.RandomState(1).randn(BATCH, STATE_DIM).astype(np.float32))
     zK = jnp.asarray(np.random.RandomState(2).randn(BATCH, STATE_DIM).astype(np.float32))
 
@@ -124,7 +124,7 @@ def test_forward_bridge_plan_shapes_and_endpoints():
 
 def test_reverse_score_plan_unchanged():
     agent = _make_agent('reverse_score')
-    K = int(agent.config['goub_N'])
+    K = int(agent.config['dynamics_N'])
     obs = jnp.asarray(np.random.RandomState(3).randn(BATCH, STATE_DIM).astype(np.float32))
     goal = jnp.asarray(np.random.RandomState(4).randn(BATCH, STATE_DIM).astype(np.float32))
 
@@ -141,7 +141,7 @@ def test_reverse_score_plan_unchanged():
 def test_forward_bridge_planner_dispatch():
     for planner in ('forward_bridge', 'forward_bridge_residual'):
         agent = _make_agent(planner)
-        K = int(agent.config['goub_N'])
+        K = int(agent.config['dynamics_N'])
         obs = jnp.asarray(np.random.RandomState(5).randn(BATCH, STATE_DIM).astype(np.float32))
         goal = jnp.asarray(np.random.RandomState(6).randn(BATCH, STATE_DIM).astype(np.float32))
 
@@ -159,7 +159,7 @@ def test_forward_bridge_planner_dispatch():
 def test_forward_bridge_total_loss_finite():
     for planner in ('reverse_score', 'forward_bridge', 'forward_bridge_residual'):
         agent = _make_agent(planner)
-        batch = _make_batch(int(agent.config['goub_N']))
+        batch = _make_batch(int(agent.config['dynamics_N']))
         agent2, info = agent.update(batch)
         loss_val = float(info['phase1/loss'])
         assert np.isfinite(loss_val), f'planner={planner} produced non-finite loss {loss_val}'

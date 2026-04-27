@@ -16,7 +16,7 @@ use_wandb: false
 use_tqdm: false
 
 batch_size: 1024
-joint_horizon: 25
+horizon: 25
 plan_candidates: 1
 # Used only when plan_candidates > 1.
 plan_noise_scale: 0.01
@@ -28,9 +28,9 @@ eval_max_chunks: 200
 eval_goal_tol: 0.5
 eval_goal_dims: "0,1"
 
-# Only fields that override defaults from agents/goub_dynamics.get_dynamics_config()
+# Only fields that override defaults from agents/dynamics.get_dynamics_config()
 # and agents/critic.get_config(). Everything else uses the agent defaults.
-goub:
+dynamics:
   rollout_loss_weight: 1.0      # default 0.25
   value_geom_sample: false      # default true; align with DQC-style relabeling
   subgoal_value_alpha: 0.1      # weight on V(s_g, g) in subgoal loss; 0 disables

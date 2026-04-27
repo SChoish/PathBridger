@@ -1,4 +1,4 @@
-"""Goal-conditioned DQC scalar value V(s, g) on an (x, y) grid for rollout video overlays."""
+"""Goal-conditioned scalar value V(s, g) on an (x, y) grid for rollout video overlays."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from agents.critic import DQCCriticAgent, get_config as get_critic_config
+from agents.critic import CriticAgent, get_config as get_critic_config
 from utils.datasets import Dataset
-from utils.dqc_sequence_dataset import DQCActionSeqDataset
+from utils.critic_sequence_dataset import CriticSequenceDataset
 from utils.run_io import (
     list_checkpoint_suffixes,
     load_checkpoint_pkl,
@@ -21,7 +21,7 @@ from utils.run_io import (
 )
 
 
-def load_dqc_critic_joint_run(
+def load_critic_for_run(
     run_dir: Path,
     critic_epoch: int,
     env: Any,
@@ -29,7 +29,7 @@ def load_dqc_critic_joint_run(
     *,
     seed: int,
 ) -> Any:
-    """Load ``DQCCriticAgent`` from a joint run (``flags.json`` + ``checkpoints/critic/``)."""
+    """Load ``CriticAgent`` from a run (``flags.json`` + ``checkpoints/critic/``)."""
     flags_path = run_dir / 'flags.json'
     if not flags_path.is_file():
         raise FileNotFoundError(f'Missing {flags_path}')
@@ -37,19 +37,19 @@ def load_dqc_critic_joint_run(
         root = json.load(f)
     ca = root.get('critic_agent')
     if not isinstance(ca, dict):
-        raise KeyError('flags.json must contain critic_agent for joint runs.')
+        raise KeyError('flags.json must contain critic_agent.')
     cfg = get_critic_config()
     for k, v in ca.items():
         cfg[k] = v
     cfg['action_dim'] = int(np.prod(env.action_space.shape))
 
     dataset = Dataset.create(**train_raw)
-    cds = DQCActionSeqDataset(dataset, cfg)
+    cds = CriticSequenceDataset(dataset, cfg)
     if len(cds.valid_starts) == 0:
-        raise ValueError('DQCActionSeqDataset has no valid starts.')
+        raise ValueError('CriticSequenceDataset has no valid starts.')
     idx0 = int(cds.valid_starts[0])
     ex = cds.sample(1, idxs=np.asarray([idx0], dtype=np.int64), evaluation=True)
-    agent = DQCCriticAgent.create(
+    agent = CriticAgent.create(
         int(seed),
         ex['observations'],
         ex['full_chunk_actions'],
@@ -63,7 +63,7 @@ def load_dqc_critic_joint_run(
     return load_checkpoint_pkl(agent, pkl_path)
 
 
-def dqc_value_mesh_for_xy(
+def value_mesh_for_xy(
     critic_agent: Any,
     template_obs: np.ndarray,
     goal: np.ndarray,

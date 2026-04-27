@@ -1,7 +1,8 @@
-"""Joint offline training for GOUB + DQC critic + SPI actor."""
+"""Offline training for linear-SDE dynamics + critic + SPI actor."""
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 import json
 import logging
@@ -23,22 +24,22 @@ import yaml
 from absl import app, flags
 
 from agents.critic import (
-    DQCCriticAgent,
+    CriticAgent,
     extract_critic_primary_score,
     get_config as get_critic_config,
-    validate_joint_mode,
+    validate_config,
 )
-from agents.actor import JointActorAgent, get_actor_config
-from agents.goub_dynamics import GOUBDynamicsAgent, get_dynamics_config
+from agents.actor import ActorAgent, get_actor_config
+from agents.dynamics import DynamicsAgent, get_dynamics_config
 from utils.datasets import Dataset, PathHGCDataset
-from utils.dqc_sequence_dataset import DQCActionSeqDataset
+from utils.critic_sequence_dataset import CriticSequenceDataset
 from utils.env_utils import make_env_and_datasets
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 from utils.run_io import goal_distance, goal_within_tol, parse_int_list
 
 FLAGS = flags.FLAGS
-_DEFAULT_JOINT_HORIZON = 25
+_DEFAULT_HORIZON = 25
 
 
 def _impl_dir():
@@ -82,13 +83,18 @@ flags.DEFINE_integer('log_every_n_epochs', 1, 'Log interval (epochs).')
 flags.DEFINE_integer('save_every_n_epochs', 100, 'Checkpoint interval.')
 flags.DEFINE_boolean('use_wandb', False, 'W&B.')
 flags.DEFINE_boolean('use_tqdm', False, 'tqdm over epochs.')
-flags.DEFINE_integer('batch_size', 256, 'Shared batch size for GOUB, critic, and actor.')
+flags.DEFINE_integer('batch_size', 256, 'Shared batch size for dynamics, critic, and actor.')
 flags.DEFINE_integer(
-    'joint_horizon', _DEFAULT_JOINT_HORIZON, 'Shared horizon for goub_N, subgoal_steps, and full_chunk_horizon.'
+    'horizon', _DEFAULT_HORIZON, 'Shared horizon for dynamics_N, subgoal_steps, and full_chunk_horizon.'
 )
-flags.DEFINE_integer('plan_candidates', 1, 'Number of GOUB candidate plans scored by the critic.')
-flags.DEFINE_float('plan_noise_scale', 1.0, 'Noise scale used for stochastic GOUB plan sampling.')
+flags.DEFINE_integer('plan_candidates', 1, 'Number of dynamics candidate plans scored by the critic.')
+flags.DEFINE_float('plan_noise_scale', 1.0, 'Noise scale used for stochastic dynamics plan sampling.')
 flags.DEFINE_boolean('measure_timing', False, 'Whether to measure and log per-phase wall-clock timings.')
+flags.DEFINE_boolean(
+    'async_prefetch',
+    True,
+    'Overlap host-side batch sampling with GPU work via a single-worker prefetch thread.',
+)
 flags.DEFINE_integer(
     'eval_freq',
     100,
@@ -146,10 +152,14 @@ def _resolve_resume_snapshot_config_path(run_dir: str) -> str | None:
     for key, value in fg.items():
         if key in skip:
             continue
+        # Backward-compat: legacy flag name was ``joint_horizon``; map to ``horizon``.
+        if key == 'joint_horizon':
+            root.setdefault('horizon', value)
+            continue
         if hasattr(FLAGS, key):
             root[key] = value
-    if snap.get('goub') is not None:
-        root['goub'] = snap['goub']
+    if snap.get('dynamics') is not None:
+        root['dynamics'] = snap['dynamics']
     if snap.get('critic_agent') is not None:
         root['critic_agent'] = snap['critic_agent']
     if snap.get('actor') is not None:
@@ -172,28 +182,28 @@ def _argv_sets_flag(flag_name: str) -> bool:
 
 
 def _apply_yaml_to_flags(data: dict) -> tuple[dict, dict, dict]:
-    goub_updates = data.pop('goub', None)
+    dynamics_updates = data.pop('dynamics', None)
     critic_updates = data.pop('critic_agent', None)
     actor_updates = data.pop('actor', None)
-    for name, updates in [('goub', goub_updates), ('critic_agent', critic_updates), ('actor', actor_updates)]:
+    for name, updates in [('dynamics', dynamics_updates), ('critic_agent', critic_updates), ('actor', actor_updates)]:
         if updates is not None and not isinstance(updates, dict):
             raise ValueError(f'YAML key "{name}" must be a mapping.')
 
     # Allow forward-bridge planner knobs at the top level for ergonomic YAML
-    # (route them into goub_updates so the dynamics-agent config picks them up).
+    # (route them into dynamics_updates so the dynamics-agent config picks them up).
     if 'planner_type' in data:
-        goub_updates = goub_updates or {}
-        goub_updates.setdefault('planner_type', data.pop('planner_type'))
+        dynamics_updates = dynamics_updates or {}
+        dynamics_updates.setdefault('planner_type', data.pop('planner_type'))
     if 'forward_bridge' in data:
-        goub_updates = goub_updates or {}
-        goub_updates.setdefault('forward_bridge', data.pop('forward_bridge'))
+        dynamics_updates = dynamics_updates or {}
+        dynamics_updates.setdefault('forward_bridge', data.pop('forward_bridge'))
 
-    # Flatten ``goub.forward_bridge: { mode, noise_scale, ... }`` into the
+    # Flatten ``dynamics.forward_bridge: { mode, noise_scale, ... }`` into the
     # individual ``forward_bridge_*`` keys recognised by the dynamics config.
-    if isinstance(goub_updates, dict) and isinstance(goub_updates.get('forward_bridge'), dict):
-        fb = goub_updates.pop('forward_bridge')
+    if isinstance(dynamics_updates, dict) and isinstance(dynamics_updates.get('forward_bridge'), dict):
+        fb = dynamics_updates.pop('forward_bridge')
         for k, v in fb.items():
-            goub_updates.setdefault(f'forward_bridge_{k}', v)
+            dynamics_updates.setdefault(f'forward_bridge_{k}', v)
 
     # Migrate legacy actor key names to canonical ones (e.g., spi_goal_conditioning ->
     # spi_conditioned) so older YAMLs and flags.json snapshots keep working.
@@ -205,13 +215,20 @@ def _apply_yaml_to_flags(data: dict) -> tuple[dict, dict, dict]:
                 # If both are present, drop the legacy one.
                 actor_updates.pop(old, None)
 
+    # Backward-compat: legacy snapshots / configs use ``joint_horizon`` for the
+    # shared horizon flag now exposed as ``horizon``.
+    if 'joint_horizon' in data and 'horizon' not in data:
+        data['horizon'] = data.pop('joint_horizon')
+    elif 'joint_horizon' in data:
+        data.pop('joint_horizon', None)
+
     for key, value in data.items():
         if not hasattr(FLAGS, key):
             raise ValueError(f'Unknown YAML top-level key: {key!r}')
         if _argv_sets_flag(key):
             continue
         setattr(FLAGS, key, value)
-    return goub_updates or {}, critic_updates or {}, actor_updates or {}
+    return dynamics_updates or {}, critic_updates or {}, actor_updates or {}
 
 
 def _setup_file_logger(run_dir: str, *, resume_epoch: int = 0) -> tuple[logging.Logger, str]:
@@ -221,7 +238,7 @@ def _setup_file_logger(run_dir: str, *, resume_epoch: int = 0) -> tuple[logging.
     else:
         log_name = 'run.log'
     log_path = os.path.join(run_dir, log_name)
-    logger = logging.getLogger('joint')
+    logger = logging.getLogger('train')
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fh = logging.FileHandler(log_path, encoding='utf-8')
@@ -284,7 +301,7 @@ def _emit_time_sums(metrics: dict[str, float], prefix: str, time_sums: dict[str,
 
 def _format_epoch_log(metrics: dict[str, float]) -> str:
     parts = [
-        f"goub={metrics['train/goub/loss_epoch_mean']:.6f}",
+        f"dyn={metrics['train/dynamics/loss_epoch_mean']:.6f}",
         f"critic={metrics['train/critic/loss_epoch_mean']:.6f}",
     ]
     if 'train/actor/loss_epoch_mean' in metrics:
@@ -294,11 +311,11 @@ def _format_epoch_log(metrics: dict[str, float]) -> str:
     parts.append(f"coupling={metrics['train/coupling/critic_score_epoch_mean']:.6f}")
 
     detail_keys = [
-        ('goub_g', 'train/goub/phase1/loss_goub_epoch_mean'),
-        ('goub_path', 'train/goub/phase1/loss_path_step_epoch_mean'),
-        ('goub_roll', 'train/goub/phase1/loss_roll_epoch_mean'),
-        ('goub_sub', 'train/goub/phase1/loss_subgoal_epoch_mean'),
-        ('goub_idm', 'train/goub/phase1/loss_idm_epoch_mean'),
+        ('dyn_g', 'train/dynamics/phase1/loss_dynamics_epoch_mean'),
+        ('dyn_path', 'train/dynamics/phase1/loss_path_step_epoch_mean'),
+        ('dyn_roll', 'train/dynamics/phase1/loss_roll_epoch_mean'),
+        ('dyn_sub', 'train/dynamics/phase1/loss_subgoal_epoch_mean'),
+        ('dyn_idm', 'train/dynamics/phase1/loss_idm_epoch_mean'),
         ('critic_chunk', 'train/critic/chunk_critic/critic_loss_epoch_mean'),
         ('critic_distill', 'train/critic/action_critic/distill_loss_epoch_mean'),
         ('critic_value', 'train/critic/action_critic/value_loss_epoch_mean'),
@@ -314,7 +331,7 @@ def _format_epoch_log(metrics: dict[str, float]) -> str:
         ('t_sample', 'time/build/sample_plan_epoch_sec'),
         ('t_idm', 'time/build/idm_epoch_sec'),
         ('t_score', 'time/build/score_epoch_sec'),
-        ('t_goub', 'time/goub_update_epoch_sec'),
+        ('t_dyn', 'time/dynamics_update_epoch_sec'),
         ('t_critic', 'time/critic_update_epoch_sec'),
         ('t_actor_rescore', 'time/actor_rescore_epoch_sec'),
         ('t_actor', 'time/actor_update_epoch_sec'),
@@ -326,41 +343,59 @@ def _format_epoch_log(metrics: dict[str, float]) -> str:
     return ' '.join(parts)
 
 
-def _apply_joint_horizon(goub_config: Any, critic_config: Any) -> tuple[Any, Any]:
-    joint_horizon = int(FLAGS.joint_horizon)
-    if joint_horizon < 1:
-        raise ValueError(f'joint_horizon must be >= 1, got {joint_horizon}.')
-    goub_config['goub_N'] = joint_horizon
-    goub_config['subgoal_steps'] = joint_horizon
-    critic_config['full_chunk_horizon'] = joint_horizon
-    return goub_config, critic_config
+def _apply_horizon(dynamics_config: Any, critic_config: Any) -> tuple[Any, Any]:
+    horizon = int(FLAGS.horizon)
+    if horizon < 1:
+        raise ValueError(f'horizon must be >= 1, got {horizon}.')
+    dynamics_config['dynamics_N'] = horizon
+    dynamics_config['subgoal_steps'] = horizon
+    critic_config['full_chunk_horizon'] = horizon
+    return dynamics_config, critic_config
 
 
-def _require_matching_frame_stack(goub_config: Any, critic_config: Any) -> None:
+def _require_matching_frame_stack(dynamics_config: Any, critic_config: Any) -> None:
     frame_stacks = {
-        'goub': goub_config.get('frame_stack', None),
+        'dynamics': dynamics_config.get('frame_stack', None),
         'critic': critic_config.get('frame_stack', None),
     }
     if len({str(v) for v in frame_stacks.values()}) != 1:
-        raise ValueError(f'Joint training requires matching frame_stack across modules, got {frame_stacks}.')
+        raise ValueError(f'Training requires matching frame_stack across modules, got {frame_stacks}.')
 
 
 def _make_critic_dataset(train_plain: dict, critic_config: Any):
     dataset = Dataset.create(**train_plain)
-    return DQCActionSeqDataset(dataset, critic_config)
+    return CriticSequenceDataset(dataset, critic_config)
 
 
-def _intersect_valid_starts(goub_dataset: PathHGCDataset, critic_dataset: Any) -> np.ndarray:
-    common = np.intersect1d(goub_dataset.path_valid_idxs, critic_dataset.valid_starts, assume_unique=False)
+def _intersect_valid_starts(dynamics_dataset: PathHGCDataset, critic_dataset: Any) -> np.ndarray:
+    common = np.intersect1d(dynamics_dataset.path_valid_idxs, critic_dataset.valid_starts, assume_unique=False)
     common = np.asarray(common, dtype=np.int64)
     if len(common) == 0:
-        raise ValueError('No shared valid starts across GOUB and critic datasets.')
+        raise ValueError('No shared valid starts across dynamics and critic datasets.')
     return common
 
 
 def _sample_shared_idxs(common_valid_starts: np.ndarray, batch_size: int) -> np.ndarray:
     picked = np.random.randint(len(common_valid_starts), size=batch_size)
     return common_valid_starts[picked]
+
+
+def _prepare_train_batch(
+    common_valid_starts: np.ndarray,
+    batch_size: int,
+    dynamics_dataset,
+    critic_dataset,
+):
+    """Sample one (dynamics, critic) batch from the host datasets.
+
+    Pure CPU work; safe to run on a prefetch worker thread because the only
+    shared state is NumPy's global RNG, and we serialize prefetch through a
+    single-worker executor so randint() calls remain deterministic in order.
+    """
+    idxs = _sample_shared_idxs(common_valid_starts, batch_size)
+    dynamics_batch = dynamics_dataset.sample(batch_size, idxs=idxs)
+    critic_batch = critic_dataset.sample(batch_size, idxs=idxs)
+    return dynamics_batch, critic_batch
 
 
 def _eval_batch_size(common_valid_starts: np.ndarray, batch_size: int) -> int:
@@ -377,14 +412,14 @@ def _idm_actions_from_trajectories_jit(network: Any, trajectories: jnp.ndarray, 
     return jnp.asarray(pred, dtype=jnp.float32).reshape(trajectories.shape[0], horizon, -1)
 
 
-def _idm_actions_from_trajectories(goub_agent: GOUBDynamicsAgent, trajectories: np.ndarray, horizon: int) -> jnp.ndarray:
+def _idm_actions_from_trajectories(dynamics_agent: DynamicsAgent, trajectories: np.ndarray, horizon: int) -> jnp.ndarray:
     if trajectories.shape[1] <= horizon:
         raise ValueError(
-            f'GOUB trajectory length {trajectories.shape[1]} is too short for horizon={horizon}. '
-            'Increase goub_N / subgoal_steps or reduce chunk horizons.'
+            f'Dynamics trajectory length {trajectories.shape[1]} is too short for horizon={horizon}. '
+            'Increase dynamics_N / subgoal_steps or reduce chunk horizons.'
         )
     trajectories = jnp.asarray(trajectories, dtype=jnp.float32)
-    return _idm_actions_from_trajectories_jit(goub_agent.network, trajectories, horizon)
+    return _idm_actions_from_trajectories_jit(dynamics_agent.network, trajectories, horizon)
 
 
 def _rank_candidate_actions(
@@ -488,14 +523,14 @@ def _proposal_goal_stats_jit(
     }
 
 
-def _build_actor_batch_from_goub(
-    goub_agent: GOUBDynamicsAgent,
+def _build_actor_batch_from_dynamics(
+    dynamics_agent: DynamicsAgent,
     critic_agent: Any,
-    goub_batch: dict,
+    dynamics_batch: dict,
     actor_config: Any,
-) -> tuple[GOUBDynamicsAgent, dict, dict, dict[str, float]]:
-    obs = jnp.asarray(goub_batch['observations'], dtype=jnp.float32)
-    high_goals = jnp.asarray(goub_batch['high_actor_goals'], dtype=jnp.float32)
+) -> tuple[DynamicsAgent, dict, dict, dict[str, float]]:
+    obs = jnp.asarray(dynamics_batch['observations'], dtype=jnp.float32)
+    high_goals = jnp.asarray(dynamics_batch['high_actor_goals'], dtype=jnp.float32)
     measure_timing = bool(FLAGS.measure_timing)
     timing = {}
 
@@ -504,10 +539,10 @@ def _build_actor_batch_from_goub(
     if measure_timing:
         t0 = time.perf_counter()
     sample_noise_scale = float(FLAGS.plan_noise_scale) if plan_candidates > 1 else 0.0
-    actor_goal_mean, candidate_actions, candidate_goals, plan_rng = goub_agent.build_actor_proposals(
+    actor_goal_mean, candidate_actions, candidate_goals, plan_rng = dynamics_agent.build_actor_proposals(
         obs,
         high_goals,
-        goub_agent.rng,
+        dynamics_agent.rng,
         proposal_horizon=proposal_horizon,
         plan_candidates=plan_candidates,
         sample_noise_scale=sample_noise_scale,
@@ -517,11 +552,11 @@ def _build_actor_batch_from_goub(
         timing['proposal_build'] = time.perf_counter() - t0
     else:
         timing = {}
-    goub_agent = goub_agent.replace(rng=plan_rng)
+    dynamics_agent = dynamics_agent.replace(rng=plan_rng)
     # ``spi_goals`` is the conditioning vector both pi(s, g) and Q(s, g, a) see in
-    # ``JointActorAgent.actor_loss``. ``actor_config.spi_conditioned`` selects which
+    # ``ActorAgent.actor_loss``. ``actor_config.spi_conditioned`` selects which
     # (legacy alias ``spi_goal_conditioning`` is still accepted):
-    #   'subgoal' (default): use the GOUB-predicted local subgoal mean (mirrors training).
+    #   'subgoal' (default): use the dynamics-predicted local subgoal mean (mirrors training).
     #   'goal'             : use the global ``high_goals`` directly.
     # Candidate proposal chunks are unchanged in either mode (still planned to the
     # subgoal); only the conditioning vector flips, keeping pi/Q consistent.
@@ -531,7 +566,7 @@ def _build_actor_batch_from_goub(
     if spi_cond == 'goal':
         spi_goals = high_goals
     elif spi_cond == 'subgoal':
-        use_mean_for_actor = bool(goub_agent.config.get('subgoal_use_mean_for_actor_goal', True))
+        use_mean_for_actor = bool(dynamics_agent.config.get('subgoal_use_mean_for_actor_goal', True))
         spi_goals = actor_goal_mean if use_mean_for_actor else high_goals
     else:
         raise ValueError(
@@ -540,7 +575,7 @@ def _build_actor_batch_from_goub(
     actor_batch = {
         'observations': obs,
         'spi_goals': spi_goals,
-        # Candidate action chunks generated from GOUB proposals; rescored after critic update.
+        # Candidate action chunks generated from dynamics proposals; rescored after critic update.
         # Shape: [B, N, ha, A]
         'candidate_partial_chunks': candidate_actions,
         'valids': jnp.ones((obs.shape[0], proposal_horizon), dtype=jnp.float32),
@@ -561,7 +596,7 @@ def _build_actor_batch_from_goub(
         'coupling/critic_score_gap_top1_top2': nan,
         'coupling/proposal_count': jnp.asarray(float(candidate_actions.shape[1]), dtype=jnp.float32),
     }
-    return goub_agent, actor_batch, coupling_info, timing
+    return dynamics_agent, actor_batch, coupling_info, timing
 
 
 def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_config: Any) -> tuple[dict, dict]:
@@ -607,52 +642,52 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
     )
 
 
-def _build_joint_batches_dqc(
-    goub_agent: GOUBDynamicsAgent,
+def _build_train_batches(
+    dynamics_agent: DynamicsAgent,
     critic_agent: Any,
-    goub_batch: dict,
+    dynamics_batch: dict,
     critic_batch: dict,
     actor_config: Any,
-) -> tuple[GOUBDynamicsAgent, dict, dict, dict, dict[str, float]]:
-    goub_agent, actor_batch, coupling_info, build_timing = _build_actor_batch_from_goub(
-        goub_agent, critic_agent, goub_batch, actor_config
+) -> tuple[DynamicsAgent, dict, dict, dict, dict[str, float]]:
+    dynamics_agent, actor_batch, coupling_info, build_timing = _build_actor_batch_from_dynamics(
+        dynamics_agent, critic_agent, dynamics_batch, actor_config
     )
-    return goub_agent, critic_batch, actor_batch, coupling_info, build_timing
+    return dynamics_agent, critic_batch, actor_batch, coupling_info, build_timing
 
 
 def _merge_actor_updates(actor_config: Any, actor_updates: dict) -> Any:
     ignored = sorted(k for k in actor_updates.keys() if k not in _SPI_ACTOR_KEYS)
     if ignored:
-        logging.warning('Ignoring deprecated non-SPI actor keys in joint mode: %s', ', '.join(ignored))
+        logging.warning('Ignoring deprecated non-SPI actor keys: %s', ', '.join(ignored))
     for key in _SPI_ACTOR_KEYS:
         if key in actor_updates:
             actor_config[key] = actor_updates[key]
     return actor_config
 
 
-def _prepare_joint_configs(goub_updates: dict, critic_updates: dict, actor_updates: dict):
-    goub_config = _update_config(get_dynamics_config(), goub_updates)
+def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates: dict):
+    dynamics_config = _update_config(get_dynamics_config(), dynamics_updates)
     critic_config = _update_config(get_critic_config(), critic_updates)
     actor_config = _merge_actor_updates(get_actor_config(), actor_updates)
-    goub_config, critic_config = _apply_joint_horizon(goub_config, critic_config)
+    dynamics_config, critic_config = _apply_horizon(dynamics_config, critic_config)
     actor_config['actor_chunk_horizon'] = int(critic_config['action_chunk_horizon'])
     # Subgoal-value bonus net shares parameters with the critic value net, so its
     # architecture must mirror the critic; force-sync here so users only configure it once.
-    goub_config['subgoal_value_hidden_dims'] = tuple(int(x) for x in critic_config['value_hidden_dims'])
-    goub_config['subgoal_value_layer_norm'] = bool(critic_config['layer_norm'])
-    validate_joint_mode(critic_config, actor_config)
+    dynamics_config['subgoal_value_hidden_dims'] = tuple(int(x) for x in critic_config['value_hidden_dims'])
+    dynamics_config['subgoal_value_layer_norm'] = bool(critic_config['layer_norm'])
+    validate_config(critic_config, actor_config)
     shared_batch = int(FLAGS.batch_size)
     if shared_batch < 1:
         raise ValueError(f'batch_size must be >= 1, got {shared_batch}.')
-    goub_config['batch_size'] = shared_batch
+    dynamics_config['batch_size'] = shared_batch
     critic_config['batch_size'] = shared_batch
     actor_config['batch_size'] = shared_batch
-    _require_matching_frame_stack(goub_config, critic_config)
-    return goub_config, critic_config, actor_config
+    _require_matching_frame_stack(dynamics_config, critic_config)
+    return dynamics_config, critic_config, actor_config
 
 
 def _create_critic_agent(seed: int, ex: dict, critic_config):
-    return DQCCriticAgent.create(
+    return CriticAgent.create(
         seed,
         ex['observations'],
         ex['full_chunk_actions'],
@@ -662,12 +697,12 @@ def _create_critic_agent(seed: int, ex: dict, critic_config):
     )
 
 
-def _create_actor_agent(seed: int, ex_goub: dict, actor_config):
-    return JointActorAgent.create(
+def _create_actor_agent(seed: int, ex_dynamics: dict, actor_config):
+    return ActorAgent.create(
         seed,
-        ex_goub['observations'],
+        ex_dynamics['observations'],
         actor_config,
-        ex_goals=ex_goub.get('high_actor_targets'),
+        ex_goals=ex_dynamics.get('high_actor_targets'),
     )
 
 
@@ -703,21 +738,21 @@ def _execute_action_chunk(
 
 
 def _idm_action_chunk(
-    goub_agent: GOUBDynamicsAgent,
+    dynamics_agent: DynamicsAgent,
     obs: np.ndarray,
     predicted_subgoal: np.ndarray,
     horizon: int,
 ) -> np.ndarray:
-    traj = np.asarray(goub_agent.plan(obs, predicted_subgoal)['trajectory'], dtype=np.float32)
+    traj = np.asarray(dynamics_agent.plan(obs, predicted_subgoal)['trajectory'], dtype=np.float32)
     if traj.ndim != 2:
         raise RuntimeError(f'Expected single-trajectory plan with rank 2, got shape={traj.shape}.')
-    action_chunk = np.asarray(_idm_actions_from_trajectories(goub_agent, traj[None, ...], horizon), dtype=np.float32)
+    action_chunk = np.asarray(_idm_actions_from_trajectories(dynamics_agent, traj[None, ...], horizon), dtype=np.float32)
     return action_chunk[0]
 
 
 def _evaluate_env_tasks(
     env,
-    goub_agent: GOUBDynamicsAgent,
+    dynamics_agent: DynamicsAgent,
     actor_agent: Any,
     actor_config: Any,
     critic_config: Any,
@@ -736,9 +771,9 @@ def _evaluate_env_tasks(
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     actor_horizon = int(actor_config['actor_chunk_horizon'])
     idm_horizon = int(critic_config['action_chunk_horizon'])
-    # Mirror training-time conditioning: 'subgoal' -> pi sees GOUB predict_subgoal(obs, g);
+    # Mirror training-time conditioning: 'subgoal' -> pi sees dynamics predict_subgoal(obs, g);
     # 'goal' -> pi sees the global goal directly. IDM eval below always uses predicted
-    # subgoals because GOUB IDM is the chunk planner targeting subgoal endpoints.
+    # subgoals because dynamics IDM is the chunk planner targeting subgoal endpoints.
     # Accept both the canonical key and the legacy alias.
     actor_uses_goal = (
         str(
@@ -765,7 +800,7 @@ def _evaluate_env_tasks(
             for _ in range(max(1, int(max_chunks))):
                 if success or terminated or truncated:
                     break
-                predicted_subgoal = np.asarray(goub_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+                predicted_subgoal = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
                 actor_goal_input = goal if actor_uses_goal else predicted_subgoal
                 action_chunk = np.asarray(actor_agent.sample_actions(obs, actor_goal_input), dtype=np.float32).reshape(
                     actor_horizon, -1
@@ -794,8 +829,8 @@ def _evaluate_env_tasks(
             for _ in range(max(1, int(max_chunks))):
                 if success or terminated or truncated:
                     break
-                predicted_subgoal = np.asarray(goub_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-                action_chunk = _idm_action_chunk(goub_agent, obs, predicted_subgoal, idm_horizon)
+                predicted_subgoal = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+                action_chunk = _idm_action_chunk(dynamics_agent, obs, predicted_subgoal, idm_horizon)
                 obs, success, terminated, truncated = _execute_action_chunk(
                     env,
                     obs,
@@ -843,21 +878,21 @@ def main(_):
             cfg_path = resume_snapshot_path
         else:
             print(
-                f'[joint] WARN resume_use_run_snapshot_config but no flags.json or config_used.yaml '
+                f'[train] WARN resume_use_run_snapshot_config but no flags.json or config_used.yaml '
                 f'in {resume_run_dir!r}; using default run_config: {cfg_path}',
                 file=sys.stderr,
             )
 
-    goub_updates, critic_updates, actor_updates = {}, {}, {}
+    dynamics_updates, critic_updates, actor_updates = {}, {}, {}
     if os.path.isfile(cfg_path):
-        goub_updates, critic_updates, actor_updates = _apply_yaml_to_flags(_load_yaml(cfg_path))
+        dynamics_updates, critic_updates, actor_updates = _apply_yaml_to_flags(_load_yaml(cfg_path))
     elif FLAGS.run_config.strip():
         raise FileNotFoundError(f'run_config YAML not found: {cfg_path}')
     else:
         raise FileNotFoundError(f'run_config YAML not found: {cfg_path}')
 
-    goub_config, critic_config, actor_config = _prepare_joint_configs(
-        goub_updates,
+    dynamics_config, critic_config, actor_config = _prepare_configs(
+        dynamics_updates,
         critic_updates,
         actor_updates,
     )
@@ -870,24 +905,24 @@ def main(_):
     else:
         ts = time.strftime('%Y%m%d_%H%M%S')
         env_tok = _sanitize_token(FLAGS.env_name)
-        run_folder = f'{ts}_joint_dqc_seed{FLAGS.seed}_{env_tok}'
+        run_folder = f'{ts}_seed{FLAGS.seed}_{env_tok}'
         run_dir = os.path.join(runs_root, run_folder)
     ckpt_root = os.path.join(run_dir, 'checkpoints')
-    goub_ckpt_dir = os.path.join(ckpt_root, 'goub')
+    dynamics_ckpt_dir = os.path.join(ckpt_root, 'dynamics')
     critic_ckpt_dir = os.path.join(ckpt_root, 'critic')
     actor_ckpt_dir = os.path.join(ckpt_root, 'actor')
-    os.makedirs(goub_ckpt_dir, exist_ok=True)
+    os.makedirs(dynamics_ckpt_dir, exist_ok=True)
     os.makedirs(critic_ckpt_dir, exist_ok=True)
     os.makedirs(actor_ckpt_dir, exist_ok=True)
     if os.path.isfile(cfg_path) and not resume_run_dir:
         shutil.copy2(cfg_path, os.path.join(run_dir, 'config_used.yaml'))
 
-    exp_name = get_exp_name(FLAGS.seed, env_name=FLAGS.env_name, agent_name='joint_dqc')
+    exp_name = get_exp_name(FLAGS.seed, env_name=FLAGS.env_name, agent_name='train')
     if FLAGS.use_wandb:
-        setup_wandb(project='OGBench-Joint', group=FLAGS.run_group, name=exp_name)
+        setup_wandb(project='OGBench', group=FLAGS.run_group, name=exp_name)
 
     run_logger, run_log_path = _setup_file_logger(run_dir, resume_epoch=resume_epoch if resume_run_dir else 0)
-    run_logger.info('run_dir=%s critic=dqc', run_dir)
+    run_logger.info('run_dir=%s', run_dir)
     run_logger.info('log_path=%s', run_log_path)
     if resume_snapshot_path is not None:
         run_logger.info('resume hyperparameters from snapshot file: %s', resume_snapshot_path)
@@ -901,7 +936,7 @@ def main(_):
         json.dump(
             dict(
                 flags=get_flag_dict(),
-                goub=goub_config.to_dict(),
+                dynamics=dynamics_config.to_dict(),
                 critic_agent=critic_config.to_dict(),
                 actor=actor_config.to_dict(),
             ),
@@ -909,41 +944,41 @@ def main(_):
             indent=2,
         )
 
-    goub_dataset = PathHGCDataset(Dataset.create(**train_plain), goub_config)
+    dynamics_dataset = PathHGCDataset(Dataset.create(**train_plain), dynamics_config)
     critic_dataset = _make_critic_dataset(train_plain, critic_config)
-    common_valid_starts = _intersect_valid_starts(goub_dataset, critic_dataset)
-    if int(goub_config['goub_N']) < int(actor_config['actor_chunk_horizon']):
+    common_valid_starts = _intersect_valid_starts(dynamics_dataset, critic_dataset)
+    if int(dynamics_config['dynamics_N']) < int(actor_config['actor_chunk_horizon']):
         raise ValueError(
-            f'goub_N={int(goub_config["goub_N"])} must be >= actor_chunk_horizon={int(actor_config["actor_chunk_horizon"])} '
-            'for critic-ranked GOUB proposals.'
+            f'dynamics_N={int(dynamics_config["dynamics_N"])} must be >= actor_chunk_horizon={int(actor_config["actor_chunk_horizon"])} '
+            'for critic-ranked dynamics proposals.'
         )
 
     np.random.seed(FLAGS.seed)
-    ex_idxs = _sample_shared_idxs(common_valid_starts, int(goub_config['batch_size']))
-    ex_goub = goub_dataset.sample(len(ex_idxs), idxs=ex_idxs)
+    ex_idxs = _sample_shared_idxs(common_valid_starts, int(dynamics_config['batch_size']))
+    ex_dynamics = dynamics_dataset.sample(len(ex_idxs), idxs=ex_idxs)
     ex_critic = critic_dataset.sample(len(ex_idxs), idxs=ex_idxs)
 
-    goub_agent = GOUBDynamicsAgent.create(
+    dynamics_agent = DynamicsAgent.create(
         FLAGS.seed,
-        ex_goub['observations'],
-        goub_config,
-        ex_actions=ex_goub['actions'],
+        ex_dynamics['observations'],
+        dynamics_config,
+        ex_actions=ex_dynamics['actions'],
     )
     critic_agent = _create_critic_agent(FLAGS.seed, ex_critic, critic_config)
-    actor_agent = _create_actor_agent(FLAGS.seed, ex_goub, actor_config)
+    actor_agent = _create_actor_agent(FLAGS.seed, ex_dynamics, actor_config)
     if resume_run_dir:
-        goub_agent = restore_agent(goub_agent, goub_ckpt_dir, resume_epoch)
+        dynamics_agent = restore_agent(dynamics_agent, dynamics_ckpt_dir, resume_epoch)
         critic_agent = restore_agent(critic_agent, critic_ckpt_dir, resume_epoch)
         actor_agent = restore_agent(actor_agent, actor_ckpt_dir, resume_epoch)
 
-    batch_size = int(goub_config['batch_size'])
+    batch_size = int(dynamics_config['batch_size'])
     spe = _steps_per_epoch(len(common_valid_starts), batch_size)
     run_logger.info(
-        'shared_valid_starts=%d batch_size=%d steps_per_epoch=%d goub_h=%d critic_h=%d actor_h=%d',
+        'shared_valid_starts=%d batch_size=%d steps_per_epoch=%d dyn_h=%d critic_h=%d actor_h=%d',
         len(common_valid_starts),
         batch_size,
         spe,
-        int(goub_config['subgoal_steps']),
+        int(dynamics_config['subgoal_steps']),
         int(critic_config.get('full_chunk_horizon', 0)),
         int(actor_config.get('actor_chunk_horizon', 0)),
     )
@@ -965,21 +1000,43 @@ def main(_):
     if FLAGS.use_tqdm:
         epoch_iter = tqdm.tqdm(epoch_iter, smoothing=0.1, dynamic_ncols=True)
 
+    # Async batch prefetch: a single worker thread overlaps host-side numpy
+    # slicing for batch N+1 with GPU work for batch N. Single-worker
+    # ThreadPoolExecutor preserves the order of np.random calls so the
+    # sampling sequence stays deterministic given the seed.
+    use_async_prefetch = bool(FLAGS.async_prefetch)
+    prefetch_pool = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix='train-prefetch')
+        if use_async_prefetch
+        else None
+    )
+
+    def _submit_prefetch() -> Future:
+        return prefetch_pool.submit(
+            _prepare_train_batch,
+            common_valid_starts,
+            batch_size,
+            dynamics_dataset,
+            critic_dataset,
+        )
+
+    next_batch_future: Future | None = _submit_prefetch() if prefetch_pool is not None else None
+
     for epoch in epoch_iter:
         if measure_timing:
             epoch_start = time.perf_counter()
         data_time = 0.0
         build_time = 0.0
         build_detail_times = {}
-        goub_time = 0.0
+        dynamics_time = 0.0
         critic_time = 0.0
         actor_rescore_time = 0.0
         actor_time = 0.0
-        goub_metric_sums = {}
+        dynamics_metric_sums = {}
         critic_metric_sums = {}
         actor_metric_sums = {}
         coupling_metric_sums = {}
-        last_goub_info = None
+        last_dynamics_info = None
         last_critic_info = None
         last_actor_info = None
         last_coupling_info = None
@@ -987,18 +1044,22 @@ def main(_):
         for _ in range(spe):
             if measure_timing:
                 t0 = time.perf_counter()
-            idxs = _sample_shared_idxs(common_valid_starts, batch_size)
-            goub_batch = goub_dataset.sample(batch_size, idxs=idxs)
-            critic_batch = critic_dataset.sample(batch_size, idxs=idxs)
+            if next_batch_future is not None:
+                dynamics_batch, critic_batch = next_batch_future.result()
+                next_batch_future = _submit_prefetch()
+            else:
+                idxs = _sample_shared_idxs(common_valid_starts, batch_size)
+                dynamics_batch = dynamics_dataset.sample(batch_size, idxs=idxs)
+                critic_batch = critic_dataset.sample(batch_size, idxs=idxs)
             if measure_timing:
                 data_time += time.perf_counter() - t0
 
             if measure_timing:
                 t0 = time.perf_counter()
-            goub_agent, critic_batch, actor_batch, coupling_info, build_detail_info = _build_joint_batches_dqc(
-                goub_agent,
+            dynamics_agent, critic_batch, actor_batch, coupling_info, build_detail_info = _build_train_batches(
+                dynamics_agent,
                 critic_agent,
-                goub_batch,
+                dynamics_batch,
                 critic_batch,
                 actor_config,
             )
@@ -1009,13 +1070,13 @@ def main(_):
 
             if measure_timing:
                 t0 = time.perf_counter()
-            goub_agent, goub_info = goub_agent.update(
-                goub_batch,
+            dynamics_agent, dynamics_info = dynamics_agent.update(
+                dynamics_batch,
                 critic_value_params=_extract_critic_value_params(critic_agent),
             )
             if measure_timing:
-                _block_until_ready(goub_info)
-                goub_time += time.perf_counter() - t0
+                _block_until_ready(dynamics_info)
+                dynamics_time += time.perf_counter() - t0
 
             if measure_timing:
                 t0 = time.perf_counter()
@@ -1042,33 +1103,33 @@ def main(_):
                 _block_until_ready(actor_info)
                 actor_time += time.perf_counter() - t0
 
-            last_goub_info = goub_info
+            last_dynamics_info = dynamics_info
             last_critic_info = critic_info
             last_actor_info = actor_info
             last_coupling_info = coupling_info
 
-            _accumulate_metric_sums(goub_metric_sums, goub_info)
+            _accumulate_metric_sums(dynamics_metric_sums, dynamics_info)
             _accumulate_metric_sums(critic_metric_sums, critic_info)
             _accumulate_metric_sums(actor_metric_sums, actor_info)
             _accumulate_metric_sums(coupling_metric_sums, coupling_info)
 
         gstep = epoch * spe
         steps_done = spe
-        if epoch % FLAGS.log_every_n_epochs == 0 and last_goub_info is not None:
+        if epoch % FLAGS.log_every_n_epochs == 0 and last_dynamics_info is not None:
             metrics = {}
-            metrics.update(_to_host_metrics('train/goub', last_goub_info))
+            metrics.update(_to_host_metrics('train/dynamics', last_dynamics_info))
             metrics.update(_to_host_metrics('train/critic', last_critic_info))
             metrics.update(_to_host_metrics('train/actor', last_actor_info))
             metrics.update(_to_host_metrics('train', last_coupling_info))
             metrics['train/critic/primary_score'] = extract_critic_primary_score(last_critic_info)
-            _emit_metric_means(metrics, 'train/goub', goub_metric_sums, steps_done)
+            _emit_metric_means(metrics, 'train/dynamics', dynamics_metric_sums, steps_done)
             _emit_metric_means(metrics, 'train/critic', critic_metric_sums, steps_done)
             _emit_metric_means(metrics, 'train/actor', actor_metric_sums, steps_done)
             _emit_metric_means(metrics, 'train/coupling', coupling_metric_sums, steps_done)
             # Backward-compatible aliases for legacy log/dashboard consumers.
             _alias = {
-                'train/goub/loss_epoch_mean': 'train/goub/phase1/loss_epoch_mean',
-                'train/critic/loss_epoch_mean': 'train/critic/dqc_critic/total_loss_epoch_mean',
+                'train/dynamics/loss_epoch_mean': 'train/dynamics/phase1/loss_epoch_mean',
+                'train/critic/loss_epoch_mean': 'train/critic/total_loss_epoch_mean',
                 'train/value/loss_epoch_mean': 'train/critic/action_critic/value_loss_epoch_mean',
                 'train/actor/loss_epoch_mean': 'train/actor/spi_actor/actor_loss_epoch_mean',
                 'train/coupling/critic_score_epoch_mean': 'train/coupling/coupling/critic_score_mean_epoch_mean',
@@ -1081,7 +1142,7 @@ def main(_):
                 metrics.update(
                     _evaluate_env_tasks(
                         env,
-                        goub_agent,
+                        dynamics_agent,
                         actor_agent,
                         actor_config,
                         critic_config,
@@ -1097,14 +1158,14 @@ def main(_):
                 metrics['time/data_epoch_sec'] = data_time
                 metrics['time/build_batches_epoch_sec'] = build_time
                 _emit_time_sums(metrics, 'time/build', build_detail_times, spe)
-                metrics['time/goub_update_epoch_sec'] = goub_time
+                metrics['time/dynamics_update_epoch_sec'] = dynamics_time
                 metrics['time/critic_update_epoch_sec'] = critic_time
                 metrics['time/actor_rescore_epoch_sec'] = actor_rescore_time
                 metrics['time/actor_update_epoch_sec'] = actor_time
                 metrics['time/epoch_compute_sec'] = time.perf_counter() - epoch_start
                 metrics['time/data_step_sec'] = data_time / spe
                 metrics['time/build_batches_step_sec'] = build_time / spe
-                metrics['time/goub_update_step_sec'] = goub_time / spe
+                metrics['time/dynamics_update_step_sec'] = dynamics_time / spe
                 metrics['time/critic_update_step_sec'] = critic_time / spe
                 metrics['time/actor_rescore_step_sec'] = actor_rescore_time / spe
                 metrics['time/actor_update_step_sec'] = actor_time / spe
@@ -1149,9 +1210,15 @@ def main(_):
                 run_logger.info('=== EVAL END epoch=%d ===', epoch)
 
         if epoch % FLAGS.save_every_n_epochs == 0:
-            save_agent(goub_agent, goub_ckpt_dir, epoch)
+            save_agent(dynamics_agent, dynamics_ckpt_dir, epoch)
             save_agent(critic_agent, critic_ckpt_dir, epoch)
             save_agent(actor_agent, actor_ckpt_dir, epoch)
+
+    if prefetch_pool is not None:
+        # Cancel any outstanding prefetch and tear down the worker thread.
+        if next_batch_future is not None and not next_batch_future.done():
+            next_batch_future.cancel()
+        prefetch_pool.shutdown(wait=False, cancel_futures=True)
 
     train_logger.close()
     run_logger.info('done run_dir=%s', run_dir)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Real-env rollout: GOUB ``predict_subgoal`` + joint chunk actor (same path as ``main._evaluate_env_tasks``).
+"""Real-env rollout: dynamics ``predict_subgoal`` + chunk actor (same path as ``main._evaluate_env_tasks``).
 
-Loads ``checkpoints/goub/params_<epoch>.pkl`` and ``checkpoints/actor/params_<epoch>.pkl`` from a joint run.
+Loads ``checkpoints/dynamics/params_<epoch>.pkl`` and ``checkpoints/actor/params_<epoch>.pkl`` from a training run.
 
 Example::
 
@@ -23,8 +23,8 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-from agents.actor import JointActorAgent, get_actor_config
-from agents.goub_dynamics import GOUBDynamicsAgent
+from agents.actor import ActorAgent, get_actor_config
+from agents.dynamics import DynamicsAgent
 from utils.datasets import Dataset
 from utils.env_utils import make_env_and_datasets
 from rollout.env import (
@@ -49,7 +49,7 @@ from utils.run_io import (
     load_run_flags,
     pick_epoch,
     resolve_actor_checkpoint_dir,
-    resolve_goub_checkpoint_dir,
+    resolve_dynamics_checkpoint_dir,
 )
 
 
@@ -58,7 +58,7 @@ def _load_actor_config_from_flags(flags_path: Path) -> dict:
         root = json.load(f)
     act = root.get('actor')
     if not isinstance(act, dict):
-        raise KeyError(f'{flags_path} must contain an "actor" object (joint run flags).')
+        raise KeyError(f'{flags_path} must contain an "actor" object.')
     base = get_actor_config()
     for k, v in act.items():
         base[k] = v
@@ -83,10 +83,10 @@ def _align_action_to_env(a: np.ndarray, env_dim: int) -> np.ndarray:
     return a[:env_dim].copy()
 
 
-def rollout_goub_actor_env(
+def rollout_dynamics_actor_env(
     env,
-    goub_agent: GOUBDynamicsAgent,
-    actor_agent: JointActorAgent,
+    dynamics_agent: DynamicsAgent,
+    actor_agent: ActorAgent,
     s0: np.ndarray,
     s_g: np.ndarray,
     max_chunks: int,
@@ -129,13 +129,13 @@ def rollout_goub_actor_env(
         if goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol)):
             reached = True
             break
-        # ``pred`` (GOUB subgoal) is always computed for the optional plot overlay; the
+        # ``pred`` (dynamics subgoal) is always computed for the optional plot overlay; the
         # actor conditioning vector ``actor_cond`` follows ``spi_conditioned`` to mirror
         # training so π sees the same input distribution it was trained on.
         #   'subgoal' → actor sees predicted subgoal; hats = subgoal trail.
         #   'goal'    → actor sees the global goal directly; hats = goal repeated so the
         #              video honestly shows what the actor is conditioned on.
-        pred = np.asarray(goub_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+        pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
         actor_cond = pred if str(spi_conditioned).lower() == 'subgoal' else goal
         chunk = np.asarray(actor_agent.sample_actions(obs, actor_cond), dtype=np.float32).reshape(actor_horizon, -1)
         chunk_done = False
@@ -170,9 +170,9 @@ def main() -> None:
         '--checkpoint_epoch',
         type=int,
         default=1000,
-        help='Suffix for both goub/params_<n>.pkl and actor/params_<n>.pkl (nearest match if missing).',
+        help='Suffix for both dynamics/params_<n>.pkl and actor/params_<n>.pkl (nearest match if missing).',
     )
-    p.add_argument('--goub_epoch', type=int, default=-1, help='Override GOUB checkpoint suffix (-1 = same as --checkpoint_epoch).')
+    p.add_argument('--dynamics_epoch', type=int, default=-1, help='Override dynamics checkpoint suffix (-1 = same as --checkpoint_epoch).')
     p.add_argument('--actor_epoch', type=int, default=-1, help='Override actor checkpoint suffix (-1 = same as --checkpoint_epoch).')
     p.add_argument('--traj_idx', type=int, default=0, help='Offline episode index when --task_id=0.')
     p.add_argument('--task_id', type=int, default=0, help='OGBench task id [1..num_tasks]; 0 uses offline traj start/goal.')
@@ -195,10 +195,10 @@ def main() -> None:
         '--value_heatmap',
         action=argparse.BooleanOptionalAction,
         default=True,
-        help='Overlay DQC scalar value V(s, goal) on the right XY panel (joint checkpoints/critic/).',
+        help='Overlay scalar value V(s, goal) on the right XY panel (checkpoints/critic/).',
     )
     p.add_argument('--value_grid_n', type=int, default=56)
-    p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = GOUB epoch used.')
+    p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = dynamics epoch used.')
     args = p.parse_args()
 
     try:
@@ -208,16 +208,16 @@ def main() -> None:
 
     run_dir = Path(args.run_dir).resolve()
     flags_path = run_dir / 'flags.json'
-    goub_ckpt_dir = resolve_goub_checkpoint_dir(run_dir)
+    dynamics_ckpt_dir = resolve_dynamics_checkpoint_dir(run_dir)
     actor_ckpt_dir = resolve_actor_checkpoint_dir(run_dir, required=True)
 
     base_ep = int(args.checkpoint_epoch)
-    goub_ep = int(args.goub_epoch) if int(args.goub_epoch) >= 0 else base_ep
+    dynamics_ep = int(args.dynamics_epoch) if int(args.dynamics_epoch) >= 0 else base_ep
     actor_ep = int(args.actor_epoch) if int(args.actor_epoch) >= 0 else base_ep
-    goub_ep = pick_epoch(goub_ep, list_checkpoint_suffixes(goub_ckpt_dir))
+    dynamics_ep = pick_epoch(dynamics_ep, list_checkpoint_suffixes(dynamics_ckpt_dir))
     actor_ep = pick_epoch(actor_ep, list_checkpoint_suffixes(actor_ckpt_dir))
 
-    goub_cfg, env_name = load_run_flags(run_dir)
+    dynamics_cfg, env_name = load_run_flags(run_dir)
     actor_cfg = _load_actor_config_from_flags(flags_path)
 
     navigator: MazeNavigatorMap | None = None
@@ -226,7 +226,7 @@ def main() -> None:
         print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
 
     env, train_raw, _ = make_env_and_datasets(
-        env_name, frame_stack=goub_cfg.get('frame_stack'), render_mode='rgb_array',
+        env_name, frame_stack=dynamics_cfg.get('frame_stack'), render_mode='rgb_array',
     )
     tid = int(args.task_id)
     if tid != 0:
@@ -260,21 +260,21 @@ def main() -> None:
     saved_actor_dim = int(actor_cfg.get('action_dim', act_dim))
     actor_cfg['action_dim'] = act_dim
     ex_act = jnp.zeros((1, act_dim), dtype=jnp.float32)
-    goub_agent = GOUBDynamicsAgent.create(int(args.seed), ex, goub_cfg, ex_actions=ex_act)
-    goub_pkl = goub_ckpt_dir / f'params_{goub_ep}.pkl'
-    goub_agent = load_checkpoint_pkl(goub_agent, goub_pkl)
-    print(f'Loaded GOUB {goub_pkl}')
+    dynamics_agent = DynamicsAgent.create(int(args.seed), ex, dynamics_cfg, ex_actions=ex_act)
+    dynamics_pkl = dynamics_ckpt_dir / f'params_{dynamics_ep}.pkl'
+    dynamics_agent = load_checkpoint_pkl(dynamics_agent, dynamics_pkl)
+    print(f'Loaded dynamics {dynamics_pkl}')
 
     ex_goal = jnp.asarray(s_g.reshape(1, -1), dtype=jnp.float32)
-    actor_agent = JointActorAgent.create(int(args.seed), ex, actor_cfg, ex_goals=ex_goal)
+    actor_agent = ActorAgent.create(int(args.seed), ex, actor_cfg, ex_goals=ex_goal)
     actor_pkl = actor_ckpt_dir / f'params_{actor_ep}.pkl'
     actor_agent = load_checkpoint_pkl(actor_agent, actor_pkl)
     print(f'Loaded actor {actor_pkl}')
 
-    from rollout.value_field import dqc_value_mesh_for_xy, load_dqc_critic_joint_run
+    from rollout.value_field import value_mesh_for_xy, load_critic_for_run
 
-    ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(goub_ep)
-    critic_agent = load_dqc_critic_joint_run(
+    ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(dynamics_ep)
+    critic_agent = load_critic_for_run(
         run_dir,
         ce,
         env,
@@ -304,9 +304,9 @@ def main() -> None:
         f'Actor conditioning at inference: spi_conditioned={spi_conditioned!r} '
         f"(actor sees {'predicted subgoal' if spi_conditioned == 'subgoal' else 'global goal'})"
     )
-    roll, hats, n_chunks, reached, env_frames = rollout_goub_actor_env(
+    roll, hats, n_chunks, reached, env_frames = rollout_dynamics_actor_env(
         env,
-        goub_agent,
+        dynamics_agent,
         actor_agent,
         s0,
         s_g,
@@ -334,7 +334,7 @@ def main() -> None:
     if bool(args.value_heatmap):
         xlim, ylim = axis_limits(traj, roll, hats, d0, d1, s_g, s0, navigator=plot_nav, seg=None)
         tpl = np.asarray(roll[0], dtype=np.float32).reshape(-1)
-        XX, YY, ZZ, heat_vmin, heat_vmax = dqc_value_mesh_for_xy(
+        XX, YY, ZZ, heat_vmin, heat_vmax = value_mesh_for_xy(
             critic_agent,
             tpl,
             np.asarray(s_g, dtype=np.float32).reshape(-1),

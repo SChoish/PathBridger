@@ -26,12 +26,12 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from utils.goub import make_goub_schedule, bridge_sample, model_mean
-from agents.goub_dynamics import (
-    GOUBDynamicsAgent,
+from utils.dynamics import make_dynamics_schedule, bridge_sample, model_mean
+from agents.dynamics import (
+    DynamicsAgent,
     get_dynamics_config,
 )
-from agents.critic import DQCCriticAgent, get_config as get_critic_config
+from agents.critic import CriticAgent, get_config as get_critic_config
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ BATCH = 8
 
 def _make_dynamics_agent(subgoal_distribution: str, bridge_gamma_inv: float = 0.0):
     cfg = get_dynamics_config()
-    cfg.goub_N = 4
+    cfg.dynamics_N = 4
     cfg.subgoal_steps = 4
     cfg.rollout_horizon = 2
     cfg.subgoal_distribution = subgoal_distribution
@@ -56,7 +56,7 @@ def _make_dynamics_agent(subgoal_distribution: str, bridge_gamma_inv: float = 0.
     cfg.idm_hidden_dims = (32, 32)
     ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
     ex_act = np.zeros((BATCH, ACTION_DIM), dtype=np.float32)
-    return GOUBDynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
+    return DynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
 
 
 def _make_critic_agent():
@@ -68,7 +68,7 @@ def _make_critic_agent():
     ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
     ex_full = np.zeros((BATCH, cfg.full_chunk_horizon * ACTION_DIM), dtype=np.float32)
     ex_part = np.zeros((BATCH, cfg.action_chunk_horizon * ACTION_DIM), dtype=np.float32)
-    return DQCCriticAgent.create(
+    return CriticAgent.create(
         seed=0,
         ex_observations=ex_obs,
         ex_full_chunk_actions=ex_full,
@@ -104,7 +104,7 @@ def test_deterministic_subgoal_backward_compat():
 # ---------------------------------------------------------------------------
 
 def test_linear_dynamics_schedule_and_model_mean_are_finite():
-    schedule = make_goub_schedule(N=8, beta_min=0.1, beta_max=20.0, lambda_=1.0, bridge_gamma_inv=0.0)
+    schedule = make_dynamics_schedule(N=8, beta_min=0.1, beta_max=20.0, lambda_=1.0, bridge_gamma_inv=0.0)
     assert schedule['bridge_w'].shape == (9,)
     assert schedule['bridge_var'].shape == (9,)
     assert 'dynamics_phi_iK' in schedule
@@ -125,7 +125,7 @@ def test_linear_dynamics_schedule_and_model_mean_are_finite():
 def test_linear_dynamics_resolves_gamma_inv_correctly():
     # The schedule must thread bridge_gamma_inv into a `gamma_inv` entry so
     # downstream agents can query the exact configured denominator offset.
-    s_soft = make_goub_schedule(N=8, bridge_gamma_inv=0.5)
+    s_soft = make_dynamics_schedule(N=8, bridge_gamma_inv=0.5)
     assert abs(float(s_soft['gamma_inv']) - 0.5) < 1e-6
     assert 'dynamics_bridge_w' in s_soft
     assert 'dynamics_bridge_var' in s_soft
@@ -133,7 +133,7 @@ def test_linear_dynamics_resolves_gamma_inv_correctly():
     # Negative inverse gamma must raise.
     raised = False
     try:
-        make_goub_schedule(N=4, bridge_gamma_inv=-1.0)
+        make_dynamics_schedule(N=4, bridge_gamma_inv=-1.0)
     except ValueError:
         raised = True
     assert raised

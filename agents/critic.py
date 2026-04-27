@@ -1,4 +1,4 @@
-"""DQC critic agent (chunk critic + partial critic + scalar value).
+"""Critic agent (chunk critic + partial critic + scalar value).
 
 Single-file critic module. Networks, agent, helpers, and default config live here.
 """
@@ -61,8 +61,8 @@ class BinaryChunkCritic(nn.Module):
         return jnp.stack(logits, axis=0)
 
 
-class DQCCriticAgent(flax.struct.PyTreeNode):
-    """DQC critic/value stack only."""
+class CriticAgent(flax.struct.PyTreeNode):
+    """Chunk critic + action critic + scalar value stack."""
 
     rng: Any
     network: Any
@@ -257,7 +257,7 @@ class DQCCriticAgent(flax.struct.PyTreeNode):
         total = total + pl + vl
         info.update(pi)
         info.update(vi)
-        info['dqc_critic/total_loss'] = total
+        info['total_loss'] = total
         return total, info
 
     @staticmethod
@@ -329,20 +329,20 @@ class DQCCriticAgent(flax.struct.PyTreeNode):
         return cls(rng=rng, network=network, config=flax.core.FrozenDict(**config))
 
 
-def validate_joint_mode(critic_config, actor_config=None) -> None:
+def validate_config(critic_config, actor_config=None) -> None:
     action_chunk_horizon = int(critic_config.get('action_chunk_horizon', 0))
     full_chunk_horizon = int(critic_config.get('full_chunk_horizon', 0))
     if action_chunk_horizon < 1:
-        raise ValueError('DQC joint mode requires action_chunk_horizon >= 1.')
+        raise ValueError('action_chunk_horizon must be >= 1.')
     if full_chunk_horizon < action_chunk_horizon:
         raise ValueError(
-            f'DQC joint mode requires full_chunk_horizon >= action_chunk_horizon, '
+            f'full_chunk_horizon must be >= action_chunk_horizon, '
             f'got full_chunk_horizon={full_chunk_horizon}, action_chunk_horizon={action_chunk_horizon}.'
         )
     if actor_config is None:
         return
     if int(actor_config.get('actor_chunk_horizon', 0)) < 1:
-        raise ValueError('Joint training requires actor_chunk_horizon >= 1.')
+        raise ValueError('actor_chunk_horizon must be >= 1.')
     # Accept canonical ``spi_conditioned`` and legacy alias ``spi_goal_conditioning``.
     spi_cond = str(
         actor_config.get('spi_conditioned', actor_config.get('spi_goal_conditioning', 'subgoal'))
@@ -396,8 +396,8 @@ def get_config():
 __all__ = [
     'BinaryChunkCritic',
     'ScalarValueNet',
-    'DQCCriticAgent',
-    'validate_joint_mode',
+    'CriticAgent',
+    'validate_config',
     'extract_critic_primary_score',
     'get_config',
 ]

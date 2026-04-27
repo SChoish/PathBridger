@@ -12,7 +12,7 @@ batch_size: 1024
 plan_candidates: 1
 plan_noise_scale: 0.01
 
-goub:
+dynamics:
   bridge_gamma_inv: 0.0
   subgoal_distribution: deterministic
   subgoal_value_alpha: 0.1

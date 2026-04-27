@@ -1,4 +1,4 @@
-"""2D plots and MP4 export for GOUB rollout scripts."""
+"""2D plots and MP4 export for dynamics rollout scripts."""
 
 from __future__ import annotations
 
@@ -286,7 +286,7 @@ def overlay_rgb_frames_obs2d_panel(
 
     Pass ``navigator`` from ``--navigator snap`` if maze tiles should appear on the panel.
 
-    Optional ``value_heatmap=(XX, YY, ZZ)`` draws a goal-conditioned scalar value field (e.g. DQC
+    Optional ``value_heatmap=(XX, YY, ZZ)`` draws a goal-conditioned scalar value field (e.g.
     ``sigmoid(V)``) under trajectories using ``pcolormesh`` (same ``xlim``/``ylim`` as the panel).
     The colormap uses log normalization so low-value regions remain visually separable.
     ``output_scale`` upsamples the final combined frame slightly for a larger MP4.

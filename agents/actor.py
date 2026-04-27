@@ -50,17 +50,17 @@ class DeterministicChunkActor(nn.Module):
         return jnp.clip(out, -1.0, 1.0)
 
 
-class JointActorAgent(flax.struct.PyTreeNode):
-    """Joint actor trained against an external critic scorer."""
+class ActorAgent(flax.struct.PyTreeNode):
+    """SPI actor trained against an external critic scorer."""
 
     rng: Any
     actor: Any
     config: Any = nonpytree_field()
 
     def _goals(self, batch: dict) -> jnp.ndarray | None:
-        # ``spi_goals`` carries whatever conditioning vector the joint loop chose for
-        # this update (predicted subgoal or global goal); see ``config.spi_conditioned``
-        # and ``main._build_actor_batch_from_goub``. Both π and the critic scorer in
+        # ``spi_goals`` carries whatever conditioning vector the training loop chose
+        # for this update (predicted subgoal or global goal); see ``config.spi_conditioned``
+        # and ``main._build_actor_batch_from_dynamics``. Both π and the critic scorer in
         # ``actor_loss`` share this same vector so Q stays consistent with π.
         goals = batch.get('spi_goals', None)
         if goals is None:
@@ -86,7 +86,7 @@ class JointActorAgent(flax.struct.PyTreeNode):
     def _proposal_chunks(self, batch: dict) -> jnp.ndarray:
         external = batch.get('proposal_partial_chunks', None)
         if external is None:
-            raise ValueError('Joint actor update requires proposal_partial_chunks in the batch.')
+            raise ValueError('Actor update requires proposal_partial_chunks in the batch.')
         external = jnp.asarray(external, dtype=jnp.float32)
         if external.ndim == 4:
             external = external.reshape(external.shape[0], external.shape[1], -1)
@@ -103,7 +103,7 @@ class JointActorAgent(flax.struct.PyTreeNode):
         if proposal_scores is None:
             raise ValueError(
                 'SPI actor path requires proposal_scores precomputed from the current critic snapshot. '
-                'Rescore proposals in the joint training loop before actor update.'
+                'Rescore proposals in the training loop before actor update.'
             )
         proposal_scores = jax.lax.stop_gradient(jnp.asarray(proposal_scores, dtype=jnp.float32))
         if proposal_scores.ndim != 2:
@@ -213,19 +213,19 @@ SPI_CONDITIONED_CHOICES = ('subgoal', 'goal')
 def get_actor_config():
     return ml_collections.ConfigDict(
         dict(
-            agent_name='joint_actor',
+            agent_name='actor',
             lr=3e-4,
             spi_tau=0.5,
             spi_beta=10.0,
             spi_actor_layer_norm=True,
             spi_q_norm_eps=1e-6,
             # Conditioning vector for both ``π(s, g)`` and ``Q(s, g, a)`` in the SPI loss.
-            #   'subgoal' (default): use GOUB ``predict_subgoal(s, g_global)``
+            #   'subgoal' (default): use dynamics ``predict_subgoal(s, g_global)``
             #     → matches training-time subgoal teacher; π/Q see local subgoal.
             #   'goal'   : use the (global) ``high_actor_goals`` directly
-            #     → π/Q both see the final goal; SPI prox still pulls toward GOUB
+            #     → π/Q both see the final goal; SPI prox still pulls toward dynamics
             #       proposal chunks (which were planned to subgoals).
-            # Set in ``main._build_actor_batch_from_goub`` via ``spi_goals``.
+            # Set in ``main._build_actor_batch_from_dynamics`` via ``spi_goals``.
             # Legacy alias accepted from saved checkpoints: ``spi_goal_conditioning``.
             spi_conditioned='subgoal',
             actor_chunk_horizon=ml_collections.config_dict.placeholder(int),
