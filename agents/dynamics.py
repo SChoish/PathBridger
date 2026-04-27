@@ -207,63 +207,6 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         return idm_w * mse, mse
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None, critic_value_params=None):
-        x_T = batch['observations']
-        x_0 = batch['high_actor_targets']
-        batch_size = x_T.shape[0]
-        n_total = self.config['dynamics_N']
-        sg_w = float(self.config.get('subgoal_loss_weight', 1.0))
-
-        rng1, rng2 = jax.random.split(rng)
-        n = jax.random.randint(rng1, (batch_size,), 1, n_total + 1)
-        is_boundary = n == n_total
-        n_safe = jnp.minimum(n, n_total - 1)
-
-        x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
-        x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
-        mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
-        mu_pred, eps_pred = self._learned_reverse_mean(x_n, x_T, x_0, n, self.schedule, params=grad_params)
-
-        g2_n = self.schedule['g2'][n - 1]
-        weight = 1.0 / (2.0 * jnp.maximum(g2_n, 1e-12))
-        loss_dynamics = (weight * jnp.abs(mu_true - mu_pred).sum(axis=-1)).mean()
-
-        sg_out = self.network.select('subgoal_net')(
-            batch['observations'],
-            batch['high_actor_goals'],
-            params=grad_params,
-        )
-        pred_sg = sg_out[0] if isinstance(sg_out, tuple) else sg_out
-        loss_sub = jnp.mean((pred_sg - batch['high_actor_targets']) ** 2)
-        loss = loss_dynamics + sg_w * loss_sub
-
-        idm_term, loss_idm_unw = self._idm_loss_term(batch, grad_params)
-        loss = loss + idm_term
-
-        n_N = jnp.full((batch_size,), n_total, dtype=jnp.int32)
-        xNm1, _ = self._learned_reverse_mean(x_T, x_T, x_0, n_N, self.schedule, params=grad_params)
-        xNm1_norm = jnp.linalg.norm(xNm1, axis=-1).mean()
-
-        info = {
-            'phase1/loss': loss,
-            'phase1/loss_dynamics': loss_dynamics,
-            'phase1/loss_subgoal': loss_sub,
-            'phase1/loss_idm': loss_idm_unw,
-            'phase1/eps_norm': jnp.linalg.norm(eps_pred, axis=-1).mean(),
-            'phase1/mu_true_norm': jnp.linalg.norm(mu_true, axis=-1).mean(),
-            'phase1/mu_pred_norm': jnp.linalg.norm(mu_pred, axis=-1).mean(),
-            'phase1/xN_minus_1_norm': xNm1_norm,
-            'phase1/bridge_step_mean': n.astype(jnp.float32).mean(),
-        }
-        info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg, axis=-1).mean()
-        info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
-        info['dynamics/bridge_gamma_inv'] = jnp.asarray(
-            float(self.config.get('bridge_gamma_inv', 0.0)), dtype=jnp.float32
-        )
-        info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
-        return loss, info
-
-    @jax.jit
     def update(self, batch, critic_value_params=None):
         new_rng, rng = jax.random.split(self.rng)
 
