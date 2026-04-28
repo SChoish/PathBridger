@@ -91,26 +91,9 @@ dynamics:
 | `planner_type` | `reverse_score` | reverse mean matching 기반 학습 chain (legacy). 대안: `forward_bridge` (closed-form forward bridge mean, 학습 path 파라미터 없음), `forward_bridge_residual` (forward bridge mean + endpoint-preserving 학습 residual `PathResidualNet`) |
 | `forward_bridge_mode` | `mean` | `forward_bridge*` 모드의 inference (`mean` / `sample`) |
 | `forward_bridge_use_path_loss` | `true` | path-step 손실 활성화 |
-| `dynamics_model_type` | `sde_euler` | reverse step 파라미터화. `sde_euler`는 학습된 model mean. `exact_residual`은 model mean을 `posterior_mean + sqrt(post_var) * eps_pred`로 재정의 (data residual 학습) |
-| `exact_residual_scale` | `1.0` | `exact_residual` 모드의 residual 스케일 |
+| `dynamics_model_type` | `exact_residual` | reverse step 파라미터화. exact bridge posterior mean에 `sqrt(post_var) * eps_pred` residual을 더함 |
+| `exact_residual_scale` | `1.0` | residual 스케일 |
 | `exact_residual_reg_weight` | `1e-4` | residual L2 정규화 |
-
-#### Curved Centerline Bridge (옵션, ablation)
-
-State-space subgoal proposal을 **endpoint-preserving 학습 곡선** $c_i = (1-\beta_i) s_0 + \beta_i s_K + \beta_i (1-\beta_i)\,h_\psi(s_0, s_K, g, i)$ 주위의 residual 좌표에서 풀게 만드는 옵션입니다. `dynamics_model_type=exact_residual` + `planner_type=reverse_score` 조합에서만 활성화되며, 그 외 조합에선 경고와 함께 무시됩니다.
-
-| 키 | 기본 | 설명 |
-|----|------|------|
-| `use_curved_centerline` | `false` | true로 켜면 curved centerline bridge 활성화 |
-| `centerline_hidden_dims` | `(256, 256)` | `CurvedCenterlineNet` MLP 구조 |
-| `centerline_scale` | `1.0` | 학습 displacement $h$의 출력 스케일 |
-| `centerline_zero_init` | `true` | true면 마지막 layer를 0 초기화 → 학습 초기에는 직선 bridge와 동치 |
-| `centerline_beta_type` | `linear` | β 스케줄 (`linear` 또는 `hard_bridge`) |
-| `centerline_use_goal` | `true` | $h_\psi$에 goal $g$ 추가 conditioning |
-| `centerline_amp_coef` | `1e-4` | centerline 변위 amplitude 정규화 |
-| `centerline_smooth_coef` | `1e-3` | centerline 시간축 smoothness 정규화 |
-| `centerline_residual_use_hard_variance` | `true` | residual 좌표의 reverse 분산을 hard bridge 분산으로 고정 |
-| `centerline_apply_to_state_dims` | `None` | None이면 모든 state dim에 적용, list[int]면 해당 dim에만 |
 
 #### Prefix-progress θ 스케줄 (옵션)
 
@@ -195,9 +178,8 @@ Dynamics agent는 다음 손실을 함께 학습합니다.
 - `phase1/loss_dynamics`: reverse mean matching (또는 `forward_bridge*` 모드의 forward bridge mean matching)
 - `phase1/loss_path_step`: dataset segment와 step-aligned path loss
 - `phase1/loss_roll`: short rollout consistency
-- `phase1/loss_subgoal`: deterministic subgoal MSE와 critic value bonus (또는 distributional NLL+MSE)
+- `phase1/loss_subgoal`: deterministic subgoal MSE와 critic value bonus, 또는 stochastic subgoal의 advantage-weighted NLL
 - `phase1/loss_idm`: embedded inverse dynamics MSE
-- `dynamics/centerline/{amp,smooth}`: curved centerline 활성 시에만 추가되는 정규화 항
 
 Critic + SPI actor:
 
@@ -263,17 +245,15 @@ cd /path/to/douri
 PYTHONPATH=. python tests/test_exact_residual_dynamics.py
 PYTHONPATH=. python tests/test_distributional_subgoal.py
 PYTHONPATH=. python tests/test_forward_bridge_planner.py
-PYTHONPATH=. python tests/test_curved_centerline_bridge.py
 PYTHONPATH=. python tests/test_prefix_progress_schedule.py
 ```
 
-각 테스트는 끝에 `OK: ...` 또는 `All tests passed.`를 찍어 통과 여부를 알려줍니다. dynamics 관련 변경(특히 schedule, planner, model_type, curved centerline)을 한 뒤에는 이 5개를 한 번에 돌려 회귀를 확인하세요.
+각 테스트는 끝에 `OK: ...` 또는 `All tests passed.`를 찍어 통과 여부를 알려줍니다. dynamics 관련 변경(특히 schedule, planner, model_type)을 한 뒤에는 이 4개를 한 번에 돌려 회귀를 확인하세요.
 
 ## 주의사항
 
 - 저장소 루트에서 `PYTHONPATH=.` 없이 실행하면 import가 깨질 수 있습니다.
 - `MUJOCO_GL=egl`을 설정하면 headless rollout/영상 생성이 안정적입니다.
 - Hard bridge sweep에서는 `bridge_gamma_inv: 0.0`과 `subgoal_distribution: deterministic`을 같이 둡니다.
-- `use_curved_centerline=true`는 `dynamics_model_type=exact_residual` + `planner_type=reverse_score`에서만 동작합니다. 다른 조합에선 경고와 함께 무시됩니다.
 - `theta_schedule=prefix_progress`로 학습한 체크포인트는 평가/롤아웃 시에도 같은 schedule 인자가 자동으로 `flags.json`에서 복원됩니다. 명시적으로 override할 일이 거의 없습니다.
 - 옛 prefix(`*_joint_dqc_*`) 디렉토리들은 데이터 호환을 위해 변경하지 않았습니다. 새 학습 run은 `<ts>_seed<N>_<env>` prefix를 사용합니다.

@@ -43,12 +43,17 @@ ACTION_DIM = 2
 BATCH = 8
 
 
-def _make_dynamics_agent(subgoal_distribution: str, bridge_gamma_inv: float = 0.0):
+def _make_dynamics_agent(
+    subgoal_distribution: str,
+    bridge_gamma_inv: float = 0.0,
+    subgoal_num_samples: int = 1,
+):
     cfg = get_dynamics_config()
     cfg.dynamics_N = 4
     cfg.subgoal_steps = 4
     cfg.rollout_horizon = 2
     cfg.subgoal_distribution = subgoal_distribution
+    cfg.subgoal_num_samples = subgoal_num_samples
     cfg.bridge_gamma_inv = bridge_gamma_inv
     cfg.eps_hidden_dims = (32, 32)
     cfg.subgoal_hidden_dims = (32, 32)
@@ -196,16 +201,18 @@ def test_critic_score_action_chunks_with_per_candidate_goals():
 # 5. plan_candidates=1 and >1 both succeed (deterministic + diag_gaussian)
 # ---------------------------------------------------------------------------
 
-def _check_build_actor_proposals(agent, plan_candidates: int):
+def _check_build_actor_proposals(agent, plan_candidates: int, expected_candidates: int | None = None):
     obs = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
     g = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
     mu, cand_actions, cand_goals, _ = agent.build_actor_proposals(
         obs, g, jax.random.PRNGKey(0),
         proposal_horizon=2, plan_candidates=plan_candidates, sample_noise_scale=0.0,
     )
+    if expected_candidates is None:
+        expected_candidates = plan_candidates
     assert mu.shape == (BATCH, STATE_DIM)
-    assert cand_actions.shape == (BATCH, plan_candidates, 2, ACTION_DIM)
-    assert cand_goals.shape == (BATCH, plan_candidates, STATE_DIM)
+    assert cand_actions.shape == (BATCH, expected_candidates, 2, ACTION_DIM)
+    assert cand_goals.shape == (BATCH, expected_candidates, STATE_DIM)
 
 
 def test_build_actor_proposals_deterministic_n1_n_gt_1():
@@ -218,6 +225,17 @@ def test_build_actor_proposals_diag_gaussian_n1_n_gt_1():
     agent = _make_dynamics_agent('diag_gaussian')
     _check_build_actor_proposals(agent, plan_candidates=1)
     _check_build_actor_proposals(agent, plan_candidates=4)
+
+
+def test_build_actor_proposals_diag_gaussian_subgoal_samples_times_plan_candidates():
+    subgoal_samples = 3
+    plan_candidates = 4
+    agent = _make_dynamics_agent('diag_gaussian', subgoal_num_samples=subgoal_samples)
+    _check_build_actor_proposals(
+        agent,
+        plan_candidates=plan_candidates,
+        expected_candidates=subgoal_samples * plan_candidates,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -252,9 +270,12 @@ def test_distributional_subgoal_loss_is_finite():
     # Required new keys are present.
     for required in (
         'phase1/subgoal_nll',
+        'phase1/subgoal_weighted_nll',
+        'phase1/subgoal_adv_mean',
+        'phase1/subgoal_adv_weight_mean',
+        'phase1/subgoal_adv_weight_max',
         'phase1/subgoal_std_mean',
         'phase1/subgoal_std_max',
-        'phase1/subgoal_fr_spi',
         'phase1/subgoal_mode',
         'dynamics/bridge_gamma_inv',
         'dynamics/gamma_inv',
@@ -262,6 +283,28 @@ def test_distributional_subgoal_loss_is_finite():
         assert required in info, f'missing log key {required}'
     # subgoal_mode == 1.0 in diag_gaussian mode.
     assert float(info['phase1/subgoal_mode']) == 1.0
+
+
+def test_stochastic_subgoal_rewards_use_next_state_indices():
+    """K-step rewards should inspect s_{t+1}..s_{t+K}, not s_t..s_{t+K-1}."""
+    agent = _make_dynamics_agent('diag_gaussian')
+    K = int(agent.config['subgoal_steps'])
+    batch = {
+        'observations': jnp.zeros((2, STATE_DIM), dtype=jnp.float32),
+        'trajectory_indices': jnp.asarray(
+            [
+                [10, 11, 12, 13, 14],
+                [20, 21, 22, 23, 24],
+            ],
+            dtype=jnp.int32,
+        ),
+        # Row 0 reaches the goal only at s_{t+K}; row 1 reaches only at s_t.
+        'high_actor_goal_idxs': jnp.asarray([14, 20], dtype=jnp.int32),
+    }
+    rewards = np.asarray(agent._dataset_goal_rewards(batch, K))
+    # gc_negative=True => non-success reward is -1, success reward is 0.
+    np.testing.assert_allclose(rewards[0], np.asarray([-1.0, -1.0, -1.0, 0.0], dtype=np.float32))
+    np.testing.assert_allclose(rewards[1], np.asarray([-1.0, -1.0, -1.0, -1.0], dtype=np.float32))
 
 
 def test_deterministic_subgoal_loss_is_finite_and_logs_match_legacy():
@@ -283,7 +326,8 @@ def test_dynamics_config_defaults_are_usable():
     cfg = get_dynamics_config()
     assert str(cfg.subgoal_distribution) == 'deterministic'
     assert bool(cfg.subgoal_use_mean_for_actor_goal) is True
-    assert float(cfg.subgoal_fr_spi_weight) == 0.0
+    assert int(cfg.subgoal_num_samples) == 1
+    assert float(cfg.stochastic_subgoal_adv_beta) == 1.0
 
 
 if __name__ == '__main__':

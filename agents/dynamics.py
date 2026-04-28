@@ -7,7 +7,6 @@ the endpoint-conditioned bridge planner.
 
 from __future__ import annotations
 
-import logging
 from functools import partial
 from typing import Any, Sequence
 
@@ -25,16 +24,14 @@ from utils.dynamics import (
     exact_residual_model_mean,
     forward_bridge_coefficients,
     make_dynamics_schedule,
-    model_mean,
     posterior_mean,
-    posterior_moments,
     sample_from_reverse_mean,
 )
 
 
 _VALID_PLANNER_TYPES = ('reverse_score', 'forward_bridge', 'forward_bridge_residual')
 _VALID_FORWARD_BRIDGE_MODES = ('mean', 'sample')
-_VALID_DYNAMICS_MODEL_TYPES = ('sde_euler', 'exact_residual')
+_VALID_DYNAMICS_MODEL_TYPES = ('exact_residual',)
 
 
 def _planner_type(config) -> str:
@@ -59,12 +56,10 @@ def _forward_bridge_mode(config) -> str:
 def _dynamics_model_type(config) -> str:
     """Return the canonical dynamics_model_type string from the agent config.
 
-    - ``sde_euler``  (default): exact-bridge posterior matched against a
-      forward state-time SDE/Euler model mean (current behavior).
-    - ``exact_residual``: exact bridge posterior mean as the base transition
+    ``exact_residual`` uses the exact bridge posterior mean as the base transition
       with a learned data residual; trained via path/rollout consistency.
     """
-    mode = str(config.get('dynamics_model_type', 'sde_euler')).lower()
+    mode = str(config.get('dynamics_model_type', 'exact_residual')).lower()
     if mode not in _VALID_DYNAMICS_MODEL_TYPES:
         raise ValueError(
             f'dynamics_model_type must be one of {_VALID_DYNAMICS_MODEL_TYPES}, got {mode!r}.'
@@ -73,35 +68,8 @@ def _dynamics_model_type(config) -> str:
 
 
 def _dynamics_model_type_metric(config) -> float:
-    return 1.0 if _dynamics_model_type(config) == 'exact_residual' else 0.0
-
-
-def _curved_centerline_requested(config) -> bool:
-    return bool(config.get('use_curved_centerline', False))
-
-
-def _curved_centerline_supported(config) -> bool:
-    """The curved centerline option is only well-defined for the exact-residual
-    bridge under the reverse_score planner. For all other combinations the
-    request is silently ignored at create time (with a warning)."""
-    return (
-        _dynamics_model_type(config) == 'exact_residual'
-        and _planner_type(config) == 'reverse_score'
-    )
-
-
-def _curved_centerline_active(config) -> bool:
-    return _curved_centerline_requested(config) and _curved_centerline_supported(config)
-
-
-def _curved_centerline_dims_mask(config, state_dim: int) -> jnp.ndarray:
-    """Return a (state_dim,) float32 mask of dims that receive curvature."""
-    dims = config.get('centerline_apply_to_state_dims', None)
-    if dims is None:
-        return jnp.ones((int(state_dim),), dtype=jnp.float32)
-    sel = jnp.asarray([int(d) for d in dims], dtype=jnp.int32)
-    mask = jnp.zeros((int(state_dim),), dtype=jnp.float32)
-    return mask.at[sel].set(1.0)
+    _dynamics_model_type(config)
+    return 1.0
 
 
 from utils.inverse_dynamics import InverseDynamicsMLP, parse_hidden_dims
@@ -156,10 +124,12 @@ class SubgoalEstimatorNet(nn.Module):
 class DistributionalSubgoalEstimatorNet(nn.Module):
     """Diagonal-Gaussian subgoal estimator (``subgoal_distribution='diag_gaussian'``).
 
-    Returns ``(mu, log_std)`` so the phase1 loss can mix NLL, mean MSE,
-    a small log-std regulariser, and the existing critic-V subgoal bonus.
-    Stochasticity for actor proposals is sampled from this distribution
-    in :meth:`_DynamicsAgentCore.sample_subgoal_candidates`.
+    Returns ``(mu, log_std)`` for ``pi_phi(s_{t+K} | s_t, g)``.  In stochastic
+    mode the phase-1 subgoal objective is pure advantage-weighted log
+    likelihood of the dataset future subgoal (no MSE, log-std regulariser,
+    direct value bonus, or FR/SPI auxiliary term).  Actor proposals sample
+    endpoint candidates from this distribution in
+    :meth:`_DynamicsAgentCore.sample_subgoal_candidates`.
     """
 
     hidden_dims: Sequence[int]
@@ -211,52 +181,6 @@ class PathResidualNet(nn.Module):
         )(inp)
 
 
-class CurvedCenterlineNet(nn.Module):
-    """Endpoint-preserving learned centerline displacement.
-
-    Computes the raw displacement ``h(s0, sK, goal, tau)`` of shape
-    ``(B, state_dim)``. The caller applies the envelope
-
-        c = (1 - beta) * s0 + beta * sK + beta * (1 - beta) * scale * h * mask
-
-    so that ``c|_{beta=0} = s0`` and ``c|_{beta=1} = sK`` exactly. With
-    ``zero_init=True`` the head is zero-initialised, so a freshly created
-    centerline collapses to the linear interpolation between endpoints and the
-    curved bridge coincides with the analytic linear-SDE bridge in residual
-    coordinates (``z = x - c``) at initialisation.
-    """
-
-    hidden_dims: Sequence[int]
-    state_dim: int
-    layer_norm: bool = True
-    use_goal: bool = True
-    zero_init: bool = True
-
-    @nn.compact
-    def __call__(self, s0, sK, goal, tau):
-        # s0, sK, goal: (B, D);  tau: (B, 1) with values in [0, 1].
-        delta = sK - s0
-        feats = [s0, sK, delta, tau]
-        if self.use_goal:
-            feats.append(goal)
-        x = jnp.concatenate(feats, axis=-1)
-        trunk = MLP(
-            hidden_dims=tuple(self.hidden_dims),
-            activate_final=True,
-            layer_norm=self.layer_norm,
-        )(x)
-        if self.zero_init:
-            head = nn.Dense(
-                self.state_dim,
-                kernel_init=nn.initializers.zeros,
-                bias_init=nn.initializers.zeros,
-                name='centerline_head',
-            )
-        else:
-            head = nn.Dense(self.state_dim, name='centerline_head')
-        return head(trunk)
-
-
 def _subgoal_mode(config) -> str:
     return str(config.get('subgoal_distribution', 'deterministic')).lower()
 
@@ -269,152 +193,22 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     schedule: Any
     config: Any = nonpytree_field()
 
-    def _curved_centerline_beta_array(self, K: int):
-        """Return ``beta_i`` for forward index ``i in {0, ..., K}``, shape ``(K+1,)``.
-
-        ``linear``       : ``beta_i = i / K``.
-        ``hard_bridge``  : ``beta_i`` from the precomputed hard-bridge schedule
-                           (``dynamics_beta_fwd`` with ``gamma_inv=0``), so
-                           ``beta_0 = 0`` and ``beta_K = 1`` exactly.
-        """
-        beta_type = str(self.config.get('centerline_beta_type', 'linear')).lower()
-        K_int = int(K)
-        if beta_type == 'linear':
-            return jnp.arange(K_int + 1, dtype=jnp.float32) / float(K_int)
-        if beta_type == 'hard_bridge':
-            if 'centerline_hard_b' in self.schedule:
-                return self.schedule['centerline_hard_b']
-            # Fallback: derive from forward_bridge_coefficients on the fly.
-            _, b_hard, _ = forward_bridge_coefficients(
-                K_int,
-                beta_min=float(self.config['dynamics_beta_min']),
-                beta_max=float(self.config['dynamics_beta_max']),
-                lambda_=float(self.config['dynamics_lambda']),
-                theta_schedule=str(self.config.get('theta_schedule', 'linear_beta')),
-                theta_total=float(self.config.get('theta_total', 1.0)),
-                progress_alpha=float(self.config.get('progress_alpha', 0.8)),
-            )
-            return b_hard
-        raise ValueError(
-            f'centerline_beta_type must be one of (linear, hard_bridge), got {beta_type!r}.'
+    def _learned_reverse_mean(self, x_n, x_T, x_0, n, schedule, goal=None, params=None):
+        eps = self.network.select('eps_net')(
+            x_n, x_T, x_0, n.astype(jnp.float32), params=params,
         )
-
-    def _curved_centerline(self, s0_f, sK_f, goal, i_idx, params=None):
-        """Compute the curved centerline at forward step ``i_idx``.
-
-        Returns ``(c, h, b)`` where ``c`` is the envelope-applied centerline
-        ``c = (1 - b) s0 + b sK + b (1 - b) * scale * h * mask``, ``h`` is the
-        raw network displacement (used for the amplitude regulariser), and
-        ``b`` is the per-element ``beta_i`` (used for diagnostics).
-
-        ``i_idx`` may be a Python int or a per-batch ``(B,)`` int array.
-        """
-        K = int(self.config['dynamics_N'])
-        if isinstance(i_idx, int):
-            i_arr = jnp.full((s0_f.shape[0],), i_idx, dtype=jnp.int32)
-        else:
-            i_arr = jnp.asarray(i_idx, dtype=jnp.int32)
-        tau = (i_arr.astype(jnp.float32) / float(K))[:, None]
-        beta_arr = self._curved_centerline_beta_array(K)
-        b = beta_arr[i_arr][:, None]
-
-        # Goal placeholder so the call signature is stable even when the
-        # user opted out of goal conditioning at create time.
-        goal_in = goal if goal is not None else jnp.zeros_like(s0_f)
-        h = self.network.select('centerline_net')(
-            s0_f, sK_f, goal_in, tau, params=params,
-        )
-
-        state_dim = int(h.shape[-1])
-        mask = _curved_centerline_dims_mask(self.config, state_dim)[None, :]
-        scale = float(self.config.get('centerline_scale', 1.0))
-
-        linear = (1.0 - b) * s0_f + b * sK_f
-        envelope = b * (1.0 - b)
-        c = linear + envelope * (scale * h * mask)
-        return c, h, b
-
-    def _curved_reverse_mean(self, x_n, x_T, x_0, n, schedule, goal, params=None):
-        """Reverse-step mean under the curved centerline + exact residual.
-
-        Index convention: code uses reverse step ``n`` with ``x_T`` = current
-        state and ``x_0`` = segment endpoint, so the forward state-time index
-        is ``i = N - n``. The reverse step ``n -> n - 1`` corresponds to
-        ``i -> i + 1``, hence ``mu_star = c_{i+1} + mu_z``.
-        """
-        N = int(self.config['dynamics_N'])
-        s0_f = x_T
-        sK_f = x_0
-        i = N - n
-        i_next = i + 1
-
-        c_i, h_i, _ = self._curved_centerline(s0_f, sK_f, goal, i, params=params)
-        c_next, _, _ = self._curved_centerline(s0_f, sK_f, goal, i_next, params=params)
-
-        z_n = x_n - c_i
-        mu_z, post_var = posterior_moments(
-            z_n,
-            jnp.zeros_like(z_n),
-            jnp.zeros_like(z_n),
+        # Exact bridge posterior mean as base transition + learned residual.
+        # Valid for all n in {1, ..., N}; no boundary override needed because
+        # posterior_moments(...) already handles the terminal step.
+        mu, _, _ = exact_residual_model_mean(
+            x_n,
+            x_0,
+            x_T,
+            eps,
             n,
             schedule,
+            residual_scale=float(self.config.get('exact_residual_scale', 1.0)),
         )
-        mu_star = c_next + mu_z
-
-        eps = self.network.select('eps_net')(
-            x_n, x_T, x_0, n.astype(jnp.float32), params=params,
-        )
-
-        use_hard = bool(self.config.get('centerline_residual_use_hard_variance', True))
-        if use_hard and 'centerline_hard_std' in schedule:
-            hard_std = schedule['centerline_hard_std']
-            rho = hard_std[i_next][..., None]
-        else:
-            rho = jnp.sqrt(jnp.maximum(post_var, 0.0))
-
-        scale_res = float(self.config.get('exact_residual_scale', 1.0))
-        residual = scale_res * rho * eps
-        mu = mu_star + residual
-        return mu, eps, h_i, residual
-
-    def _learned_reverse_mean(self, x_n, x_T, x_0, n, schedule, goal=None, params=None):
-        n_total = self.config['dynamics_N']
-        model_type = _dynamics_model_type(self.config)
-
-        if (
-            _curved_centerline_active(self.config)
-            and model_type == 'exact_residual'
-        ):
-            mu, eps, _h, _residual = self._curved_reverse_mean(
-                x_n, x_T, x_0, n, schedule, goal, params=params,
-            )
-            return mu, eps
-
-        eps = self.network.select('eps_net')(
-            x_n, x_T, x_0, n.astype(jnp.float32), params=params,
-        )
-
-        if model_type == 'exact_residual':
-            # Exact bridge posterior mean as base transition + learned residual.
-            # Valid for all n in {1, ..., N}; no boundary override needed because
-            # posterior_moments(...) already handles the terminal step.
-            mu, _, _ = exact_residual_model_mean(
-                x_n,
-                x_0,
-                x_T,
-                eps,
-                n,
-                schedule,
-                residual_scale=float(self.config.get('exact_residual_scale', 1.0)),
-            )
-            return mu, eps
-
-        # Default 'sde_euler' path. Numerically identical to previous behavior.
-        n_safe = jnp.minimum(n, n_total - 1)
-        is_boundary = n == n_total
-        mu_inner = model_mean(x_n, x_0, x_T, eps, n_safe, schedule)
-        mu_boundary = x_T + eps
-        mu = jnp.where(is_boundary[..., None], mu_boundary, mu_inner)
         return mu, eps
 
     def _reverse_step(self, x_n, x_T, x_0, n, rng, stochastic, noise_scale, params=None, goal=None):
@@ -912,8 +706,12 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             Mean subgoal point used as ``spi_goals`` for the actor when
             ``subgoal_use_mean_for_actor_goal=True`` (default).
         candidate_actions : ``[B, N, ha, A]``
-            Decoded action chunks for the ``N = plan_candidates`` proposals.
-        candidate_goals : ``[B, N, D]``
+            Decoded action chunks for the proposals.  In deterministic mode
+            ``N = plan_candidates``.  In ``diag_gaussian`` mode the candidate
+            axis is ``U * N`` where ``U = subgoal_num_samples`` sampled
+            subgoal endpoints and ``N = plan_candidates`` bridge/action
+            samples per endpoint.
+        candidate_goals : ``[B, N, D]`` or ``[B, U*N, D]``
             Per-candidate subgoal endpoints used both to drive bridge
             sampling and to rescore each candidate with its own goal.  In
             deterministic mode this is just the mean broadcast across ``N``.
@@ -925,24 +723,38 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
         if sub_mode == 'diag_gaussian':
             sub_rng, plan_rng, new_rng = jax.random.split(rng, 3)
+            subgoal_samples = max(1, int(self.config.get('subgoal_num_samples', 1)))
             candidate_goals, mu = self.sample_subgoal_candidates(
                 obs,
                 goals,
                 sub_rng,
-                num_candidates=plan_candidates,
+                num_candidates=subgoal_samples,
                 include_mean=True,
             )
-            per_rngs = jax.random.split(plan_rng, plan_candidates)
-            cand_endpoints = jnp.swapaxes(candidate_goals, 0, 1)  # [N, B, D]
+            per_subgoal_rngs = jax.random.split(plan_rng, subgoal_samples)
+            cand_endpoints = jnp.swapaxes(candidate_goals, 0, 1)  # [U, B, D]
             traj_noise = float(sample_noise_scale)
 
-            def _per_candidate(rng_k, endpoint_k):
-                return self._sample_plan_trajectory(
-                    obs, endpoint_k, rng_k, traj_noise, num_steps=proposal_horizon, goal=goals,
+            def _per_subgoal(rng_u, endpoint_u):
+                return self.sample_plan_candidates(
+                    obs,
+                    endpoint_u,
+                    rng_u,
+                    num_candidates=plan_candidates,
+                    noise_scale=traj_noise,
+                    include_mean=True,
+                    num_steps=proposal_horizon,
+                    goal=goals,
                 )
 
-            candidate_trajectories = jax.vmap(_per_candidate, in_axes=(0, 0))(per_rngs, cand_endpoints)
-            candidate_trajectories = jnp.swapaxes(candidate_trajectories, 0, 1)  # [B, N, K+1, D]
+            candidate_trajectories = jax.vmap(_per_subgoal, in_axes=(0, 0))(per_subgoal_rngs, cand_endpoints)
+            candidate_trajectories = jnp.swapaxes(candidate_trajectories, 0, 1)  # [B, U, N, K+1, D]
+            B, U, Np = candidate_trajectories.shape[:3]
+            candidate_trajectories = candidate_trajectories.reshape(
+                B, U * Np, candidate_trajectories.shape[-2], candidate_trajectories.shape[-1]
+            )
+            candidate_goals = jnp.repeat(candidate_goals[:, :, None, :], plan_candidates, axis=2)
+            candidate_goals = candidate_goals.reshape(obs.shape[0], subgoal_samples * plan_candidates, -1)
         else:
             mu = self._subgoal_forward(obs, goals)
             if isinstance(mu, tuple):  # safety net (shouldn't happen in deterministic mode)
@@ -1011,30 +823,6 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             progress_alpha=float(config.get('progress_alpha', 0.8)),
         )
 
-        # Optional precomputed hard-bridge coefficients (gamma_inv = 0) used
-        # by the curved centerline path when
-        # ``centerline_residual_use_hard_variance`` is True. We compute these
-        # at create() time so the residual std is constant w.r.t. the chosen
-        # ``bridge_gamma_inv`` (the analytic hard-bridge variance schedule).
-        # Only stored when the curved option is active to keep checkpoints
-        # bit-identical for legacy configs.
-        if _curved_centerline_active(config) and bool(
-            config.get('centerline_residual_use_hard_variance', True)
-        ):
-            a_hard, b_hard, std_hard = forward_bridge_coefficients(
-                int(config['dynamics_N']),
-                beta_min=float(config['dynamics_beta_min']),
-                beta_max=float(config['dynamics_beta_max']),
-                lambda_=float(config['dynamics_lambda']),
-                theta_schedule=str(config.get('theta_schedule', 'linear_beta')),
-                theta_total=float(config.get('theta_total', 1.0)),
-                progress_alpha=float(config.get('progress_alpha', 0.8)),
-            )
-            schedule = dict(schedule)
-            schedule['centerline_hard_a'] = a_hard
-            schedule['centerline_hard_b'] = b_hard
-            schedule['centerline_hard_std'] = std_hard
-
         eps_net_def = EpsilonNet(
             hidden_dims=tuple(config['eps_hidden_dims']),
             state_dim=state_dim,
@@ -1097,40 +885,6 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             dummy_t = jnp.zeros((batch_size, horizon), dtype=jnp.float32)
             network_info['path_residual_net'] = (residual_def, (dummy_x, dummy_x, dummy_t))
 
-        # Optionally register the curved centerline MLP. Only created when the
-        # option is requested AND supported (exact_residual + reverse_score) so
-        # legacy checkpoints stay bit-loadable. Unsupported combinations log a
-        # one-shot warning and silently skip registration.
-        if _curved_centerline_requested(config):
-            if _curved_centerline_supported(config):
-                center_hidden = config.get('centerline_hidden_dims', (256, 256))
-                if isinstance(center_hidden, str):
-                    center_hidden = parse_hidden_dims(center_hidden)
-                else:
-                    center_hidden = tuple(int(x) for x in center_hidden)
-                center_def = CurvedCenterlineNet(
-                    hidden_dims=center_hidden,
-                    state_dim=state_dim,
-                    layer_norm=bool(config['layer_norm']),
-                    use_goal=bool(config.get('centerline_use_goal', True)),
-                    zero_init=bool(config.get('centerline_zero_init', True)),
-                )
-                dummy_tau = jnp.zeros((batch_size, 1), dtype=jnp.float32)
-                # Goal init dummy: same shape as observations; ignored when
-                # ``use_goal=False`` but always passed for a stable signature.
-                network_info['centerline_net'] = (
-                    center_def, (dummy_x, dummy_x, dummy_x, dummy_tau)
-                )
-            else:
-                logging.warning(
-                    'use_curved_centerline=True is only supported with '
-                    'dynamics_model_type=exact_residual + planner_type=reverse_score; '
-                    'got dynamics_model_type=%r, planner_type=%r. The curved '
-                    'centerline option will be ignored.',
-                    _dynamics_model_type(config),
-                    _planner_type(config),
-                )
-
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -1183,6 +937,86 @@ class DynamicsAgent(_DynamicsAgentCore):
         value = jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
         return value, jnp.asarray(alpha, dtype=jnp.float32) * value
 
+    def _value_predictions(
+        self,
+        observations: jnp.ndarray,
+        high_actor_goals: jnp.ndarray,
+        critic_value_params: Any | None,
+    ) -> jnp.ndarray:
+        """Evaluate the shared scalar value net used by the critic."""
+        if critic_value_params is None:
+            return jnp.zeros((observations.shape[0],), dtype=jnp.float32)
+        value_def = ScalarValueNet(
+            tuple(int(x) for x in self.config.get('subgoal_value_hidden_dims', (512, 512, 512))),
+            layer_norm=bool(self.config.get('subgoal_value_layer_norm', True)),
+        )
+        value_logits = value_def.apply({'params': critic_value_params}, observations, high_actor_goals)
+        return jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
+
+    def _dataset_goal_rewards(self, batch, K: int) -> jnp.ndarray:
+        """Discount-path rewards using the batch's sampled high-level goal.
+
+        PathHGCDataset exposes the integer trajectory indices and the sampled
+        high_actor_goal index.  That lets the stochastic subgoal objective use
+        exactly the same dataset goal criterion as the rest of the GC pipeline:
+        a state receives success reward when its dataset index equals the
+        sampled goal index.  Lightweight unit-test batches do not carry these
+        indices; in that case this returns zeros so the objective reduces to
+        ordinary log-likelihood.
+        """
+        if 'trajectory_indices' not in batch or 'high_actor_goal_idxs' not in batch:
+            return jnp.zeros((batch['observations'].shape[0], K), dtype=jnp.float32)
+        # K-step transition rewards are next-state based, so use
+        # s_{t+1}, ..., s_{t+K}; s_t itself is accounted for by -V(s_t, g).
+        traj_idx = jnp.asarray(batch['trajectory_indices'][:, 1 : K + 1], dtype=jnp.int32)
+        goal_idx = jnp.asarray(batch['high_actor_goal_idxs'], dtype=jnp.int32)
+        success = (traj_idx == goal_idx[:, None]).astype(jnp.float32)
+        reward_offset = 1.0 if bool(self.config.get('gc_negative', True)) else 0.0
+        return success - reward_offset
+
+    def _stochastic_subgoal_advantage_weights(
+        self,
+        batch,
+        target: jnp.ndarray,
+        high_actor_goals: jnp.ndarray,
+        critic_value_params: Any | None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Return stop-gradient weights proportional to exp(beta * A).
+
+        A(s_t, s_{t+K}, g) = gamma^K V(s_{t+K}, g)
+                            + sum_i gamma^i r(s_{t+i}, g)
+                            - V(s_t, g)
+
+        ``beta`` defaults to 1.0.  We center/clip/normalize the exponent for
+        numerical stability; this preserves the relative exp(A) preference while
+        keeping the weighted NLL on the same loss scale as the old objective.
+        """
+        K = int(self.config.get('subgoal_steps', target.shape[0]))
+        discount = float(self.config.get('discount', 0.99))
+        v_start = self._value_predictions(batch['observations'], high_actor_goals, critic_value_params)
+        v_target = self._value_predictions(target, high_actor_goals, critic_value_params)
+
+        rewards = self._dataset_goal_rewards(batch, K)
+        powers = jnp.power(jnp.asarray(discount, dtype=jnp.float32), jnp.arange(K, dtype=jnp.float32))
+        discounted_rewards = jnp.sum(rewards * powers[None, :], axis=1)
+        advantage = (
+            (jnp.asarray(discount, dtype=jnp.float32) ** K) * v_target
+            + discounted_rewards
+            - v_start
+        )
+
+        beta = float(self.config.get('stochastic_subgoal_adv_beta', 1.0))
+        clip = float(self.config.get('stochastic_subgoal_adv_clip', 5.0))
+        logits = beta * jax.lax.stop_gradient(advantage)
+        if bool(self.config.get('stochastic_subgoal_adv_center', True)):
+            logits = logits - jnp.mean(logits)
+        if clip > 0.0:
+            logits = jnp.clip(logits, -clip, clip)
+        weights = jnp.exp(logits)
+        if bool(self.config.get('stochastic_subgoal_adv_normalize', True)):
+            weights = weights / jnp.maximum(jnp.mean(weights), 1e-6)
+        return jax.lax.stop_gradient(weights), advantage
+
     def _compute_subgoal_loss(self, batch, grad_params, rng_fr, critic_value_params):
         """Compute the subgoal-net training loss + companion logging tensors.
 
@@ -1204,55 +1038,28 @@ class DynamicsAgent(_DynamicsAgentCore):
                 diff_sg ** 2 * inv_var + 2.0 * pred_log_std + jnp.log(2.0 * jnp.pi), axis=-1
             )
             subgoal_mse = jnp.mean(diff_sg ** 2, axis=-1)
-            var_reg_per_sample = jnp.mean(pred_log_std ** 2, axis=-1)
-
-            w_fr = float(self.config.get('subgoal_fr_spi_weight', 0.0))
-            if w_fr > 0.0 and critic_value_params is not None:
-                k_fr = 4
-                fr_eps = jax.random.normal(rng_fr, (s.shape[0], k_fr, target.shape[-1]))
-                cand = jax.lax.stop_gradient(
-                    pred_mu[:, None, :] + pred_std[:, None, :] * fr_eps
-                )
-                value_def = ScalarValueNet(
-                    tuple(int(x) for x in self.config.get('subgoal_value_hidden_dims', (512, 512, 512))),
-                    layer_norm=bool(self.config.get('subgoal_value_layer_norm', True)),
-                )
-                cand_flat = cand.reshape(-1, cand.shape[-1])
-                g_high_flat = jnp.repeat(g_high[:, None, :], k_fr, axis=1).reshape(-1, g_high.shape[-1])
-                v_logits = value_def.apply({'params': critic_value_params}, cand_flat, g_high_flat)
-                v_cand = jax.nn.sigmoid(jnp.asarray(v_logits, dtype=jnp.float32)).reshape(s.shape[0], k_fr)
-                tau_fr = float(self.config.get('subgoal_fr_spi_tau', 1.0))
-                rho_fr = jax.lax.stop_gradient(jax.nn.softmax(v_cand / jnp.maximum(tau_fr, 1e-6), axis=1))
-                log_q = -0.5 * jnp.sum(
-                    ((cand - pred_mu[:, None, :]) ** 2) * inv_var[:, None, :]
-                    + 2.0 * pred_log_std[:, None, :]
-                    + jnp.log(2.0 * jnp.pi),
-                    axis=-1,
-                )
-                fr_term = -jnp.mean(jnp.sum(rho_fr * log_q, axis=1))
-            else:
-                fr_term = jnp.asarray(0.0, dtype=jnp.float32)
-
-            subgoal_value, subgoal_value_bonus = self._subgoal_value_bonus(
-                pred_mu, g_high, critic_value_params
+            adv_weights, subgoal_adv = self._stochastic_subgoal_advantage_weights(
+                batch, target, g_high, critic_value_params
             )
 
-            w_nll = float(self.config.get('subgoal_nll_weight', 1.0))
-            w_mse = float(self.config.get('subgoal_mse_weight', 0.25))
-            w_var = float(self.config.get('subgoal_var_reg_weight', 1.0e-4))
-            loss_sub = (
-                w_nll * jnp.mean(nll_per_sample)
-                + w_mse * jnp.mean(subgoal_mse)
-                + w_var * jnp.mean(var_reg_per_sample)
-                - jnp.mean(subgoal_value_bonus)
-                + w_fr * fr_term
-            )
+            # Stochastic subgoal mode is purely advantage-weighted behaviour
+            # log-likelihood:
+            #   loss = - E[ stop_grad(exp(beta * A)) * log pi_phi(s_{t+K}|s_t,g) ].
+            # Do not add the deterministic MSE, direct value bonus, variance
+            # regularizer, or the old FR-SPI auxiliary term in this branch.
+            loss_sub = jnp.mean(adv_weights * nll_per_sample)
+            subgoal_value = self._value_predictions(target, g_high, critic_value_params)
+            subgoal_value_bonus = jnp.zeros_like(subgoal_value)
             pred_sg_out = pred_mu
+            zero = jnp.asarray(0.0, dtype=jnp.float32)
             subgoal_extra_info = {
                 'phase1/subgoal_nll': jnp.mean(nll_per_sample),
+                'phase1/subgoal_weighted_nll': jnp.mean(adv_weights * nll_per_sample),
+                'phase1/subgoal_adv_mean': jnp.mean(subgoal_adv),
+                'phase1/subgoal_adv_weight_mean': jnp.mean(adv_weights),
+                'phase1/subgoal_adv_weight_max': jnp.max(adv_weights),
                 'phase1/subgoal_std_mean': jnp.mean(pred_std),
                 'phase1/subgoal_std_max': jnp.max(pred_std),
-                'phase1/subgoal_fr_spi': fr_term,
                 'phase1/subgoal_mode': jnp.asarray(1.0, dtype=jnp.float32),
             }
         else:
@@ -1268,7 +1075,6 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_nll': zero,
                 'phase1/subgoal_std_mean': zero,
                 'phase1/subgoal_std_max': zero,
-                'phase1/subgoal_fr_spi': zero,
                 'phase1/subgoal_mode': zero,
             }
         return loss_sub, subgoal_mse, subgoal_value, subgoal_value_bonus, pred_sg_out, subgoal_extra_info
@@ -1299,45 +1105,32 @@ class DynamicsAgent(_DynamicsAgentCore):
         n_safe = jnp.minimum(n, N - 1)
 
         # --- L_dynamics / bridge-prior regularization ---
-        # In sde_euler mode this is the bridge posterior mean-matching loss.
-        # In exact_residual mode the model mean = posterior_mean + learned
-        # residual, so matching mu_pred -> mu_true would force the residual to
-        # zero. Instead we use a small L2 prior on the residual; the main
-        # learning signals are L_path and L_roll below.
-        model_type = _dynamics_model_type(self.config)
-        # When the curved centerline is active, ``_learned_reverse_mean`` consumes
-        # the high-actor goal so the centerline can be conditioned on it. The
-        # rest of the path stays untouched (legacy code paths ignore ``goal``).
-        goal_for_curved = (
-            batch['high_actor_goals'] if _curved_centerline_active(self.config) else None
-        )
-
+        # The model mean is posterior_mean + learned residual.  Directly matching
+        # mu_pred -> mu_true would force the residual to zero, so the mean-match
+        # term is only an optional regularizer.  The main learning signals are
+        # L_path and L_roll below.
         x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
         x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
         mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
         mu_pred, eps_pred = self._learned_reverse_mean(
-            x_n, x_T, x_0, n, self.schedule, goal=goal_for_curved, params=grad_params,
+            x_n, x_T, x_0, n, self.schedule, params=grad_params,
         )
         g2_n = self.schedule['g2'][n - 1]
         weight = 1.0 / (2.0 * jnp.maximum(g2_n, 1e-12))
         loss_bridge_mean_match = (weight * jnp.abs(mu_true - mu_pred).sum(axis=-1)).mean()
 
-        if model_type == 'exact_residual':
-            loss_residual_reg = jnp.mean(jnp.sum(eps_pred ** 2, axis=-1))
-            loss_dynamics = (
-                float(self.config.get('exact_residual_bridge_match_weight', 0.0)) * loss_bridge_mean_match
-                + float(self.config.get('exact_residual_reg_weight', 1.0e-4)) * loss_residual_reg
-            )
-        else:
-            loss_residual_reg = jnp.array(0.0, dtype=jnp.float32)
-            loss_dynamics = loss_bridge_mean_match
+        loss_residual_reg = jnp.mean(jnp.sum(eps_pred ** 2, axis=-1))
+        loss_dynamics = (
+            float(self.config.get('exact_residual_bridge_match_weight', 0.0)) * loss_bridge_mean_match
+            + float(self.config.get('exact_residual_reg_weight', 1.0e-4)) * loss_residual_reg
+        )
 
         # --- L_path: real x_n along segment, same n ---
         row = jnp.arange(B, dtype=jnp.int32)
         x_n_real = segment[row, K - n, :]
         x_prev_real = segment[row, K - n + 1, :]
         mu_pred_path, _ = self._learned_reverse_mean(
-            x_n_real, x_T, x_0, n, self.schedule, goal=goal_for_curved, params=grad_params,
+            x_n_real, x_T, x_0, n, self.schedule, params=grad_params,
         )
         diff_p = mu_pred_path - x_prev_real
         loss_path = jnp.abs(diff_p).sum(axis=-1).mean()
@@ -1351,7 +1144,7 @@ class DynamicsAgent(_DynamicsAgentCore):
             step_n = N - h + 1
             n_b = jnp.full((B,), step_n, dtype=jnp.int32)
             mu_r, _ = self._learned_reverse_mean(
-                x, x_T, x_0, n_b, self.schedule, goal=goal_for_curved, params=grad_params,
+                x, x_T, x_0, n_b, self.schedule, params=grad_params,
             )
             tgt = segment[row, h, :]
             err = jnp.abs(mu_r - tgt).sum(axis=-1)
@@ -1368,27 +1161,12 @@ class DynamicsAgent(_DynamicsAgentCore):
 
         loss = w_g * loss_dynamics + w_p * loss_path + w_r * loss_roll + sg_w * loss_sub
 
-        # --- L_centerline (optional, curved centerline only) ---
-        zero = jnp.asarray(0.0, dtype=jnp.float32)
-        loss_center_amp = zero
-        loss_center_smooth = zero
-        center_deviation = zero
-        center_residual_norm = zero
-        if _curved_centerline_active(self.config):
-            (loss_center_amp, loss_center_smooth, center_deviation,
-             center_residual_norm) = self._curved_centerline_diagnostics(
-                x_T, x_0, batch['high_actor_goals'], n, x_n_real, grad_params,
-            )
-            amp_coef = float(self.config.get('centerline_amp_coef', 1.0e-4))
-            smooth_coef = float(self.config.get('centerline_smooth_coef', 1.0e-3))
-            loss = loss + amp_coef * loss_center_amp + smooth_coef * loss_center_smooth
-
         idm_term, loss_idm_unw = self._idm_loss_term(batch, grad_params)
         loss = loss + idm_term
 
         n_N = jnp.full((B,), N, dtype=jnp.int32)
         xNm1, _ = self._learned_reverse_mean(
-            x_T, x_T, x_0, n_N, self.schedule, goal=goal_for_curved, params=grad_params,
+            x_T, x_T, x_0, n_N, self.schedule, params=grad_params,
         )
         xNm1_norm = jnp.linalg.norm(xNm1, axis=-1).mean()
 
@@ -1430,61 +1208,7 @@ class DynamicsAgent(_DynamicsAgentCore):
         )
         info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
         info.update(self._theta_schedule_info())
-        if _curved_centerline_active(self.config):
-            info['dynamics/centerline/amp'] = loss_center_amp
-            info['dynamics/centerline/smooth'] = loss_center_smooth
-            info['dynamics/centerline/deviation'] = center_deviation
-            info['dynamics/centerline/residual_norm'] = center_residual_norm
         return loss, info
-
-    def _curved_centerline_diagnostics(self, x_T, x_0, goal, n, x_n_real, grad_params):
-        """Compute curved centerline regularisers and diagnostics.
-
-        - ``loss_amp``     : ``mean(h^2)`` over forward i ∈ {0,...,K},
-                             ``h`` is the centerline raw displacement.
-        - ``loss_smooth``  : second-difference smoothness on ``c`` over
-                             interior i ∈ {1,...,K-1}.
-        - ``deviation``    : ``mean(|c_i - linear_i|)`` where ``linear_i`` is
-                             the straight-line interpolation between endpoints.
-        - ``residual_norm``: ``mean(|alpha rho eps|)`` at the sampled ``n``,
-                             evaluated with ``x_n_real`` for an in-distribution
-                             estimate of the residual magnitude.
-        """
-        N = int(self.config['dynamics_N'])
-        B = x_T.shape[0]
-
-        def at_i(i):
-            i_int = jnp.full((B,), int(i), dtype=jnp.int32)
-            c_i, h_i, b_i = self._curved_centerline(x_T, x_0, goal, i_int, params=grad_params)
-            linear_i = (1.0 - b_i) * x_T + b_i * x_0
-            return c_i, h_i, linear_i
-
-        all_c = []
-        all_h = []
-        all_linear = []
-        for i in range(N + 1):
-            c_i, h_i, linear_i = at_i(i)
-            all_c.append(c_i)
-            all_h.append(h_i)
-            all_linear.append(linear_i)
-        c_stack = jnp.stack(all_c, axis=1)        # (B, K+1, D)
-        h_stack = jnp.stack(all_h, axis=1)        # (B, K+1, D)
-        linear_stack = jnp.stack(all_linear, axis=1)
-
-        loss_amp = jnp.mean(h_stack ** 2)
-        if N >= 2:
-            second_diff = c_stack[:, 2:, :] - 2.0 * c_stack[:, 1:-1, :] + c_stack[:, :-2, :]
-            loss_smooth = jnp.mean(second_diff ** 2)
-        else:
-            loss_smooth = jnp.asarray(0.0, dtype=jnp.float32)
-        deviation = jnp.mean(jnp.abs(c_stack - linear_stack))
-
-        # Residual norm at the sampled n, on real x_n.
-        _, eps_pred, _h, residual = self._curved_reverse_mean(
-            x_n_real, x_T, x_0, n, self.schedule, goal, params=grad_params,
-        )
-        residual_norm = jnp.mean(jnp.abs(residual))
-        return loss_amp, loss_smooth, deviation, residual_norm
 
     def _total_loss_forward_bridge(self, batch, grad_params, rng, critic_value_params, planner: str):
         """Forward-bridge path-supervised loss (planner_type in {forward_bridge,
@@ -1682,15 +1406,18 @@ def _get_common_config():
             subgoal_hidden_dims=(512, 512, 512),
             # Distributional subgoal controls (default: legacy deterministic point).
             subgoal_distribution='deterministic',
+            subgoal_num_samples=1,
             subgoal_log_std_min=-5.0,
             subgoal_log_std_max=1.0,
             subgoal_temperature=1.0,
             subgoal_use_mean_for_actor_goal=True,
-            subgoal_nll_weight=1.0,
-            subgoal_mse_weight=0.25,
-            subgoal_var_reg_weight=1.0e-4,
-            subgoal_fr_spi_weight=0.0,
-            subgoal_fr_spi_tau=1.0,
+            # Distributional subgoal mode trains log pi(s_{t+K}|s_t,g) with
+            # weights proportional to exp(beta * A).  The exponent is centered,
+            # clipped, and normalized by default to keep the loss scale stable.
+            stochastic_subgoal_adv_beta=1.0,
+            stochastic_subgoal_adv_clip=5.0,
+            stochastic_subgoal_adv_center=True,
+            stochastic_subgoal_adv_normalize=True,
             discount=0.99,
             subgoal_steps=25,
             # When False (default): PathHGCDataset overrides high_actor_targets with the
@@ -1742,28 +1469,10 @@ def get_dynamics_config():
     c.path_eval_slice = [0, 1]
     c.idm_loss_weight = 1.0
     c.idm_hidden_dims = (512, 512, 512)
-    # Dynamics model parameterization. Default 'sde_euler' preserves current
-    # behavior bit-for-bit. 'exact_residual' replaces the learned model mean
-    # with posterior_mean + sqrt(post_var) * eps_pred (data residual).
-    c.dynamics_model_type = 'sde_euler'
+    # Dynamics model parameterization: exact bridge posterior mean plus a
+    # variance-scaled learned residual.
+    c.dynamics_model_type = 'exact_residual'
     c.exact_residual_scale = 1.0
     c.exact_residual_reg_weight = 1.0e-4
     c.exact_residual_bridge_match_weight = 0.0
-    # Optional curved centerline bridge (state-space proposal only).
-    # When False (default) the analytic linear-SDE bridge is used unchanged.
-    # When True (and dynamics_model_type=exact_residual + planner_type=reverse_score),
-    # the bridge mean is computed in residual coordinates around an
-    # endpoint-preserving learned centerline c_i = (1-b)s0 + b sK + b(1-b)*h.
-    # See _curved_reverse_mean and CurvedCenterlineNet for details.
-    c.use_curved_centerline = False
-    c.centerline_hidden_dims = (256, 256)
-    c.centerline_scale = 1.0
-    c.centerline_zero_init = True
-    c.centerline_beta_type = 'linear'  # 'linear' | 'hard_bridge'
-    c.centerline_use_goal = True
-    c.centerline_amp_coef = 1.0e-4
-    c.centerline_smooth_coef = 1.0e-3
-    c.centerline_residual_use_hard_variance = True
-    # None = apply curvature to all state dims; list[int] restricts to a subset.
-    c.centerline_apply_to_state_dims = ml_collections.config_dict.placeholder(tuple)
     return c

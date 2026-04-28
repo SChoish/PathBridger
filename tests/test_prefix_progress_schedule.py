@@ -232,10 +232,9 @@ def test_agent_logs_theta_schedule_metadata():
         )
 
     combos = [
-        ('reverse_score', 'sde_euler'),
         ('reverse_score', 'exact_residual'),
-        ('forward_bridge', 'sde_euler'),
-        ('forward_bridge_residual', 'sde_euler'),
+        ('forward_bridge', 'exact_residual'),
+        ('forward_bridge_residual', 'exact_residual'),
     ]
     for planner, model_type in combos:
         cfg = get_dynamics_config()

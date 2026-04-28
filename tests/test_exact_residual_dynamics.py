@@ -98,18 +98,18 @@ def test_exact_residual_uses_post_var_as_scale():
 
 
 def test_dynamics_model_type_validation():
-    """The config helper must accept the two valid modes and reject unknowns."""
+    """The config helper accepts the exact_residual mode and rejects removed modes."""
     from agents.dynamics import _dynamics_model_type
 
-    assert _dynamics_model_type({}) == 'sde_euler'
-    assert _dynamics_model_type({'dynamics_model_type': 'sde_euler'}) == 'sde_euler'
+    assert _dynamics_model_type({}) == 'exact_residual'
     assert _dynamics_model_type({'dynamics_model_type': 'EXACT_RESIDUAL'}) == 'exact_residual'
-    raised = False
-    try:
-        _dynamics_model_type({'dynamics_model_type': 'no_such_mode'})
-    except ValueError:
-        raised = True
-    assert raised, 'expected ValueError for unknown dynamics_model_type'
+    for removed in ('sde_euler', 'no_such_mode'):
+        raised = False
+        try:
+            _dynamics_model_type({'dynamics_model_type': removed})
+        except ValueError:
+            raised = True
+        assert raised, f'expected ValueError for dynamics_model_type={removed!r}'
 
 
 if __name__ == '__main__':
