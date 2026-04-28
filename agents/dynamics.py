@@ -124,10 +124,10 @@ class SubgoalEstimatorNet(nn.Module):
 class DistributionalSubgoalEstimatorNet(nn.Module):
     """Diagonal-Gaussian subgoal estimator (``subgoal_distribution='diag_gaussian'``).
 
-    Returns ``(mu, log_std)`` for ``pi_phi(s_{t+K} | s_t, g)``.  In stochastic
-    mode the phase-1 subgoal objective is pure advantage-weighted log
-    likelihood of the dataset future subgoal (no MSE, log-std regulariser,
-    direct value bonus, or FR/SPI auxiliary term).  Actor proposals sample
+    Returns ``(mu, log_std)`` for ``pi_phi(s_{t+K} | s_t, g)``.  The phase-1
+    subgoal objective trains the Gaussian mean with the same stable
+    ``MSE - alpha * V(mu, g)`` loss as deterministic mode; ``log_std`` is used
+    for stochastic actor proposals and NLL diagnostics.  Actor proposals sample
     endpoint candidates from this distribution in
     :meth:`_DynamicsAgentCore.sample_subgoal_candidates`.
     """
@@ -267,7 +267,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     # so downstream consumers (IDM action decoding, rollout/subgoal.py, etc.)
     # can be re-used without changes.
 
-    def forward_bridge_coefficients(self, K, *, eps: float | None = None):
+    def forward_bridge_coefficients(self, K, *, bridge_gamma_inv: float | None = None):
         """Return ``(a, b, std)`` of shape ``(K + 1,)`` for the linear-SDE forward bridge.
 
         Coefficients satisfy ``z_i | z_0, z_K ~ N(a_i z_0 + b_i z_K, std_i^2 I)``
@@ -275,16 +275,20 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         ``a[0]=1, b[0]=0, std[0]=0`` and ``a[K]=0, b[K]=1, std[K]=0``.
 
         ``K`` is treated as a *static* Python int (it determines the size of
-        the returned arrays); ``eps`` defaults to ``self.config['forward_bridge_eps']``
-        when ``None``.
+        the returned arrays). ``bridge_gamma_inv`` defaults to the agent config,
+        so forward bridge planners use the same finite-gamma setting as the
+        reverse-score bridge math.
         """
-        eps_val = float(self.config.get('forward_bridge_eps', 1.0e-6)) if eps is None else float(eps)
+        gamma_inv = (
+            float(self.config.get('bridge_gamma_inv', 0.0))
+            if bridge_gamma_inv is None else float(bridge_gamma_inv)
+        )
         return forward_bridge_coefficients(
             int(K),
             beta_min=float(self.config['dynamics_beta_min']),
             beta_max=float(self.config['dynamics_beta_max']),
             lambda_=float(self.config['dynamics_lambda']),
-            eps=eps_val,
+            bridge_gamma_inv=gamma_inv,
             theta_schedule=str(self.config.get('theta_schedule', 'linear_beta')),
             theta_total=float(self.config.get('theta_total', 1.0)),
             progress_alpha=float(self.config.get('progress_alpha', 0.8)),
@@ -937,86 +941,6 @@ class DynamicsAgent(_DynamicsAgentCore):
         value = jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
         return value, jnp.asarray(alpha, dtype=jnp.float32) * value
 
-    def _value_predictions(
-        self,
-        observations: jnp.ndarray,
-        high_actor_goals: jnp.ndarray,
-        critic_value_params: Any | None,
-    ) -> jnp.ndarray:
-        """Evaluate the shared scalar value net used by the critic."""
-        if critic_value_params is None:
-            return jnp.zeros((observations.shape[0],), dtype=jnp.float32)
-        value_def = ScalarValueNet(
-            tuple(int(x) for x in self.config.get('subgoal_value_hidden_dims', (512, 512, 512))),
-            layer_norm=bool(self.config.get('subgoal_value_layer_norm', True)),
-        )
-        value_logits = value_def.apply({'params': critic_value_params}, observations, high_actor_goals)
-        return jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
-
-    def _dataset_goal_rewards(self, batch, K: int) -> jnp.ndarray:
-        """Discount-path rewards using the batch's sampled high-level goal.
-
-        PathHGCDataset exposes the integer trajectory indices and the sampled
-        high_actor_goal index.  That lets the stochastic subgoal objective use
-        exactly the same dataset goal criterion as the rest of the GC pipeline:
-        a state receives success reward when its dataset index equals the
-        sampled goal index.  Lightweight unit-test batches do not carry these
-        indices; in that case this returns zeros so the objective reduces to
-        ordinary log-likelihood.
-        """
-        if 'trajectory_indices' not in batch or 'high_actor_goal_idxs' not in batch:
-            return jnp.zeros((batch['observations'].shape[0], K), dtype=jnp.float32)
-        # K-step transition rewards are next-state based, so use
-        # s_{t+1}, ..., s_{t+K}; s_t itself is accounted for by -V(s_t, g).
-        traj_idx = jnp.asarray(batch['trajectory_indices'][:, 1 : K + 1], dtype=jnp.int32)
-        goal_idx = jnp.asarray(batch['high_actor_goal_idxs'], dtype=jnp.int32)
-        success = (traj_idx == goal_idx[:, None]).astype(jnp.float32)
-        reward_offset = 1.0 if bool(self.config.get('gc_negative', True)) else 0.0
-        return success - reward_offset
-
-    def _stochastic_subgoal_advantage_weights(
-        self,
-        batch,
-        target: jnp.ndarray,
-        high_actor_goals: jnp.ndarray,
-        critic_value_params: Any | None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Return stop-gradient weights proportional to exp(beta * A).
-
-        A(s_t, s_{t+K}, g) = gamma^K V(s_{t+K}, g)
-                            + sum_i gamma^i r(s_{t+i}, g)
-                            - V(s_t, g)
-
-        ``beta`` defaults to 1.0.  We center/clip/normalize the exponent for
-        numerical stability; this preserves the relative exp(A) preference while
-        keeping the weighted NLL on the same loss scale as the old objective.
-        """
-        K = int(self.config.get('subgoal_steps', target.shape[0]))
-        discount = float(self.config.get('discount', 0.99))
-        v_start = self._value_predictions(batch['observations'], high_actor_goals, critic_value_params)
-        v_target = self._value_predictions(target, high_actor_goals, critic_value_params)
-
-        rewards = self._dataset_goal_rewards(batch, K)
-        powers = jnp.power(jnp.asarray(discount, dtype=jnp.float32), jnp.arange(K, dtype=jnp.float32))
-        discounted_rewards = jnp.sum(rewards * powers[None, :], axis=1)
-        advantage = (
-            (jnp.asarray(discount, dtype=jnp.float32) ** K) * v_target
-            + discounted_rewards
-            - v_start
-        )
-
-        beta = float(self.config.get('stochastic_subgoal_adv_beta', 1.0))
-        clip = float(self.config.get('stochastic_subgoal_adv_clip', 5.0))
-        logits = beta * jax.lax.stop_gradient(advantage)
-        if bool(self.config.get('stochastic_subgoal_adv_center', True)):
-            logits = logits - jnp.mean(logits)
-        if clip > 0.0:
-            logits = jnp.clip(logits, -clip, clip)
-        weights = jnp.exp(logits)
-        if bool(self.config.get('stochastic_subgoal_adv_normalize', True)):
-            weights = weights / jnp.maximum(jnp.mean(weights), 1e-6)
-        return jax.lax.stop_gradient(weights), advantage
-
     def _compute_subgoal_loss(self, batch, grad_params, rng_fr, critic_value_params):
         """Compute the subgoal-net training loss + companion logging tensors.
 
@@ -1038,26 +962,13 @@ class DynamicsAgent(_DynamicsAgentCore):
                 diff_sg ** 2 * inv_var + 2.0 * pred_log_std + jnp.log(2.0 * jnp.pi), axis=-1
             )
             subgoal_mse = jnp.mean(diff_sg ** 2, axis=-1)
-            adv_weights, subgoal_adv = self._stochastic_subgoal_advantage_weights(
-                batch, target, g_high, critic_value_params
+            subgoal_value, subgoal_value_bonus = self._subgoal_value_bonus(
+                pred_mu, g_high, critic_value_params
             )
-
-            # Stochastic subgoal mode is purely advantage-weighted behaviour
-            # log-likelihood:
-            #   loss = - E[ stop_grad(exp(beta * A)) * log pi_phi(s_{t+K}|s_t,g) ].
-            # Do not add the deterministic MSE, direct value bonus, variance
-            # regularizer, or the old FR-SPI auxiliary term in this branch.
-            loss_sub = jnp.mean(adv_weights * nll_per_sample)
-            subgoal_value = self._value_predictions(target, g_high, critic_value_params)
-            subgoal_value_bonus = jnp.zeros_like(subgoal_value)
+            loss_sub = jnp.mean(subgoal_mse) - jnp.mean(subgoal_value_bonus)
             pred_sg_out = pred_mu
-            zero = jnp.asarray(0.0, dtype=jnp.float32)
             subgoal_extra_info = {
                 'phase1/subgoal_nll': jnp.mean(nll_per_sample),
-                'phase1/subgoal_weighted_nll': jnp.mean(adv_weights * nll_per_sample),
-                'phase1/subgoal_adv_mean': jnp.mean(subgoal_adv),
-                'phase1/subgoal_adv_weight_mean': jnp.mean(adv_weights),
-                'phase1/subgoal_adv_weight_max': jnp.max(adv_weights),
                 'phase1/subgoal_std_mean': jnp.mean(pred_std),
                 'phase1/subgoal_std_max': jnp.max(pred_std),
                 'phase1/subgoal_mode': jnp.asarray(1.0, dtype=jnp.float32),
@@ -1411,13 +1322,6 @@ def _get_common_config():
             subgoal_log_std_max=1.0,
             subgoal_temperature=1.0,
             subgoal_use_mean_for_actor_goal=True,
-            # Distributional subgoal mode trains log pi(s_{t+K}|s_t,g) with
-            # weights proportional to exp(beta * A).  The exponent is centered,
-            # clipped, and normalized by default to keep the loss scale stable.
-            stochastic_subgoal_adv_beta=1.0,
-            stochastic_subgoal_adv_clip=5.0,
-            stochastic_subgoal_adv_center=True,
-            stochastic_subgoal_adv_normalize=True,
             discount=0.99,
             subgoal_steps=25,
             # When False (default): PathHGCDataset overrides high_actor_targets with the
@@ -1437,7 +1341,6 @@ def _get_common_config():
             #                               learned residual (PathResidualNet).
             planner_type='reverse_score',
             forward_bridge_mode='mean',
-            forward_bridge_eps=1.0e-6,
             forward_bridge_use_path_loss=True,
             # Hidden dims for the optional PathResidualNet (forward_bridge_residual).
             residual_hidden_dims=(512, 512, 512),

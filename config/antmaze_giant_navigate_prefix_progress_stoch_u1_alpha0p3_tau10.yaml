@@ -2,11 +2,11 @@
 # AntMaze giant stochastic subgoal planning:
 #   U = dynamics.subgoal_num_samples = 1 sampled subgoal
 #   N = plan_candidates = 1 bridge/action chunk per subgoal
-#   total SPI candidates = U * N = 1
+#   generated candidates = U * N = 1, then best-of-N before SPI => U = 1
 #
-# Stochastic subgoal training uses advantage-weighted log likelihood:
-#   loss = - E[ stop_grad(w(A)) log pi_phi(s_{t+K} | s_t, g) ]
-# with beta=1.0 by default.
+# Stochastic subgoal training keeps the stable mean loss:
+#   loss = MSE(mu_phi(s_t, g), s_{t+K}) - alpha * V(mu_phi, g)
+# The Gaussian std is used for proposal sampling and NLL diagnostics.
 
 env_name: antmaze-giant-navigate-v0
 seed: 0
@@ -40,7 +40,6 @@ dynamics:
   subgoal_distribution: diag_gaussian
   subgoal_num_samples: 1
   subgoal_temperature: 1.0
-  stochastic_subgoal_adv_beta: 1.0
   dynamics_model_type: exact_residual
   exact_residual_scale: 1.0
   exact_residual_bridge_match_weight: 0.0

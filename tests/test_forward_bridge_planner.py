@@ -102,6 +102,39 @@ def test_forward_bridge_coefficients_endpoints():
     assert np.all(std[1:-1] > 0.0)
 
 
+def test_forward_bridge_coefficients_use_bridge_gamma_inv():
+    K = 8
+    a_hard, b_hard, std_hard = forward_bridge_coefficients(
+        K,
+        beta_min=0.1,
+        beta_max=20.0,
+        lambda_=1.0,
+        bridge_gamma_inv=0.0,
+        theta_schedule='prefix_progress',
+        theta_total=1.0,
+    )
+    a_soft, b_soft, std_soft = forward_bridge_coefficients(
+        K,
+        beta_min=0.1,
+        beta_max=20.0,
+        lambda_=1.0,
+        bridge_gamma_inv=0.5,
+        theta_schedule='prefix_progress',
+        theta_total=1.0,
+    )
+
+    # The finite-gamma bridge should affect the interior marginal coefficients
+    # and variance, while explicit endpoint clamps keep planner outputs pinned.
+    assert not np.allclose(np.asarray(b_hard[1:-1]), np.asarray(b_soft[1:-1]))
+    assert not np.allclose(np.asarray(std_hard[1:-1]), np.asarray(std_soft[1:-1]))
+    a_soft_np = np.asarray(a_soft)
+    b_soft_np = np.asarray(b_soft)
+    std_soft_np = np.asarray(std_soft)
+    np.testing.assert_allclose(a_soft_np[[0, -1]], np.asarray([1.0, 0.0]), atol=1e-6)
+    np.testing.assert_allclose(b_soft_np[[0, -1]], np.asarray([0.0, 1.0]), atol=1e-6)
+    np.testing.assert_allclose(std_soft_np[[0, -1]], np.asarray([0.0, 0.0]), atol=1e-6)
+
+
 def test_forward_bridge_plan_shapes_and_endpoints():
     agent = _make_agent('forward_bridge')
     K = int(agent.config['dynamics_N'])
@@ -120,6 +153,39 @@ def test_forward_bridge_plan_shapes_and_endpoints():
     assert path_s_np.shape == (BATCH, K + 1, STATE_DIM)
     np.testing.assert_allclose(path_s_np[:, 0], np.asarray(z0), atol=1e-5)
     np.testing.assert_allclose(path_s_np[:, -1], np.asarray(zK), atol=1e-5)
+
+
+def test_agent_forward_bridge_uses_configured_bridge_gamma_inv():
+    cfg_hard = get_dynamics_config()
+    cfg_hard.dynamics_N = 8
+    cfg_hard.subgoal_steps = 8
+    cfg_hard.bridge_gamma_inv = 0.0
+    cfg_hard.theta_schedule = 'prefix_progress'
+    cfg_hard.theta_total = 1.0
+    agent_hard = DynamicsAgent.create(
+        seed=0,
+        ex_observations=np.zeros((BATCH, STATE_DIM), dtype=np.float32),
+        ex_actions=np.zeros((BATCH, ACTION_DIM), dtype=np.float32),
+        config=cfg_hard,
+    )
+
+    cfg_soft = get_dynamics_config()
+    cfg_soft.dynamics_N = 8
+    cfg_soft.subgoal_steps = 8
+    cfg_soft.bridge_gamma_inv = 0.5
+    cfg_soft.theta_schedule = 'prefix_progress'
+    cfg_soft.theta_total = 1.0
+    agent_soft = DynamicsAgent.create(
+        seed=0,
+        ex_observations=np.zeros((BATCH, STATE_DIM), dtype=np.float32),
+        ex_actions=np.zeros((BATCH, ACTION_DIM), dtype=np.float32),
+        config=cfg_soft,
+    )
+
+    _, b_hard, std_hard = agent_hard.forward_bridge_coefficients(8)
+    _, b_soft, std_soft = agent_soft.forward_bridge_coefficients(8)
+    assert not np.allclose(np.asarray(b_hard[1:-1]), np.asarray(b_soft[1:-1]))
+    assert not np.allclose(np.asarray(std_hard[1:-1]), np.asarray(std_soft[1:-1]))
 
 
 def test_reverse_score_plan_unchanged():
@@ -171,7 +237,9 @@ def test_forward_bridge_total_loss_finite():
 
 if __name__ == '__main__':
     test_forward_bridge_coefficients_endpoints()
+    test_forward_bridge_coefficients_use_bridge_gamma_inv()
     test_forward_bridge_plan_shapes_and_endpoints()
+    test_agent_forward_bridge_uses_configured_bridge_gamma_inv()
     test_reverse_score_plan_unchanged()
     test_forward_bridge_planner_dispatch()
     test_forward_bridge_total_loss_finite()

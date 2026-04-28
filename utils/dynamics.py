@@ -348,7 +348,8 @@ def forward_bridge_coefficients(
     beta_min: float,
     beta_max: float,
     lambda_: float,
-    eps: float = 1.0e-6,
+    bridge_gamma_inv: float = 0.0,
+    eps: float | None = None,
     theta_schedule: str = 'linear_beta',
     theta_total: float = 1.0,
     progress_alpha: float = 0.8,
@@ -362,10 +363,17 @@ def forward_bridge_coefficients(
     :func:`make_dynamics_schedule`'s legacy convention (which reverses to a
     descending forward state-time order); both conventions are intentionally
     preserved for backward compatibility with their respective call sites.
+
+    ``bridge_gamma_inv`` is the same finite-gamma denominator offset used by
+    :func:`make_dynamics_schedule`.  ``eps`` is accepted as a deprecated alias
+    for old call sites and overrides ``bridge_gamma_inv`` when provided.
     """
     if K < 1:
         raise ValueError(f'K must be >= 1, got {K}.')
     K_int = int(K)
+    gamma_inv = float(bridge_gamma_inv if eps is None else eps)
+    if gamma_inv < 0.0:
+        raise ValueError(f'bridge_gamma_inv must be >= 0, got {gamma_inv!r}.')
     mode = canonical_theta_schedule(theta_schedule)
 
     if mode == 'linear_beta':
@@ -380,7 +388,7 @@ def forward_bridge_coefficients(
 
     g2_fwd = 2.0 * float(lambda_) ** 2 * theta_fwd
     step_var_fwd = float(lambda_) ** 2 * (1.0 - jnp.exp(-2.0 * theta_fwd))
-    arr = _linear_dynamics_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=0.0)
+    arr = _linear_dynamics_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=gamma_inv)
     b = arr['dynamics_beta_fwd']
     std = jnp.sqrt(jnp.maximum(arr['dynamics_bridge_var_fwd'], 0.0))
     a = 1.0 - b

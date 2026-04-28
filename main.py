@@ -520,6 +520,74 @@ def _rescore_with_stats_jit(
     return out_batch, coupling_stats
 
 
+@partial(jax.jit, static_argnames=('group_size', 'use_partial_critic'))
+def _rescore_best_of_n_with_stats_jit(
+    critic_agent: Any,
+    obs: jnp.ndarray,
+    spi_goals: jnp.ndarray,
+    critic_goals: jnp.ndarray,
+    candidates: jnp.ndarray,
+    valids: jnp.ndarray,
+    network_params: Any,
+    *,
+    group_size: int,
+    use_partial_critic: bool,
+) -> tuple[dict, dict]:
+    """Score ``[B, U*N, ...]`` candidates and keep best-of-N per subgoal.
+
+    Dynamics may generate ``N`` bridge/action samples for each of ``U`` subgoal
+    endpoints.  SPI should compare subgoals, not every noisy bridge sample, so
+    we first select the best candidate within each contiguous ``N`` group.
+    """
+    scores = jnp.asarray(
+        critic_agent.score_action_chunks(
+            obs,
+            critic_goals,
+            candidates,
+            network_params=network_params,
+            use_partial_critic=use_partial_critic,
+        ),
+        dtype=jnp.float32,
+    )
+    B, total = scores.shape
+    group_size = max(1, int(group_size))
+    num_groups = total // group_size
+    grouped_scores = scores.reshape(B, num_groups, group_size)
+    grouped_candidates = candidates.reshape(
+        B, num_groups, group_size, candidates.shape[2], candidates.shape[3]
+    )
+    best_idx = jnp.argmax(grouped_scores, axis=2)
+    gather_idx = best_idx[:, :, None, None, None]
+    best_chunks = jnp.take_along_axis(grouped_candidates, gather_idx, axis=2)[:, :, 0, :, :]
+    best_scores = jnp.take_along_axis(grouped_scores, best_idx[:, :, None], axis=2)[:, :, 0]
+
+    score_mean = best_scores.mean()
+    score_max = best_scores.max()
+    score_min = best_scores.min()
+    if best_scores.shape[1] >= 2:
+        sorted_best = jnp.sort(best_scores, axis=1)[:, ::-1]
+        gap = (sorted_best[:, 0] - sorted_best[:, 1]).mean()
+    else:
+        gap = jnp.zeros((), dtype=jnp.float32)
+
+    out_batch = {
+        'observations': obs,
+        'spi_goals': spi_goals,
+        'proposal_partial_chunks': jnp.asarray(best_chunks, dtype=jnp.float32),
+        'proposal_scores': jnp.asarray(best_scores, dtype=jnp.float32),
+        'valids': valids,
+    }
+    coupling_stats = {
+        'critic_score_mean': score_mean,
+        'critic_score_max': score_max,
+        'critic_score_min': score_min,
+        'critic_score_gap_top1_top2': gap,
+        'critic_score_pre_best_mean': scores.mean(),
+        'critic_score_pre_best_max': scores.max(),
+    }
+    return out_batch, coupling_stats
+
+
 @jax.jit
 def _proposal_goal_stats_jit(
     actor_goal_mean: jnp.ndarray,
@@ -577,6 +645,10 @@ def _build_actor_batch_from_dynamics(
         # Per-candidate sub-goal endpoints for critic rescoring (deterministic mode: mean broadcast).
         # Shape: [B, N, D]
         'candidate_goals': candidate_goals,
+        # Contiguous candidate grouping: each subgoal contributes
+        # ``plan_candidates`` bridge/action samples.  Rescoring keeps best-of-N
+        # within each group before the SPI actor sees the proposals.
+        'candidate_group_size': plan_candidates,
     }
 
     nan = jnp.full((), jnp.nan, dtype=jnp.float32)
@@ -603,6 +675,7 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
         critic_goals = jnp.asarray(cand_goals_in, dtype=jnp.float32)  # [B, N, D]
     else:
         critic_goals = goals  # [B, D] - shared
+    group_size = max(1, int(actor_batch.get('candidate_group_size', 1)))
     # Fast path: single candidate -> skip critic call entirely.
     if candidates.shape[1] == 1:
         zero = jnp.zeros((), dtype=jnp.float32)
@@ -619,10 +692,38 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
                 'critic_score_max': zero,
                 'critic_score_min': zero,
                 'critic_score_gap_top1_top2': zero,
+                'critic_score_pre_best_mean': zero,
+                'critic_score_pre_best_max': zero,
+                'proposal_best_of_n': jnp.asarray(1.0, dtype=jnp.float32),
+                'proposal_pre_best_count': jnp.asarray(1.0, dtype=jnp.float32),
+                'proposal_post_best_count': jnp.asarray(1.0, dtype=jnp.float32),
+                'proposal_count': jnp.asarray(1.0, dtype=jnp.float32),
             },
         )
+    if group_size > 1:
+        if candidates.shape[1] % group_size != 0:
+            raise ValueError(
+                f'candidate count {candidates.shape[1]} must be divisible by candidate_group_size={group_size}.'
+            )
+        out_batch, stats = _rescore_best_of_n_with_stats_jit(
+            critic_agent,
+            obs,
+            goals,
+            critic_goals,
+            candidates,
+            valids,
+            critic_agent.network.params,
+            group_size=group_size,
+            use_partial_critic=True,
+        )
+        stats = dict(stats)
+        stats['proposal_best_of_n'] = jnp.asarray(float(group_size), dtype=jnp.float32)
+        stats['proposal_pre_best_count'] = jnp.asarray(float(candidates.shape[1]), dtype=jnp.float32)
+        stats['proposal_post_best_count'] = jnp.asarray(float(candidates.shape[1] // group_size), dtype=jnp.float32)
+        stats['proposal_count'] = stats['proposal_post_best_count']
+        return out_batch, stats
     # Multi-candidate path: fused score + rank + stats in one compiled graph.
-    return _rescore_with_stats_jit(
+    out_batch, stats = _rescore_with_stats_jit(
         critic_agent,
         obs,
         goals,
@@ -633,6 +734,14 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
         keep_topk=int(candidates.shape[1]),
         use_partial_critic=True,
     )
+    stats = dict(stats)
+    stats['critic_score_pre_best_mean'] = stats['critic_score_mean']
+    stats['critic_score_pre_best_max'] = stats['critic_score_max']
+    stats['proposal_best_of_n'] = jnp.asarray(1.0, dtype=jnp.float32)
+    stats['proposal_pre_best_count'] = jnp.asarray(float(candidates.shape[1]), dtype=jnp.float32)
+    stats['proposal_post_best_count'] = jnp.asarray(float(candidates.shape[1]), dtype=jnp.float32)
+    stats['proposal_count'] = stats['proposal_post_best_count']
+    return out_batch, stats
 
 
 def _build_train_batches(
