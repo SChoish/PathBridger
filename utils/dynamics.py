@@ -17,6 +17,15 @@ Indexing conventions
 import jax
 import jax.numpy as jnp
 
+from utils.theta_schedules import (
+    canonical_theta_schedule,
+    compute_progress_target_fwd,
+    compute_theta_fwd,
+    linear_beta_theta_legacy,
+    prefix_progress_theta_fwd,
+    schedule_id,
+)
+
 
 def _linear_dynamics_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=0.0):
     """Exact linear-SDE bridge arrays in forward state time.
@@ -99,45 +108,68 @@ def make_dynamics_schedule(
     beta_max: float = 20.0,
     lambda_: float = 1.0,
     bridge_gamma_inv: float = 0.0,
+    theta_schedule: str = 'linear_beta',
+    theta_total: float = 1.0,
+    progress_alpha: float = 0.8,
 ):
     """Precompute all linear-SDE dynamics schedule quantities.
 
     Args:
         N: number of diffusion steps.
-        beta_min, beta_max, lambda_: linear-beta OU schedule parameters.
+        beta_min, beta_max, lambda_: linear-beta OU schedule parameters
+            (used only when ``theta_schedule == 'linear_beta'``).
         bridge_gamma_inv: endpoint precision offset used directly in bridge
             denominators. ``0.0`` is the hard endpoint bridge.
+        theta_schedule: ``'linear_beta'`` (default, preserves the legacy
+            diffusion-style schedule bit-for-bit) or ``'prefix_progress'``
+            (calibrates the hard-bridge marginal interpolation so that the
+            actor-visible prefix already reaches a meaningful fraction of the
+            subgoal displacement).
+        theta_total: total cumulative rate ``Theta_K`` for the prefix-progress
+            schedule. Ignored when ``theta_schedule == 'linear_beta'``.
+        progress_alpha: exponent on ``i / K`` defining the desired marginal
+            progress curve ``c_i = (i / K) ** progress_alpha`` for the
+            prefix-progress schedule. Ignored otherwise.
     """
     gamma_inv = float(bridge_gamma_inv)
     if gamma_inv < 0.0:
         raise ValueError(f'bridge_gamma_inv must be >= 0, got {bridge_gamma_inv!r}.')
 
-    steps = jnp.arange(1, N + 1, dtype=jnp.float32)
+    schedule_mode = canonical_theta_schedule(theta_schedule)
 
-    # Per-step OU rate (linear schedule)
-    theta = beta_min / N + (beta_max - beta_min) * steps / (N * N)  # (N,)
+    theta_fwd = compute_theta_fwd(
+        N,
+        theta_schedule=schedule_mode,
+        beta_min=beta_min,
+        beta_max=beta_max,
+        theta_total=theta_total,
+        progress_alpha=progress_alpha,
+    )
+    g2_fwd = 2.0 * lambda_ ** 2 * theta_fwd
+    step_var_fwd = lambda_ ** 2 * (1.0 - jnp.exp(-2.0 * theta_fwd))
+    progress_target_fwd = compute_progress_target_fwd(
+        N, theta_schedule=schedule_mode, progress_alpha=progress_alpha,
+    )
 
-    # Approximate per-step diffusion variance (model mean & loss weight)
-    g2 = 2.0 * lambda_ ** 2 * theta  # (N,)
-
-    # Exact per-step transition variance (analytic posterior only)
-    step_var = lambda_ ** 2 * (1.0 - jnp.exp(-2.0 * theta))  # (N,)
-
-    # Legacy cumulative arrays are retained for diagnostics/compatibility.
-    bar_theta = jnp.concatenate([jnp.zeros(1), jnp.cumsum(theta)])  # (N+1,)
-    bar_sigma2 = lambda_ ** 2 * (1.0 - jnp.exp(-2.0 * bar_theta))  # (N+1,)
-    bar_theta_nN = bar_theta[-1] - bar_theta  # (N+1,)
-    bar_sigma2_nN = lambda_ ** 2 * (1.0 - jnp.exp(-2.0 * bar_theta_nN))  # (N+1,)
-    bar_sigma2_N = bar_sigma2[-1]  # scalar
     gamma_inv_arr = jnp.asarray(gamma_inv, dtype=jnp.float32)
 
-    dynamics = _linear_dynamics_arrays(theta[::-1], g2[::-1], step_var[::-1], gamma_inv=gamma_inv)
+    dynamics = _linear_dynamics_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=gamma_inv)
     # Arrays indexed by legacy n correspond to forward state-time step i = N - n.
     theta = dynamics['theta_legacy']
     g2 = dynamics['g2_legacy']
     step_var = dynamics['step_var_legacy']
     bridge_w = dynamics['dynamics_bridge_w']
     bridge_var = dynamics['dynamics_bridge_var']
+
+    # Diagnostic cumulative arrays. For the prefix-progress schedule these
+    # remain mathematically meaningful (cumulative theta in legacy index n).
+    bar_theta = jnp.concatenate([jnp.zeros(1), jnp.cumsum(theta)])  # (N+1,)
+    bar_sigma2 = lambda_ ** 2 * (1.0 - jnp.exp(-2.0 * bar_theta))  # (N+1,)
+    bar_theta_nN = bar_theta[-1] - bar_theta  # (N+1,)
+    bar_sigma2_nN = lambda_ ** 2 * (1.0 - jnp.exp(-2.0 * bar_theta_nN))  # (N+1,)
+    bar_sigma2_N = bar_sigma2[-1]  # scalar
+
+    sched_id = jnp.asarray(schedule_id(schedule_mode), dtype=jnp.float32)
 
     out = dict(
         theta=theta, g2=g2, step_var=step_var,
@@ -146,6 +178,10 @@ def make_dynamics_schedule(
         bar_sigma2_N=bar_sigma2_N,
         bridge_var=bridge_var, bridge_w=bridge_w,
         gamma_inv=gamma_inv_arr,
+        theta_schedule_id=sched_id,
+        theta_total=jnp.asarray(theta_total, dtype=jnp.float32),
+        progress_alpha=jnp.asarray(progress_alpha, dtype=jnp.float32),
+        progress_target_fwd=progress_target_fwd,
     )
     out.update(dynamics)
     return out
@@ -313,16 +349,38 @@ def forward_bridge_coefficients(
     beta_max: float,
     lambda_: float,
     eps: float = 1.0e-6,
+    theta_schedule: str = 'linear_beta',
+    theta_total: float = 1.0,
+    progress_alpha: float = 0.8,
 ):
-    """Closed-form forward bridge marginals for the linear dynamics bridge."""
+    """Closed-form forward bridge marginals for the linear dynamics bridge.
+
+    When ``theta_schedule == 'linear_beta'`` the theta schedule is bit-identical
+    to the legacy implementation: the ascending raw array
+    ``beta_min/K + (beta_max - beta_min) * (k+1) / K^2``  is passed *directly*
+    as ``theta_fwd`` to ``_linear_dynamics_arrays``. Note this differs from
+    :func:`make_dynamics_schedule`'s legacy convention (which reverses to a
+    descending forward state-time order); both conventions are intentionally
+    preserved for backward compatibility with their respective call sites.
+    """
     if K < 1:
         raise ValueError(f'K must be >= 1, got {K}.')
     K_int = int(K)
-    steps = jnp.arange(1, K_int + 1, dtype=jnp.float32)
-    theta = beta_min / float(K_int) + (beta_max - beta_min) * steps / float(K_int * K_int)
-    g2 = 2.0 * float(lambda_) ** 2 * theta
-    step_var = float(lambda_) ** 2 * (1.0 - jnp.exp(-2.0 * theta))
-    arr = _linear_dynamics_arrays(theta, g2, step_var, gamma_inv=0.0)
+    mode = canonical_theta_schedule(theta_schedule)
+
+    if mode == 'linear_beta':
+        # Legacy: pass the ascending raw theta as theta_fwd directly.
+        theta_fwd = linear_beta_theta_legacy(K_int, beta_min, beta_max)
+    else:
+        theta_fwd = prefix_progress_theta_fwd(
+            K_int,
+            theta_total=theta_total,
+            progress_alpha=progress_alpha,
+        )
+
+    g2_fwd = 2.0 * float(lambda_) ** 2 * theta_fwd
+    step_var_fwd = float(lambda_) ** 2 * (1.0 - jnp.exp(-2.0 * theta_fwd))
+    arr = _linear_dynamics_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=0.0)
     b = arr['dynamics_beta_fwd']
     std = jnp.sqrt(jnp.maximum(arr['dynamics_bridge_var_fwd'], 0.0))
     a = 1.0 - b

@@ -7,6 +7,7 @@ the endpoint-conditioned bridge planner.
 
 from __future__ import annotations
 
+import logging
 from functools import partial
 from typing import Any, Sequence
 
@@ -73,6 +74,34 @@ def _dynamics_model_type(config) -> str:
 
 def _dynamics_model_type_metric(config) -> float:
     return 1.0 if _dynamics_model_type(config) == 'exact_residual' else 0.0
+
+
+def _curved_centerline_requested(config) -> bool:
+    return bool(config.get('use_curved_centerline', False))
+
+
+def _curved_centerline_supported(config) -> bool:
+    """The curved centerline option is only well-defined for the exact-residual
+    bridge under the reverse_score planner. For all other combinations the
+    request is silently ignored at create time (with a warning)."""
+    return (
+        _dynamics_model_type(config) == 'exact_residual'
+        and _planner_type(config) == 'reverse_score'
+    )
+
+
+def _curved_centerline_active(config) -> bool:
+    return _curved_centerline_requested(config) and _curved_centerline_supported(config)
+
+
+def _curved_centerline_dims_mask(config, state_dim: int) -> jnp.ndarray:
+    """Return a (state_dim,) float32 mask of dims that receive curvature."""
+    dims = config.get('centerline_apply_to_state_dims', None)
+    if dims is None:
+        return jnp.ones((int(state_dim),), dtype=jnp.float32)
+    sel = jnp.asarray([int(d) for d in dims], dtype=jnp.int32)
+    mask = jnp.zeros((int(state_dim),), dtype=jnp.float32)
+    return mask.at[sel].set(1.0)
 
 
 from utils.inverse_dynamics import InverseDynamicsMLP, parse_hidden_dims
@@ -182,6 +211,52 @@ class PathResidualNet(nn.Module):
         )(inp)
 
 
+class CurvedCenterlineNet(nn.Module):
+    """Endpoint-preserving learned centerline displacement.
+
+    Computes the raw displacement ``h(s0, sK, goal, tau)`` of shape
+    ``(B, state_dim)``. The caller applies the envelope
+
+        c = (1 - beta) * s0 + beta * sK + beta * (1 - beta) * scale * h * mask
+
+    so that ``c|_{beta=0} = s0`` and ``c|_{beta=1} = sK`` exactly. With
+    ``zero_init=True`` the head is zero-initialised, so a freshly created
+    centerline collapses to the linear interpolation between endpoints and the
+    curved bridge coincides with the analytic linear-SDE bridge in residual
+    coordinates (``z = x - c``) at initialisation.
+    """
+
+    hidden_dims: Sequence[int]
+    state_dim: int
+    layer_norm: bool = True
+    use_goal: bool = True
+    zero_init: bool = True
+
+    @nn.compact
+    def __call__(self, s0, sK, goal, tau):
+        # s0, sK, goal: (B, D);  tau: (B, 1) with values in [0, 1].
+        delta = sK - s0
+        feats = [s0, sK, delta, tau]
+        if self.use_goal:
+            feats.append(goal)
+        x = jnp.concatenate(feats, axis=-1)
+        trunk = MLP(
+            hidden_dims=tuple(self.hidden_dims),
+            activate_final=True,
+            layer_norm=self.layer_norm,
+        )(x)
+        if self.zero_init:
+            head = nn.Dense(
+                self.state_dim,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.zeros,
+                name='centerline_head',
+            )
+        else:
+            head = nn.Dense(self.state_dim, name='centerline_head')
+        return head(trunk)
+
+
 def _subgoal_mode(config) -> str:
     return str(config.get('subgoal_distribution', 'deterministic')).lower()
 
@@ -194,9 +269,126 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     schedule: Any
     config: Any = nonpytree_field()
 
-    def _learned_reverse_mean(self, x_n, x_T, x_0, n, schedule, params=None):
+    def _curved_centerline_beta_array(self, K: int):
+        """Return ``beta_i`` for forward index ``i in {0, ..., K}``, shape ``(K+1,)``.
+
+        ``linear``       : ``beta_i = i / K``.
+        ``hard_bridge``  : ``beta_i`` from the precomputed hard-bridge schedule
+                           (``dynamics_beta_fwd`` with ``gamma_inv=0``), so
+                           ``beta_0 = 0`` and ``beta_K = 1`` exactly.
+        """
+        beta_type = str(self.config.get('centerline_beta_type', 'linear')).lower()
+        K_int = int(K)
+        if beta_type == 'linear':
+            return jnp.arange(K_int + 1, dtype=jnp.float32) / float(K_int)
+        if beta_type == 'hard_bridge':
+            if 'centerline_hard_b' in self.schedule:
+                return self.schedule['centerline_hard_b']
+            # Fallback: derive from forward_bridge_coefficients on the fly.
+            _, b_hard, _ = forward_bridge_coefficients(
+                K_int,
+                beta_min=float(self.config['dynamics_beta_min']),
+                beta_max=float(self.config['dynamics_beta_max']),
+                lambda_=float(self.config['dynamics_lambda']),
+                theta_schedule=str(self.config.get('theta_schedule', 'linear_beta')),
+                theta_total=float(self.config.get('theta_total', 1.0)),
+                progress_alpha=float(self.config.get('progress_alpha', 0.8)),
+            )
+            return b_hard
+        raise ValueError(
+            f'centerline_beta_type must be one of (linear, hard_bridge), got {beta_type!r}.'
+        )
+
+    def _curved_centerline(self, s0_f, sK_f, goal, i_idx, params=None):
+        """Compute the curved centerline at forward step ``i_idx``.
+
+        Returns ``(c, h, b)`` where ``c`` is the envelope-applied centerline
+        ``c = (1 - b) s0 + b sK + b (1 - b) * scale * h * mask``, ``h`` is the
+        raw network displacement (used for the amplitude regulariser), and
+        ``b`` is the per-element ``beta_i`` (used for diagnostics).
+
+        ``i_idx`` may be a Python int or a per-batch ``(B,)`` int array.
+        """
+        K = int(self.config['dynamics_N'])
+        if isinstance(i_idx, int):
+            i_arr = jnp.full((s0_f.shape[0],), i_idx, dtype=jnp.int32)
+        else:
+            i_arr = jnp.asarray(i_idx, dtype=jnp.int32)
+        tau = (i_arr.astype(jnp.float32) / float(K))[:, None]
+        beta_arr = self._curved_centerline_beta_array(K)
+        b = beta_arr[i_arr][:, None]
+
+        # Goal placeholder so the call signature is stable even when the
+        # user opted out of goal conditioning at create time.
+        goal_in = goal if goal is not None else jnp.zeros_like(s0_f)
+        h = self.network.select('centerline_net')(
+            s0_f, sK_f, goal_in, tau, params=params,
+        )
+
+        state_dim = int(h.shape[-1])
+        mask = _curved_centerline_dims_mask(self.config, state_dim)[None, :]
+        scale = float(self.config.get('centerline_scale', 1.0))
+
+        linear = (1.0 - b) * s0_f + b * sK_f
+        envelope = b * (1.0 - b)
+        c = linear + envelope * (scale * h * mask)
+        return c, h, b
+
+    def _curved_reverse_mean(self, x_n, x_T, x_0, n, schedule, goal, params=None):
+        """Reverse-step mean under the curved centerline + exact residual.
+
+        Index convention: code uses reverse step ``n`` with ``x_T`` = current
+        state and ``x_0`` = segment endpoint, so the forward state-time index
+        is ``i = N - n``. The reverse step ``n -> n - 1`` corresponds to
+        ``i -> i + 1``, hence ``mu_star = c_{i+1} + mu_z``.
+        """
+        N = int(self.config['dynamics_N'])
+        s0_f = x_T
+        sK_f = x_0
+        i = N - n
+        i_next = i + 1
+
+        c_i, h_i, _ = self._curved_centerline(s0_f, sK_f, goal, i, params=params)
+        c_next, _, _ = self._curved_centerline(s0_f, sK_f, goal, i_next, params=params)
+
+        z_n = x_n - c_i
+        mu_z, post_var = posterior_moments(
+            z_n,
+            jnp.zeros_like(z_n),
+            jnp.zeros_like(z_n),
+            n,
+            schedule,
+        )
+        mu_star = c_next + mu_z
+
+        eps = self.network.select('eps_net')(
+            x_n, x_T, x_0, n.astype(jnp.float32), params=params,
+        )
+
+        use_hard = bool(self.config.get('centerline_residual_use_hard_variance', True))
+        if use_hard and 'centerline_hard_std' in schedule:
+            hard_std = schedule['centerline_hard_std']
+            rho = hard_std[i_next][..., None]
+        else:
+            rho = jnp.sqrt(jnp.maximum(post_var, 0.0))
+
+        scale_res = float(self.config.get('exact_residual_scale', 1.0))
+        residual = scale_res * rho * eps
+        mu = mu_star + residual
+        return mu, eps, h_i, residual
+
+    def _learned_reverse_mean(self, x_n, x_T, x_0, n, schedule, goal=None, params=None):
         n_total = self.config['dynamics_N']
         model_type = _dynamics_model_type(self.config)
+
+        if (
+            _curved_centerline_active(self.config)
+            and model_type == 'exact_residual'
+        ):
+            mu, eps, _h, _residual = self._curved_reverse_mean(
+                x_n, x_T, x_0, n, schedule, goal, params=params,
+            )
+            return mu, eps
 
         eps = self.network.select('eps_net')(
             x_n, x_T, x_0, n.astype(jnp.float32), params=params,
@@ -225,8 +417,10 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         mu = jnp.where(is_boundary[..., None], mu_boundary, mu_inner)
         return mu, eps
 
-    def _reverse_step(self, x_n, x_T, x_0, n, rng, stochastic, noise_scale, params=None):
-        mu, eps = self._learned_reverse_mean(x_n, x_T, x_0, n, self.schedule, params=params)
+    def _reverse_step(self, x_n, x_T, x_0, n, rng, stochastic, noise_scale, params=None, goal=None):
+        mu, eps = self._learned_reverse_mean(
+            x_n, x_T, x_0, n, self.schedule, goal=goal, params=params,
+        )
         ns = jnp.asarray(noise_scale, dtype=jnp.float32)
 
         def take_sample(_):
@@ -297,6 +491,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             beta_max=float(self.config['dynamics_beta_max']),
             lambda_=float(self.config['dynamics_lambda']),
             eps=eps_val,
+            theta_schedule=str(self.config.get('theta_schedule', 'linear_beta')),
+            theta_total=float(self.config.get('theta_total', 1.0)),
+            progress_alpha=float(self.config.get('progress_alpha', 0.8)),
         )
 
     def forward_bridge_plan(
@@ -395,7 +592,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         path = path.at[:, 0, :].set(z0).at[:, -1, :].set(zK)
         return path
 
-    def _reverse_score_plan(self, current_state, desired_endpoint, num_steps: int | None = None):
+    def _reverse_score_plan(self, current_state, desired_endpoint, num_steps: int | None = None, *, goal=None):
         x_T = current_state
         x_0_goal = desired_endpoint
         n_total = int(self.config['dynamics_N'])
@@ -406,7 +603,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
         def scan_body(x, step_n):
             n = jnp.full((batch_size,), step_n, dtype=jnp.int32)
-            x_new, _ = self._learned_reverse_mean(x, x_T, x_0_goal, n, self.schedule)
+            x_new, _ = self._learned_reverse_mean(x, x_T, x_0_goal, n, self.schedule, goal=goal)
             return x_new, x_new
 
         steps = jnp.arange(n_total, n_total - steps_to_roll, -1)
@@ -415,7 +612,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         return jnp.swapaxes(traj, 0, 1)
 
     def _reverse_score_sample_plan(
-        self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None
+        self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None, *, goal=None,
     ):
         x_T = current_state
         x_0_goal = desired_endpoint
@@ -429,7 +626,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         def scan_body(x, inputs):
             step_n, step_rng = inputs
             n = jnp.full((batch_size,), step_n, dtype=jnp.int32)
-            x_new, _ = self._reverse_step(x, x_T, x_0_goal, n, step_rng, True, noise_scale, params=None)
+            x_new, _ = self._reverse_step(
+                x, x_T, x_0_goal, n, step_rng, True, noise_scale, params=None, goal=goal,
+            )
             return x_new, x_new
 
         steps = jnp.arange(n_total, n_total - steps_to_roll, -1)
@@ -438,11 +637,13 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         return jnp.swapaxes(traj, 0, 1)
 
     @partial(jax.jit, static_argnames=('num_steps',))
-    def plan(self, current_state, desired_endpoint, *, num_steps: int | None = None):
+    def plan(self, current_state, desired_endpoint, *, num_steps: int | None = None, goal=None):
         squeeze = current_state.ndim == 1
         if squeeze:
             current_state = current_state[None]
             desired_endpoint = desired_endpoint[None]
+            if goal is not None:
+                goal = goal[None]
 
         planner = _planner_type(self.config)
         if planner == 'forward_bridge':
@@ -456,7 +657,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 sample=False, noise_scale=0.0, num_steps=num_steps,
             )
         else:
-            traj = self._reverse_score_plan(current_state, desired_endpoint, num_steps=num_steps)
+            traj = self._reverse_score_plan(
+                current_state, desired_endpoint, num_steps=num_steps, goal=goal,
+            )
 
         result = {'next_step': traj[:, 1, :], 'trajectory': traj}
         if squeeze:
@@ -464,11 +667,13 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         return result
 
     @partial(jax.jit, static_argnames=('noise_scale', 'num_steps'))
-    def sample_plan(self, current_state, desired_endpoint, rng, noise_scale: float = 1.0, num_steps: int | None = None):
+    def sample_plan(self, current_state, desired_endpoint, rng, noise_scale: float = 1.0, num_steps: int | None = None, *, goal=None):
         squeeze = current_state.ndim == 1
         if squeeze:
             current_state = current_state[None]
             desired_endpoint = desired_endpoint[None]
+            if goal is not None:
+                goal = goal[None]
 
         planner = _planner_type(self.config)
         if planner == 'forward_bridge':
@@ -487,7 +692,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             )
         else:
             traj = self._reverse_score_sample_plan(
-                current_state, desired_endpoint, rng, noise_scale, num_steps=num_steps,
+                current_state, desired_endpoint, rng, noise_scale, num_steps=num_steps, goal=goal,
             )
 
         result = {'next_step': traj[:, 1, :], 'trajectory': traj}
@@ -496,7 +701,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         return result
 
     def _sample_plan_trajectory(
-        self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None
+        self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None, *, goal=None,
     ):
         planner = _planner_type(self.config)
         if planner == 'forward_bridge':
@@ -514,7 +719,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 num_steps=num_steps, rng=rng,
             )
         return self._reverse_score_sample_plan(
-            current_state, desired_endpoint, rng, noise_scale, num_steps=num_steps,
+            current_state, desired_endpoint, rng, noise_scale, num_steps=num_steps, goal=goal,
         )
 
     @partial(jax.jit, static_argnames=('num_candidates', 'include_mean', 'noise_scale', 'num_steps'))
@@ -528,21 +733,24 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         noise_scale: float = 1.0,
         include_mean: bool = True,
         num_steps: int | None = None,
+        goal=None,
     ):
         squeeze = current_state.ndim == 1
         if squeeze:
             current_state = current_state[None]
             desired_endpoint = desired_endpoint[None]
+            if goal is not None:
+                goal = goal[None]
 
         if include_mean:
-            det = self.plan(current_state, desired_endpoint, num_steps=num_steps)['trajectory'][:, None, ...]
+            det = self.plan(current_state, desired_endpoint, num_steps=num_steps, goal=goal)['trajectory'][:, None, ...]
             if num_candidates == 1:
                 out = det
             else:
                 sample_rngs = jax.random.split(rng, num_candidates - 1)
                 sampled = jax.vmap(
                     lambda r: self._sample_plan_trajectory(
-                        current_state, desired_endpoint, r, noise_scale, num_steps=num_steps
+                        current_state, desired_endpoint, r, noise_scale, num_steps=num_steps, goal=goal,
                     ),
                     in_axes=0,
                 )(sample_rngs)
@@ -552,7 +760,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             sample_rngs = jax.random.split(rng, num_candidates)
             sampled = jax.vmap(
                 lambda r: self._sample_plan_trajectory(
-                    current_state, desired_endpoint, r, noise_scale, num_steps=num_steps
+                    current_state, desired_endpoint, r, noise_scale, num_steps=num_steps, goal=goal,
                 ),
                 in_axes=0,
             )(sample_rngs)
@@ -675,7 +883,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     @jax.jit
     def plan_from_high_goal(self, current_state, high_actor_goals):
         endpoint = self.predict_subgoal(current_state, high_actor_goals)
-        return self.plan(current_state, endpoint)
+        return self.plan(current_state, endpoint, goal=high_actor_goals)
 
     def _idm_actions_from_trajectories(self, trajectories: jnp.ndarray, horizon: int) -> jnp.ndarray:
         prev_states = trajectories[:, :horizon, :]
@@ -730,7 +938,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
             def _per_candidate(rng_k, endpoint_k):
                 return self._sample_plan_trajectory(
-                    obs, endpoint_k, rng_k, traj_noise, num_steps=proposal_horizon
+                    obs, endpoint_k, rng_k, traj_noise, num_steps=proposal_horizon, goal=goals,
                 )
 
             candidate_trajectories = jax.vmap(_per_candidate, in_axes=(0, 0))(per_rngs, cand_endpoints)
@@ -746,6 +954,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                     rng,
                     noise_scale=0.0,
                     num_steps=proposal_horizon,
+                    goal=goals,
                 )
                 new_rng, _ = jax.random.split(rng)
                 candidate_trajectories = sampled['trajectory'][:, None, ...]
@@ -759,6 +968,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                     noise_scale=sample_noise_scale,
                     include_mean=True,
                     num_steps=proposal_horizon,
+                    goal=goals,
                 )
             candidate_goals = jnp.broadcast_to(mu[:, None, :], (mu.shape[0], plan_candidates, mu.shape[-1]))
 
@@ -796,7 +1006,34 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             beta_max=config['dynamics_beta_max'],
             lambda_=config['dynamics_lambda'],
             bridge_gamma_inv=float(config.get('bridge_gamma_inv', 0.0)),
+            theta_schedule=str(config.get('theta_schedule', 'linear_beta')),
+            theta_total=float(config.get('theta_total', 1.0)),
+            progress_alpha=float(config.get('progress_alpha', 0.8)),
         )
+
+        # Optional precomputed hard-bridge coefficients (gamma_inv = 0) used
+        # by the curved centerline path when
+        # ``centerline_residual_use_hard_variance`` is True. We compute these
+        # at create() time so the residual std is constant w.r.t. the chosen
+        # ``bridge_gamma_inv`` (the analytic hard-bridge variance schedule).
+        # Only stored when the curved option is active to keep checkpoints
+        # bit-identical for legacy configs.
+        if _curved_centerline_active(config) and bool(
+            config.get('centerline_residual_use_hard_variance', True)
+        ):
+            a_hard, b_hard, std_hard = forward_bridge_coefficients(
+                int(config['dynamics_N']),
+                beta_min=float(config['dynamics_beta_min']),
+                beta_max=float(config['dynamics_beta_max']),
+                lambda_=float(config['dynamics_lambda']),
+                theta_schedule=str(config.get('theta_schedule', 'linear_beta')),
+                theta_total=float(config.get('theta_total', 1.0)),
+                progress_alpha=float(config.get('progress_alpha', 0.8)),
+            )
+            schedule = dict(schedule)
+            schedule['centerline_hard_a'] = a_hard
+            schedule['centerline_hard_b'] = b_hard
+            schedule['centerline_hard_std'] = std_hard
 
         eps_net_def = EpsilonNet(
             hidden_dims=tuple(config['eps_hidden_dims']),
@@ -859,6 +1096,41 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             horizon = int(config['dynamics_N']) + 1
             dummy_t = jnp.zeros((batch_size, horizon), dtype=jnp.float32)
             network_info['path_residual_net'] = (residual_def, (dummy_x, dummy_x, dummy_t))
+
+        # Optionally register the curved centerline MLP. Only created when the
+        # option is requested AND supported (exact_residual + reverse_score) so
+        # legacy checkpoints stay bit-loadable. Unsupported combinations log a
+        # one-shot warning and silently skip registration.
+        if _curved_centerline_requested(config):
+            if _curved_centerline_supported(config):
+                center_hidden = config.get('centerline_hidden_dims', (256, 256))
+                if isinstance(center_hidden, str):
+                    center_hidden = parse_hidden_dims(center_hidden)
+                else:
+                    center_hidden = tuple(int(x) for x in center_hidden)
+                center_def = CurvedCenterlineNet(
+                    hidden_dims=center_hidden,
+                    state_dim=state_dim,
+                    layer_norm=bool(config['layer_norm']),
+                    use_goal=bool(config.get('centerline_use_goal', True)),
+                    zero_init=bool(config.get('centerline_zero_init', True)),
+                )
+                dummy_tau = jnp.zeros((batch_size, 1), dtype=jnp.float32)
+                # Goal init dummy: same shape as observations; ignored when
+                # ``use_goal=False`` but always passed for a stable signature.
+                network_info['centerline_net'] = (
+                    center_def, (dummy_x, dummy_x, dummy_x, dummy_tau)
+                )
+            else:
+                logging.warning(
+                    'use_curved_centerline=True is only supported with '
+                    'dynamics_model_type=exact_residual + planner_type=reverse_score; '
+                    'got dynamics_model_type=%r, planner_type=%r. The curved '
+                    'centerline option will be ignored.',
+                    _dynamics_model_type(config),
+                    _planner_type(config),
+                )
+
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -1033,12 +1305,18 @@ class DynamicsAgent(_DynamicsAgentCore):
         # zero. Instead we use a small L2 prior on the residual; the main
         # learning signals are L_path and L_roll below.
         model_type = _dynamics_model_type(self.config)
+        # When the curved centerline is active, ``_learned_reverse_mean`` consumes
+        # the high-actor goal so the centerline can be conditioned on it. The
+        # rest of the path stays untouched (legacy code paths ignore ``goal``).
+        goal_for_curved = (
+            batch['high_actor_goals'] if _curved_centerline_active(self.config) else None
+        )
 
         x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
         x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
         mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
         mu_pred, eps_pred = self._learned_reverse_mean(
-            x_n, x_T, x_0, n, self.schedule, params=grad_params,
+            x_n, x_T, x_0, n, self.schedule, goal=goal_for_curved, params=grad_params,
         )
         g2_n = self.schedule['g2'][n - 1]
         weight = 1.0 / (2.0 * jnp.maximum(g2_n, 1e-12))
@@ -1059,7 +1337,7 @@ class DynamicsAgent(_DynamicsAgentCore):
         x_n_real = segment[row, K - n, :]
         x_prev_real = segment[row, K - n + 1, :]
         mu_pred_path, _ = self._learned_reverse_mean(
-            x_n_real, x_T, x_0, n, self.schedule, params=grad_params,
+            x_n_real, x_T, x_0, n, self.schedule, goal=goal_for_curved, params=grad_params,
         )
         diff_p = mu_pred_path - x_prev_real
         loss_path = jnp.abs(diff_p).sum(axis=-1).mean()
@@ -1073,7 +1351,7 @@ class DynamicsAgent(_DynamicsAgentCore):
             step_n = N - h + 1
             n_b = jnp.full((B,), step_n, dtype=jnp.int32)
             mu_r, _ = self._learned_reverse_mean(
-                x, x_T, x_0, n_b, self.schedule, params=grad_params,
+                x, x_T, x_0, n_b, self.schedule, goal=goal_for_curved, params=grad_params,
             )
             tgt = segment[row, h, :]
             err = jnp.abs(mu_r - tgt).sum(axis=-1)
@@ -1090,12 +1368,27 @@ class DynamicsAgent(_DynamicsAgentCore):
 
         loss = w_g * loss_dynamics + w_p * loss_path + w_r * loss_roll + sg_w * loss_sub
 
+        # --- L_centerline (optional, curved centerline only) ---
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
+        loss_center_amp = zero
+        loss_center_smooth = zero
+        center_deviation = zero
+        center_residual_norm = zero
+        if _curved_centerline_active(self.config):
+            (loss_center_amp, loss_center_smooth, center_deviation,
+             center_residual_norm) = self._curved_centerline_diagnostics(
+                x_T, x_0, batch['high_actor_goals'], n, x_n_real, grad_params,
+            )
+            amp_coef = float(self.config.get('centerline_amp_coef', 1.0e-4))
+            smooth_coef = float(self.config.get('centerline_smooth_coef', 1.0e-3))
+            loss = loss + amp_coef * loss_center_amp + smooth_coef * loss_center_smooth
+
         idm_term, loss_idm_unw = self._idm_loss_term(batch, grad_params)
         loss = loss + idm_term
 
         n_N = jnp.full((B,), N, dtype=jnp.int32)
         xNm1, _ = self._learned_reverse_mean(
-            x_T, x_T, x_0, n_N, self.schedule, params=grad_params,
+            x_T, x_T, x_0, n_N, self.schedule, goal=goal_for_curved, params=grad_params,
         )
         xNm1_norm = jnp.linalg.norm(xNm1, axis=-1).mean()
 
@@ -1136,7 +1429,62 @@ class DynamicsAgent(_DynamicsAgentCore):
             float(self.config.get('bridge_gamma_inv', 0.0)), dtype=jnp.float32
         )
         info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
+        info.update(self._theta_schedule_info())
+        if _curved_centerline_active(self.config):
+            info['dynamics/centerline/amp'] = loss_center_amp
+            info['dynamics/centerline/smooth'] = loss_center_smooth
+            info['dynamics/centerline/deviation'] = center_deviation
+            info['dynamics/centerline/residual_norm'] = center_residual_norm
         return loss, info
+
+    def _curved_centerline_diagnostics(self, x_T, x_0, goal, n, x_n_real, grad_params):
+        """Compute curved centerline regularisers and diagnostics.
+
+        - ``loss_amp``     : ``mean(h^2)`` over forward i ∈ {0,...,K},
+                             ``h`` is the centerline raw displacement.
+        - ``loss_smooth``  : second-difference smoothness on ``c`` over
+                             interior i ∈ {1,...,K-1}.
+        - ``deviation``    : ``mean(|c_i - linear_i|)`` where ``linear_i`` is
+                             the straight-line interpolation between endpoints.
+        - ``residual_norm``: ``mean(|alpha rho eps|)`` at the sampled ``n``,
+                             evaluated with ``x_n_real`` for an in-distribution
+                             estimate of the residual magnitude.
+        """
+        N = int(self.config['dynamics_N'])
+        B = x_T.shape[0]
+
+        def at_i(i):
+            i_int = jnp.full((B,), int(i), dtype=jnp.int32)
+            c_i, h_i, b_i = self._curved_centerline(x_T, x_0, goal, i_int, params=grad_params)
+            linear_i = (1.0 - b_i) * x_T + b_i * x_0
+            return c_i, h_i, linear_i
+
+        all_c = []
+        all_h = []
+        all_linear = []
+        for i in range(N + 1):
+            c_i, h_i, linear_i = at_i(i)
+            all_c.append(c_i)
+            all_h.append(h_i)
+            all_linear.append(linear_i)
+        c_stack = jnp.stack(all_c, axis=1)        # (B, K+1, D)
+        h_stack = jnp.stack(all_h, axis=1)        # (B, K+1, D)
+        linear_stack = jnp.stack(all_linear, axis=1)
+
+        loss_amp = jnp.mean(h_stack ** 2)
+        if N >= 2:
+            second_diff = c_stack[:, 2:, :] - 2.0 * c_stack[:, 1:-1, :] + c_stack[:, :-2, :]
+            loss_smooth = jnp.mean(second_diff ** 2)
+        else:
+            loss_smooth = jnp.asarray(0.0, dtype=jnp.float32)
+        deviation = jnp.mean(jnp.abs(c_stack - linear_stack))
+
+        # Residual norm at the sampled n, on real x_n.
+        _, eps_pred, _h, residual = self._curved_reverse_mean(
+            x_n_real, x_T, x_0, n, self.schedule, goal, params=grad_params,
+        )
+        residual_norm = jnp.mean(jnp.abs(residual))
+        return loss_amp, loss_smooth, deviation, residual_norm
 
     def _total_loss_forward_bridge(self, batch, grad_params, rng, critic_value_params, planner: str):
         """Forward-bridge path-supervised loss (planner_type in {forward_bridge,
@@ -1262,7 +1610,32 @@ class DynamicsAgent(_DynamicsAgentCore):
             float(self.config.get('bridge_gamma_inv', 0.0)), dtype=jnp.float32
         )
         info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
+        info.update(self._theta_schedule_info())
         return loss, info
+
+    def _theta_schedule_info(self) -> dict:
+        """Common theta-schedule diagnostics shared by every loss path.
+
+        Always logs the schedule id, ``theta_total``, ``progress_alpha`` and
+        the *actual* hard-bridge marginal weight at step
+        ``min(5, dynamics_N)``. The prefix-progress *target* curve is only
+        defined for the ``prefix_progress`` schedule; logging it under
+        ``linear_beta`` would emit ``NaN`` (legacy paths assert log finiteness),
+        so we omit that key in legacy mode.
+        """
+        sched = self.schedule
+        prefix_idx = min(5, int(self.config['dynamics_N']))
+        info = {
+            'dynamics/theta_schedule_id': sched['theta_schedule_id'],
+            'dynamics/theta_total': sched['theta_total'],
+            'dynamics/progress_alpha': sched['progress_alpha'],
+            'dynamics/prefix_progress_actual_5': sched['dynamics_beta_fwd'][prefix_idx],
+        }
+        # Schedule-id 1.0 == prefix_progress; use a static config check (not the
+        # jax array) so the dict layout is fixed across jit traces.
+        if str(self.config.get('theta_schedule', 'linear_beta')).lower() == 'prefix_progress':
+            info['dynamics/prefix_progress_target_5'] = sched['progress_target_fwd'][prefix_idx]
+        return info
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None, critic_value_params=None):
@@ -1290,6 +1663,15 @@ def _get_common_config():
             dynamics_lambda=1.0,
             # Linear-SDE bridge denominator offset. 0.0 is the hard endpoint bridge.
             bridge_gamma_inv=0.0,
+            # Theta schedule selector. ``linear_beta`` preserves the legacy
+            # diffusion-style schedule bit-for-bit. ``prefix_progress`` calibrates
+            # the hard-bridge marginal interpolation so that the actor-visible
+            # prefix already reaches a meaningful fraction of the subgoal
+            # displacement (``c_i = (i / K) ** progress_alpha``); ``theta_total``
+            # controls the cumulative rate ``Theta_K``.
+            theta_schedule='linear_beta',
+            theta_total=1.0,
+            progress_alpha=0.8,
             eps_hidden_dims=(512, 512, 512),
             time_embed_dim=64,
             layer_norm=True,
@@ -1367,4 +1749,21 @@ def get_dynamics_config():
     c.exact_residual_scale = 1.0
     c.exact_residual_reg_weight = 1.0e-4
     c.exact_residual_bridge_match_weight = 0.0
+    # Optional curved centerline bridge (state-space proposal only).
+    # When False (default) the analytic linear-SDE bridge is used unchanged.
+    # When True (and dynamics_model_type=exact_residual + planner_type=reverse_score),
+    # the bridge mean is computed in residual coordinates around an
+    # endpoint-preserving learned centerline c_i = (1-b)s0 + b sK + b(1-b)*h.
+    # See _curved_reverse_mean and CurvedCenterlineNet for details.
+    c.use_curved_centerline = False
+    c.centerline_hidden_dims = (256, 256)
+    c.centerline_scale = 1.0
+    c.centerline_zero_init = True
+    c.centerline_beta_type = 'linear'  # 'linear' | 'hard_bridge'
+    c.centerline_use_goal = True
+    c.centerline_amp_coef = 1.0e-4
+    c.centerline_smooth_coef = 1.0e-3
+    c.centerline_residual_use_hard_variance = True
+    # None = apply curvature to all state dims; list[int] restricts to a subset.
+    c.centerline_apply_to_state_dims = ml_collections.config_dict.placeholder(tuple)
     return c

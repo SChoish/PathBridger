@@ -1,0 +1,61 @@
+# Linear-SDE dynamics + critic + actor offline training.
+# AntMaze large with the prefix-calibrated theta schedule.
+#
+# The default linear-beta schedule moves the K=25 bridge very slowly in the
+# early prefix, but the actor / IDM / SPI rescoring only consume the first
+# rollout_horizon=5 proposal states. ``theta_schedule: prefix_progress``
+# calibrates the hard-bridge marginal interpolation so that
+#   c_i = (i / K) ** progress_alpha  =>  c_5 ≈ 0.276 at K=25, alpha=0.8,
+# i.e., the actor-visible prefix already covers ~28% of the subgoal
+# displacement.
+
+env_name: antmaze-large-navigate-v0
+seed: 0
+run_group: antmaze_large_navigate_prefix_progress
+
+train_epochs: 1000
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+
+use_wandb: false
+use_tqdm: false
+
+batch_size: 1024
+horizon: 25
+plan_candidates: 1
+plan_noise_scale: 0.01
+measure_timing: false
+eval_freq: 100
+eval_task_ids: "1,2,3,4,5"
+eval_episodes_per_task: 10
+eval_max_chunks: 200
+eval_goal_tol: 0.5
+eval_goal_dims: "0,1"
+
+# Only fields that override defaults from agents/dynamics.get_dynamics_config()
+# and agents/critic.get_config(). Everything else uses the agent defaults.
+dynamics:
+  rollout_loss_weight: 1.0
+  rollout_horizon: 5
+  value_geom_sample: false
+  subgoal_value_alpha: 0.1
+
+  # --- Prefix-calibrated theta schedule ---
+  theta_schedule: prefix_progress
+  theta_total: 1.0
+  progress_alpha: 0.8
+
+  # --- Linear dynamics bridge denominator offset ---
+  bridge_gamma_inv: 0.0
+
+  # Hard endpoint bridge uses deterministic point subgoals.
+  subgoal_distribution: deterministic
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.99
+
+actor:
+  spi_tau: 5.0
+  spi_beta: 1.0
+  spi_actor_layer_norm: false
