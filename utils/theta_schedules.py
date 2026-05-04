@@ -9,13 +9,12 @@ constructs all derived quantities.
 Currently supported schedules
 -----------------------------
 * ``linear_beta`` (default)
-    Legacy diffusion-style schedule
+    Diffusion-style schedule
 
-        theta_legacy_n = beta_min / N + (beta_max - beta_min) * n / N^2,  n = 1..N
+        theta_diffusion_n = beta_min / N + (beta_max - beta_min) * n / N^2,  n = 1..N
 
-    in *legacy* diffusion-time index ``n`` (large ``n`` = noisy end). The
-    forward state-time array is the reverse of this legacy array. Preserves
-    bit-for-bit the behavior of the original schedule.
+    in diffusion-time index ``n`` (large ``n`` = noisy end). The forward
+    state-time array is the reverse of this diffusion-indexed array.
 
 * ``prefix_progress``
     Calibrates the hard linear-SDE bridge marginal interpolation so that the
@@ -63,10 +62,10 @@ def schedule_id(theta_schedule: str) -> float:
 # ---------------------------------------------------------------------------
 
 
-def linear_beta_theta_legacy(N: int, beta_min: float, beta_max: float) -> jnp.ndarray:
-    """Diffusion-indexed legacy linear-beta theta, shape ``(N,)``.
+def linear_beta_theta_diffusion(N: int, beta_min: float, beta_max: float) -> jnp.ndarray:
+    """Diffusion-indexed linear-beta theta, shape ``(N,)``.
 
-    Indexed by legacy diffusion-time ``n = 1, ..., N`` (large ``n`` = noisy
+    Indexed by diffusion-time ``n = 1, ..., N`` (large ``n`` = noisy
     start). The forward state-time array is :func:`linear_beta_theta_fwd`.
     """
     steps = jnp.arange(1, N + 1, dtype=jnp.float32)
@@ -76,10 +75,10 @@ def linear_beta_theta_legacy(N: int, beta_min: float, beta_max: float) -> jnp.nd
 def linear_beta_theta_fwd(N: int, beta_min: float, beta_max: float) -> jnp.ndarray:
     """Forward state-time linear-beta theta, shape ``(N,)``.
 
-    Equal to :func:`linear_beta_theta_legacy` reversed: ``theta_fwd[i] =
-    theta_legacy[N - 1 - i]``.
+    Equal to :func:`linear_beta_theta_diffusion` reversed: ``theta_fwd[i] =
+    theta_diffusion[N - 1 - i]``.
     """
-    return linear_beta_theta_legacy(N, beta_min, beta_max)[::-1]
+    return linear_beta_theta_diffusion(N, beta_min, beta_max)[::-1]
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +175,7 @@ __all__ = [
     'VALID_THETA_SCHEDULES',
     'canonical_theta_schedule',
     'schedule_id',
-    'linear_beta_theta_legacy',
+    'linear_beta_theta_diffusion',
     'linear_beta_theta_fwd',
     'desired_prefix_progress',
     'prefix_progress_theta_fwd',

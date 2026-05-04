@@ -2,10 +2,8 @@
 """State-space rollout only: subgoal net + dynamics ``plan`` trajectory vs one offline episode.
 
 Pipeline (no environment dynamics — open-loop in observation space). **Ant maze:** the planner
-does not know about walls; by default ``--navigator snap`` projects each virtual ``(x,y)`` into a
-walkable cell so rollouts match the grid (use ``--navigator none`` for the raw network trajectory).
-When ``--goal_tol > 0`` and the snap rollout never satisfies that goal tolerance, the script retries
-once with ``navigator`` disabled so a difficult maze layout can still be visualized (xy may cross walls).
+does not know about walls, so each virtual ``(x,y)`` is always projected (snap) into a walkable
+maze cell so rollouts match the grid; the wall-piercing/raw mode is no longer offered.
 
 1. Pick one episode from the compact offline dataset (``terminals`` boundaries), or reset an
    OGBench eval task via ``env.reset(options=dict(task_id=..., render_goal=False))``.
@@ -224,7 +222,7 @@ def rollout_subgoal(
         action_chunk_horizon: After each ``predict_subgoal``, call ``plan`` (or ``sample_plan``) **once**
             and walk the first ``K`` states along its reverse trajectory — i.e. append
             ``trajectory[1], …, trajectory[K]`` (1-based slice ``trajectory[1:K+1]``), capped by ``dynamics_N``.
-            Use ``1`` for legacy behaviour (only ``next_step`` / ``trajectory[1]`` per chunk, then new
+            Use ``1`` to keep one-step replanning (only ``next_step`` / ``trajectory[1]`` per chunk, then new
             subgoal).
     """
     g_np = np.asarray(s_g, dtype=np.float32)
@@ -353,17 +351,6 @@ def main():
     p.add_argument('--value_grid_n', type=int, default=56)
     p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = dynamics epoch used.')
     p.add_argument(
-        '--navigator',
-        type=str,
-        choices=('none', 'snap'),
-        default='snap',
-        help=(
-            'snap (default): after each planned state, snap (clamp_dim0, clamp_dim1) into the maze free region '
-            '(see --navigator_clamp) so open-loop rollouts do not cut through walls. '
-            'none: raw plan states (can leave walkable cells).'
-        ),
-    )
-    p.add_argument(
         '--navigator_clamp',
         type=str,
         choices=('ij', 'oracle', 'union', 'center'),
@@ -488,13 +475,11 @@ def main():
 
     cfg, env_name = load_run_flags(run_dir)
 
-    navigator: MazeNavigatorMap | None = None
-    if args.navigator == 'snap':
-        try:
-            navigator = load_maze_navigator_snap(args.maze_type, env_name)
-        except ValueError as ex:
-            p.error(str(ex))
-        print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
+    try:
+        navigator = load_maze_navigator_snap(args.maze_type, env_name)
+    except ValueError as ex:
+        p.error(str(ex))
+    print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
 
     env, train_raw, _ = make_env_and_datasets(env_name, frame_stack=cfg.get('frame_stack'))
     dataset = Dataset.create(**train_raw)
@@ -620,23 +605,6 @@ def main():
                 **skw,
                 action_chunk_horizon=iter_state_chunk_h,
             )
-            if navigator is not None and tol > 0 and not reached:
-                print(
-                    'State rollout: goal not reached with wall projection (--navigator snap); '
-                    'retrying once without navigator (raw xy, may cross walls).'
-                )
-                nav_kw_raw = {**nav_kw, 'navigator': None}
-                roll, hats, n_planner_steps, reached = rollout_subgoal(
-                    agent,
-                    s0,
-                    s_g,
-                    max_steps_eff,
-                    goal_tol=tol,
-                    goal_stop_dims=stop_dims,
-                    **nav_kw_raw,
-                    **skw,
-                    action_chunk_horizon=iter_state_chunk_h,
-                )
             if plan_seed is not None:
                 print(
                     f'State rollout: K={iter_state_chunk_h} (raw --action_chunk_horizon={raw_chunk_h}), '
@@ -651,11 +619,6 @@ def main():
 
     d0, d1 = args.plot_dim0, args.plot_dim1
     plot_nav = maze_navigator_for_xy_plot(navigator, env_name, d0, d1)
-    if plot_nav is not None and navigator is None and d0 == 0 and d1 == 1:
-        print(
-            f'Maze plot tiles: auto from env_name (source={plot_nav.source}, maze_type={plot_nav.maze_type}); '
-            'rollout xy not clamped unless --navigator snap.'
-        )
 
     heat_mesh = None
     heat_vmin = heat_vmax = None

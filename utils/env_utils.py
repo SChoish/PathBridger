@@ -1,4 +1,5 @@
 import collections
+import glob
 import os
 import platform
 import time
@@ -87,12 +88,45 @@ def make_env_and_datasets(dataset_name, frame_stack=None, **env_kwargs):
     Returns:
         A tuple of the environment, training dataset, and validation dataset.
     """
-    # Use compact dataset to save memory.
-    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(
-        dataset_name, compact_dataset=True, **env_kwargs
-    )
-    train_dataset = Dataset.create(**train_dataset)
-    val_dataset = Dataset.create(**val_dataset)
+    dataset_dir = env_kwargs.pop('dataset_dir', None)
+    expanded_dataset_dir = os.path.expanduser(dataset_dir) if dataset_dir else None
+
+    if expanded_dataset_dir and os.path.isdir(expanded_dataset_dir):
+        train_shards = sorted(glob.glob(os.path.join(expanded_dataset_dir, '*.npz')))
+        train_shards = [p for p in train_shards if not p.endswith('-val.npz')]
+        val_shards = sorted(glob.glob(os.path.join(expanded_dataset_dir, '*-val.npz')))
+    else:
+        train_shards = []
+        val_shards = []
+
+    if train_shards and val_shards:
+        env = ogbench.make_env_and_datasets(dataset_name, env_only=True, **env_kwargs)
+
+        def _merge_shards(paths: list[str]) -> dict:
+            merged: dict[str, np.ndarray] = {}
+            for shard_path in paths:
+                shard = ogbench.load_dataset(shard_path, compact_dataset=True)
+                if not merged:
+                    merged = {k: np.asarray(v) for k, v in shard.items()}
+                else:
+                    for k, v in shard.items():
+                        merged[k] = np.concatenate([merged[k], np.asarray(v)], axis=0)
+            return merged
+
+        train_dataset = Dataset.create(**_merge_shards(train_shards))
+        val_dataset = Dataset.create(**_merge_shards(val_shards))
+    else:
+        # Fall back to OGBench's default dataset resolution when no explicit directory is provided.
+        ogbench_kwargs = dict(env_kwargs)
+        if expanded_dataset_dir is not None:
+            ogbench_kwargs['dataset_dir'] = expanded_dataset_dir
+
+        # Use compact dataset to save memory.
+        env, train_dataset, val_dataset = ogbench.make_env_and_datasets(
+            dataset_name, compact_dataset=True, **ogbench_kwargs
+        )
+        train_dataset = Dataset.create(**train_dataset)
+        val_dataset = Dataset.create(**val_dataset)
 
     if frame_stack is not None:
         env = FrameStackWrapper(env, frame_stack)

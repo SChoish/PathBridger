@@ -10,7 +10,7 @@ Indexing conventions
 * Per-step arrays ``theta``, ``g2``, ``step_var``:
   shape (N,), index k corresponds to step n = k + 1.
 * Linear-SDE forward state time uses i = N - n internally; schedule arrays are
-  converted back to legacy n-indexing so existing agent code can index
+  also exposed in diffusion n-indexing so agent code can index
   ``bridge_w[n]`` and ``bridge_var[n]`` directly.
 """
 
@@ -21,7 +21,7 @@ from utils.theta_schedules import (
     canonical_theta_schedule,
     compute_progress_target_fwd,
     compute_theta_fwd,
-    linear_beta_theta_legacy,
+    linear_beta_theta_diffusion,
     prefix_progress_theta_fwd,
     schedule_id,
 )
@@ -35,8 +35,8 @@ def _linear_dynamics_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=0.0):
         r_{i+1} = exp(theta_i) r_i + eta_i,
         eta_i ~ N(0, exp(2 theta_i) step_var_i I).
 
-    The returned arrays are converted to the legacy diffusion index ``n`` via
-    ``i = N - n`` so existing calls ``bridge_w[n]`` / ``bridge_var[n]`` keep the
+    The returned arrays are converted to diffusion index ``n`` via
+    ``i = N - n`` so calls ``bridge_w[n]`` / ``bridge_var[n]`` keep the
     linear-SDE bridge.
     """
     theta_fwd = jnp.asarray(theta_fwd, dtype=jnp.float32)
@@ -78,14 +78,14 @@ def _linear_dynamics_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=0.0):
         beta = beta.at[0].set(0.0).at[-1].set(1.0)
         bridge_var = bridge_var.at[0].set(0.0).at[-1].set(0.0)
 
-    # Legacy index n corresponds to forward index i = N - n.
+    # Diffusion index n corresponds to forward index i = N - n.
     return dict(
         theta_fwd=theta_fwd,
         g2_fwd=g2_fwd,
         step_var_fwd=step_var_fwd,
-        theta_legacy=theta_fwd[::-1],
-        g2_legacy=g2_fwd[::-1],
-        step_var_legacy=step_var_fwd[::-1],
+        theta_diffusion=theta_fwd[::-1],
+        g2_diffusion=g2_fwd[::-1],
+        step_var_diffusion=step_var_fwd[::-1],
         dynamics_A_fwd=A,
         dynamics_A=A[::-1],
         dynamics_q2_fwd=q2,
@@ -120,8 +120,7 @@ def make_dynamics_schedule(
             (used only when ``theta_schedule == 'linear_beta'``).
         bridge_gamma_inv: endpoint precision offset used directly in bridge
             denominators. ``0.0`` is the hard endpoint bridge.
-        theta_schedule: ``'linear_beta'`` (default, preserves the legacy
-            diffusion-style schedule bit-for-bit) or ``'prefix_progress'``
+        theta_schedule: ``'linear_beta'`` (default diffusion-style schedule) or ``'prefix_progress'``
             (calibrates the hard-bridge marginal interpolation so that the
             actor-visible prefix already reaches a meaningful fraction of the
             subgoal displacement).
@@ -154,15 +153,14 @@ def make_dynamics_schedule(
     gamma_inv_arr = jnp.asarray(gamma_inv, dtype=jnp.float32)
 
     dynamics = _linear_dynamics_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=gamma_inv)
-    # Arrays indexed by legacy n correspond to forward state-time step i = N - n.
-    theta = dynamics['theta_legacy']
-    g2 = dynamics['g2_legacy']
-    step_var = dynamics['step_var_legacy']
+    # Arrays indexed by diffusion n correspond to forward state-time step i = N - n.
+    theta = dynamics['theta_diffusion']
+    g2 = dynamics['g2_diffusion']
+    step_var = dynamics['step_var_diffusion']
     bridge_w = dynamics['dynamics_bridge_w']
     bridge_var = dynamics['dynamics_bridge_var']
 
-    # Diagnostic cumulative arrays. For the prefix-progress schedule these
-    # remain mathematically meaningful (cumulative theta in legacy index n).
+    # Diagnostic cumulative arrays in diffusion index n.
     bar_theta = jnp.concatenate([jnp.zeros(1), jnp.cumsum(theta)])  # (N+1,)
     bar_sigma2 = lambda_ ** 2 * (1.0 - jnp.exp(-2.0 * bar_theta))  # (N+1,)
     bar_theta_nN = bar_theta[-1] - bar_theta  # (N+1,)
@@ -205,24 +203,6 @@ def bridge_sample(x_0, x_T, n, schedule, rng):
     mean = w * x_0 + (1.0 - w) * x_T
     return mean + jnp.sqrt(jnp.maximum(var, 1e-12)) * jax.random.normal(rng, x_0.shape)
 
-
-
-def model_mean(x_n, x_0, x_T, eps_pred, n, schedule):
-    """SDE/Euler model mean for the linear dynamics bridge."""
-    k = n - 1
-    theta_i = schedule['theta'][k][..., None]
-    g2_i = schedule['g2'][k][..., None]
-    phi_iK = schedule['dynamics_phi_iK'][n][..., None]
-    omega_iK = schedule['dynamics_omega_iK'][n][..., None]
-    gamma_inv = schedule.get('gamma_inv', jnp.asarray(0.0, dtype=jnp.float32))
-    gamma_inv = jnp.asarray(gamma_inv, dtype=jnp.float32)
-    bvar_i = schedule['bridge_var'][n][..., None]
-
-    r_i = x_n - x_T
-    delta = x_0 - x_T
-    h_drift = g2_i * phi_iK / jnp.maximum(omega_iK + gamma_inv, 1e-12) * (delta - phi_iK * r_i)
-    scale = g2_i / jnp.sqrt(jnp.maximum(bvar_i, 1e-12))
-    return x_n + theta_i * r_i + h_drift - scale * eps_pred
 
 def posterior_moments(x_n, x_0, x_T, n, schedule):
     """Analytic linear-dynamics posterior moments for ``x_{n-1} | x_n, x_0, x_T``.
@@ -291,7 +271,7 @@ def exact_residual_model_mean(
 
     This is the ``exact_residual`` ablation: the analytic one-step bridge
     posterior is used as the *base* transition, and only a data-dependent
-    residual (reusing ``eps_net``) is learned. Valid for all ``n in {1,..,N}``;
+    residual (from ``ResidualNet``) is learned. Valid for all ``n in {1,..,N}``;
     no boundary special case is required because the exact moments already
     handle the terminal step (and ``post_var`` -> 0 at ``n=1``, which makes
     the residual vanish automatically).
@@ -349,36 +329,27 @@ def forward_bridge_coefficients(
     beta_max: float,
     lambda_: float,
     bridge_gamma_inv: float = 0.0,
-    eps: float | None = None,
     theta_schedule: str = 'linear_beta',
     theta_total: float = 1.0,
     progress_alpha: float = 0.8,
 ):
     """Closed-form forward bridge marginals for the linear dynamics bridge.
 
-    When ``theta_schedule == 'linear_beta'`` the theta schedule is bit-identical
-    to the legacy implementation: the ascending raw array
+    When ``theta_schedule == 'linear_beta'`` the ascending raw array
     ``beta_min/K + (beta_max - beta_min) * (k+1) / K^2``  is passed *directly*
-    as ``theta_fwd`` to ``_linear_dynamics_arrays``. Note this differs from
-    :func:`make_dynamics_schedule`'s legacy convention (which reverses to a
-    descending forward state-time order); both conventions are intentionally
-    preserved for backward compatibility with their respective call sites.
-
-    ``bridge_gamma_inv`` is the same finite-gamma denominator offset used by
-    :func:`make_dynamics_schedule`.  ``eps`` is accepted as a deprecated alias
-    for old call sites and overrides ``bridge_gamma_inv`` when provided.
+    as ``theta_fwd`` to ``_linear_dynamics_arrays``. ``bridge_gamma_inv`` is the
+    same finite-gamma denominator offset used by :func:`make_dynamics_schedule`.
     """
     if K < 1:
         raise ValueError(f'K must be >= 1, got {K}.')
     K_int = int(K)
-    gamma_inv = float(bridge_gamma_inv if eps is None else eps)
+    gamma_inv = float(bridge_gamma_inv)
     if gamma_inv < 0.0:
         raise ValueError(f'bridge_gamma_inv must be >= 0, got {gamma_inv!r}.')
     mode = canonical_theta_schedule(theta_schedule)
 
     if mode == 'linear_beta':
-        # Legacy: pass the ascending raw theta as theta_fwd directly.
-        theta_fwd = linear_beta_theta_legacy(K_int, beta_min, beta_max)
+        theta_fwd = linear_beta_theta_diffusion(K_int, beta_min, beta_max)
     else:
         theta_fwd = prefix_progress_theta_fwd(
             K_int,

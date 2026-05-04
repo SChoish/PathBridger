@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import Any, Sequence
 
 import flax
@@ -13,31 +12,6 @@ import optax
 
 from utils.flax_utils import TrainState, nonpytree_field
 from utils.networks import MLP
-
-
-def normalize_actor_spi_config(agent: 'ActorAgent') -> 'ActorAgent':
-    """Strip deprecated ``spi_conditioned`` / ``spi_goal_conditioning`` from config.
-
-    SPI actor and critic scoring always use the dynamics-predicted subgoal as the
-    conditioning vector (``spi_goals`` in ``main``). Legacy ``goal`` mode is ignored
-    with a warning so old checkpoints and flags.json still load.
-    """
-    cfg = dict(agent.config)
-    raw = str(cfg.get('spi_conditioned', cfg.get('spi_goal_conditioning', 'subgoal'))).strip().lower()
-    if raw == 'goal':
-        logging.warning(
-            'Loaded actor config had spi_conditioned/spi_goal_conditioning=%r; '
-            'global-goal SPI conditioning was removed — using predicted subgoal only.',
-            raw,
-        )
-    elif raw not in ('subgoal', ''):
-        logging.warning(
-            'Ignoring unknown actor SPI conditioning key value %r; using predicted subgoal only.',
-            raw,
-        )
-    cfg.pop('spi_conditioned', None)
-    cfg.pop('spi_goal_conditioning', None)
-    return agent.replace(config=flax.core.FrozenDict(**cfg))
 
 
 class DeterministicChunkActor(nn.Module):
@@ -193,20 +167,6 @@ class ActorAgent(flax.struct.PyTreeNode):
         ex_goal = None if ex_goals is None else jnp.asarray(ex_goals, dtype=jnp.float32)
 
         config = dict(config)
-        raw = str(config.get('spi_conditioned', config.get('spi_goal_conditioning', 'subgoal'))).strip().lower()
-        if raw == 'goal':
-            logging.warning(
-                'actor config sets spi_conditioned/spi_goal_conditioning=%r; '
-                'global-goal mode was removed — training uses predicted subgoal only.',
-                raw,
-            )
-        elif raw not in ('subgoal', ''):
-            raise ValueError(
-                f'Unknown actor spi_conditioned/spi_goal_conditioning value {raw!r}; '
-                "only 'subgoal' is supported (legacy 'goal' is ignored with a warning)."
-            )
-        config.pop('spi_conditioned', None)
-        config.pop('spi_goal_conditioning', None)
 
         actor_def = DeterministicChunkActor(
             hidden_dims=(512, 512, 512),
@@ -221,9 +181,8 @@ class ActorAgent(flax.struct.PyTreeNode):
 def get_actor_config():
     return ml_collections.ConfigDict(
         dict(
-            agent_name='actor',
             lr=3e-4,
-            spi_tau=0.5,
+            spi_tau=10.0,
             spi_beta=10.0,
             spi_actor_layer_norm=True,
             spi_q_norm_eps=1e-6,

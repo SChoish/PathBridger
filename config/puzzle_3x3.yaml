@@ -1,0 +1,16 @@
+# Linear-SDE dynamics + critic + actor offline training.
+# Baseline for puzzle-3x3-play. Algorithm defaults come from
+# agents/{dynamics,critic,actor}.py and main.py FLAGS.
+
+env_name: puzzle-3x3-play-v0
+run_group: puzzle_3x3
+train_epochs: 1000
+
+critic_agent:
+  action_chunk_horizon: 5      # default 10
+  discount: 0.995              # default 0.99
+  kappa_b: 0.9                 # default 0.7
+  kappa_d: 0.5                 # default 0.7
+
+actor:
+  spi_beta: 1.0                # default 10.0

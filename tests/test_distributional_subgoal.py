@@ -7,12 +7,12 @@ training) so they can be run standalone with::
     PYTHONPATH=. python tests/test_distributional_subgoal.py    # also works
 
 They cover the contract changes only:
-1. backward compatibility of the deterministic subgoal mode
+1. deterministic subgoal mode
 2. linear dynamics schedule exposes gamma_inv and bridge arrays
 3. distributional-subgoal sampling shape correctness
 4. critic ``score_action_chunks`` accepts both ``[B, D]`` and ``[B, N, D]`` goals
 5. ``plan_candidates=1`` and ``plan_candidates>1`` both succeed
-6. best-of-N bridge candidates are reduced before SPI
+6. all U*N bridge candidates are reduced to one best proposal before SPI
 7. distributional subgoal loss path is finite (no NaNs / Infs)
 8. dynamics-config defaults remain usable
 """
@@ -27,7 +27,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from utils.dynamics import make_dynamics_schedule, bridge_sample, model_mean
+from utils.dynamics import bridge_sample, make_dynamics_schedule, posterior_mean
 from agents.dynamics import (
     DynamicsAgent,
     get_dynamics_config,
@@ -57,7 +57,7 @@ def _make_dynamics_agent(
     cfg.subgoal_distribution = subgoal_distribution
     cfg.subgoal_num_samples = subgoal_num_samples
     cfg.bridge_gamma_inv = bridge_gamma_inv
-    cfg.eps_hidden_dims = (32, 32)
+    cfg.residual_model_hidden_dims = (32, 32)
     cfg.subgoal_hidden_dims = (32, 32)
     cfg.subgoal_value_hidden_dims = (32, 32)
     cfg.idm_hidden_dims = (32, 32)
@@ -86,10 +86,10 @@ def _make_critic_agent():
 
 
 # ---------------------------------------------------------------------------
-# 1. backward-compatible deterministic mode
+# 1. deterministic mode
 # ---------------------------------------------------------------------------
 
-def test_deterministic_subgoal_backward_compat():
+def test_deterministic_subgoal_api():
     agent = _make_dynamics_agent('deterministic')
     obs = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
     g = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
@@ -110,7 +110,7 @@ def test_deterministic_subgoal_backward_compat():
 # 2. linear dynamics schedule
 # ---------------------------------------------------------------------------
 
-def test_linear_dynamics_schedule_and_model_mean_are_finite():
+def test_linear_dynamics_schedule_and_posterior_mean_are_finite():
     schedule = make_dynamics_schedule(N=8, beta_min=0.1, beta_max=20.0, lambda_=1.0, bridge_gamma_inv=0.0)
     assert schedule['bridge_w'].shape == (9,)
     assert schedule['bridge_var'].shape == (9,)
@@ -123,8 +123,7 @@ def test_linear_dynamics_schedule_and_model_mean_are_finite():
     xT = jax.random.normal(jax.random.fold_in(rng, 1), (BATCH, STATE_DIM))
     n = jnp.full((BATCH,), 3, dtype=jnp.int32)
     x_n = bridge_sample(x0, xT, n, schedule, rng)
-    eps = jax.random.normal(jax.random.fold_in(rng, 2), (BATCH, STATE_DIM))
-    mu = model_mean(x_n, x0, xT, eps, n, schedule)
+    mu = posterior_mean(x_n, x0, xT, n, schedule)
     assert np.all(np.isfinite(np.asarray(x_n)))
     assert np.all(np.isfinite(np.asarray(mu)))
 
@@ -240,7 +239,7 @@ def test_build_actor_proposals_diag_gaussian_subgoal_samples_times_plan_candidat
     )
 
 
-def test_rescore_keeps_best_of_n_before_spi():
+def test_rescore_keeps_global_best_proposal_before_spi():
     subgoal_samples = 3
     plan_candidates = 4
     agent = _make_dynamics_agent('diag_gaussian', subgoal_num_samples=subgoal_samples)
@@ -266,11 +265,16 @@ def test_rescore_keeps_best_of_n_before_spi():
     }
     out_batch, stats = _rescore_actor_batch_for_update(actor_batch, critic, actor_config={})
 
-    assert out_batch['proposal_partial_chunks'].shape == (BATCH, subgoal_samples, 2, ACTION_DIM)
-    assert out_batch['proposal_scores'].shape == (BATCH, subgoal_samples)
-    assert float(stats['proposal_best_of_n']) == float(plan_candidates)
+    scores = critic.score_action_chunks(obs, cand_goals, cand_actions, use_partial_critic=True)
+    best_idx = jnp.argmax(scores, axis=1)
+    expected_goals = jnp.take_along_axis(cand_goals, best_idx[:, None, None], axis=1)[:, 0, :]
+
+    assert out_batch['proposal_partial_chunks'].shape == (BATCH, 1, 2, ACTION_DIM)
+    assert out_batch['proposal_scores'].shape == (BATCH, 1)
+    np.testing.assert_allclose(np.asarray(out_batch['spi_goals']), np.asarray(expected_goals), rtol=1e-5, atol=1e-6)
+    assert float(stats['proposal_best_of_n']) == float(subgoal_samples * plan_candidates)
     assert float(stats['proposal_pre_best_count']) == float(subgoal_samples * plan_candidates)
-    assert float(stats['proposal_post_best_count']) == float(subgoal_samples)
+    assert float(stats['proposal_post_best_count']) == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +309,11 @@ def test_distributional_subgoal_loss_is_finite():
     # Required new keys are present.
     for required in (
         'phase1/subgoal_nll',
+        'phase1/subgoal_mean_mse',
+        'phase1/subgoal_sample_mse',
+        'phase1/subgoal_weighted_mse',
+        'phase1/subgoal_current_value_mean',
+        'phase1/subgoal_mse_weight_mean',
         'phase1/subgoal_std_mean',
         'phase1/subgoal_std_max',
         'phase1/subgoal_mode',
@@ -316,7 +325,7 @@ def test_distributional_subgoal_loss_is_finite():
     assert float(info['phase1/subgoal_mode']) == 1.0
 
 
-def test_deterministic_subgoal_loss_is_finite_and_logs_match_legacy():
+def test_deterministic_subgoal_loss_is_finite_and_logs_are_stable():
     agent = _make_dynamics_agent('deterministic')
     batch = _make_phase1_batch()
     _, info = agent.update(batch, critic_value_params=None)
@@ -328,7 +337,7 @@ def test_deterministic_subgoal_loss_is_finite_and_logs_match_legacy():
 
 
 # ---------------------------------------------------------------------------
-# 8. dynamics-config defaults remain backward-compatible
+# 8. dynamics-config defaults are usable
 # ---------------------------------------------------------------------------
 
 def test_dynamics_config_defaults_are_usable():
@@ -336,6 +345,7 @@ def test_dynamics_config_defaults_are_usable():
     assert str(cfg.subgoal_distribution) == 'deterministic'
     assert bool(cfg.subgoal_use_mean_for_actor_goal) is True
     assert int(cfg.subgoal_num_samples) == 1
+    assert float(cfg.subgoal_value_gap_scale) == 1.0
 
 
 if __name__ == '__main__':

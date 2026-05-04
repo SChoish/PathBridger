@@ -47,9 +47,8 @@ def test_canonical_theta_schedule_validates_string():
     assert raised, 'unknown theta_schedule must raise'
 
 
-def test_linear_beta_schedule_preserves_legacy_theta():
-    """Default (linear_beta) schedule is bit-for-bit identical to the legacy
-    diffusion-style theta array."""
+def test_linear_beta_schedule_matches_diffusion_theta():
+    """Default (linear_beta) schedule matches the diffusion-style theta array."""
     N = 25
     beta_min = 0.1
     beta_max = 20.0
@@ -74,9 +73,8 @@ def test_linear_beta_schedule_preserves_legacy_theta():
     assert float(sched['theta_schedule_id']) == 0.0
 
 
-def test_linear_beta_default_kwarg_matches_legacy():
-    """Calling make_dynamics_schedule without theta_schedule must reproduce
-    the historical behaviour."""
+def test_linear_beta_default_kwarg_matches_explicit_mode():
+    """Calling make_dynamics_schedule without theta_schedule matches explicit linear_beta."""
     N = 10
     sched_default = make_dynamics_schedule(
         N=N, beta_min=0.1, beta_max=20.0, lambda_=1.0, bridge_gamma_inv=0.0,
@@ -178,7 +176,7 @@ def test_forward_bridge_coefficients_prefix_progress():
 
 def test_forward_bridge_coefficients_linear_beta_default_unchanged():
     """Without theta_schedule, forward_bridge_coefficients reproduces the
-    legacy linear-beta marginals."""
+    linear-beta marginals."""
     K = 8
     a_def, b_def, std_def = forward_bridge_coefficients(
         K, beta_min=0.1, beta_max=20.0, lambda_=1.0,
@@ -232,7 +230,7 @@ def test_agent_logs_theta_schedule_metadata():
         )
 
     combos = [
-        ('reverse_score', 'exact_residual'),
+        ('exact_residual_chain', 'exact_residual'),
         ('forward_bridge', 'exact_residual'),
         ('forward_bridge_residual', 'exact_residual'),
     ]
@@ -241,11 +239,11 @@ def test_agent_logs_theta_schedule_metadata():
         cfg.dynamics_N = 4
         cfg.subgoal_steps = 4
         cfg.rollout_horizon = 2
-        cfg.eps_hidden_dims = (32, 32)
+        cfg.residual_model_hidden_dims = (32, 32)
         cfg.subgoal_hidden_dims = (32, 32)
         cfg.subgoal_value_hidden_dims = (32, 32)
         cfg.idm_hidden_dims = (32, 32)
-        cfg.residual_hidden_dims = (32, 32)
+        cfg.path_residual_hidden_dims = (32, 32)
         cfg.planner_type = planner
         cfg.dynamics_model_type = model_type
         cfg.theta_schedule = 'prefix_progress'
@@ -271,8 +269,8 @@ def test_agent_logs_theta_schedule_metadata():
 
 if __name__ == '__main__':
     test_canonical_theta_schedule_validates_string()
-    test_linear_beta_schedule_preserves_legacy_theta()
-    test_linear_beta_default_kwarg_matches_legacy()
+    test_linear_beta_schedule_matches_diffusion_theta()
+    test_linear_beta_default_kwarg_matches_explicit_mode()
     test_prefix_progress_matches_desired_bridge_progress()
     test_prefix_progress_endpoint_pinning()
     test_prefix_progress_metadata_keys()

@@ -440,7 +440,7 @@ class PathHGCDataset(HGCDataset):
 
     The optional ``clip_path_to_goal`` config flag controls behaviour near the episode goal:
 
-    - ``False`` (default, legacy): segment endpoint is always ``s_{t+K}`` regardless of where
+    - ``False`` (default): segment endpoint is always ``s_{t+K}`` regardless of where
       the sampled goal ``s_{t_g}`` is. Subgoal_net teacher is ``s_{t+K}`` so it may "overshoot"
       past close goals.
     - ``True``: per-row endpoint becomes ``s_{min(t+K, t_g)}``; segment tail past ``t_g`` is
@@ -571,7 +571,7 @@ class PathHGCDataset(HGCDataset):
         batch['trajectory_start_indices'] = np.asarray(idxs, dtype=np.int64)
         batch['trajectory_terminal_indices'] = np.asarray(finals, dtype=np.int64)
         # Override high_actor_targets to match segment endpoint. clip_path=False keeps
-        # the legacy s_{t+K}; clip_path=True yields s_{min(t+K, t_g)}.
+        # s_{t+K}; clip_path=True yields s_{min(t+K, t_g)}.
         batch['high_actor_targets'] = np.asarray(traj[:, K], dtype=np.float32)
         return batch
 

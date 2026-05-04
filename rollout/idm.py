@@ -40,7 +40,6 @@ import numpy as np
 from agents.dynamics import DynamicsAgent
 from utils.env_utils import make_env_and_datasets
 from utils.run_io import (
-    goal_within_tol,
     list_checkpoint_suffixes,
     load_checkpoint_pkl,
     load_run_flags,
@@ -49,12 +48,12 @@ from utils.run_io import (
 )
 from rollout.env import (
     configure_mujoco_gl,
-    env_render_rgb_u8,
     format_maze_navigator_log,
     load_maze_navigator_snap,
     make_xy_clamper,
     sync_env_state_from_obs_vector_aligned,
 )
+from rollout.episode_runner import run_chunked_episode
 from rollout.plot import (
     axis_limits,
     maze_navigator_for_xy_plot,
@@ -73,8 +72,6 @@ def rollout_dynamics_idm_env(
     s0: np.ndarray,
     s_g: np.ndarray,
     max_chunks: int,
-    goal_tol: float = 0.0,
-    goal_stop_dims: tuple[int, ...] | None = None,
     navigator: MazeNavigatorMap | None = None,
     clamp_dim0: int = 0,
     clamp_dim1: int = 1,
@@ -90,10 +87,9 @@ def rollout_dynamics_idm_env(
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray]:
     """Chunked dynamics bridge + inverse dynamics in the real environment.
 
-    Note: ``navigator`` / ``xy_clamper`` are used only for visualization outputs
-    (subgoal markers and planned state-space trajectories). The actual rollout
-    policy runs on the raw environment observations / dynamics predictions so this
-    path stays aligned with training-time evaluation in ``main.py``.
+    Success is decided **only** by the env (``info['success']`` in the shared
+    runner); no user-defined tolerance is applied here. ``navigator`` /
+    ``xy_clamper`` are visualization-only and do not affect success.
     """
     g_np = np.asarray(s_g, dtype=np.float32)
     low = np.asarray(action_low, dtype=np.float32).reshape(-1)
@@ -104,29 +100,6 @@ def rollout_dynamics_idm_env(
 
     cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
     d = int(cur.shape[-1])
-    states: list[np.ndarray] = [cur.copy()]
-    hats_list: list[np.ndarray] = []
-    rgb_frames: list[np.ndarray] = []
-    frame_plan_trajs: list[np.ndarray] = []
-
-    def _pack_frame_plan_trajs() -> np.ndarray:
-        if frame_plan_trajs:
-            return np.stack(frame_plan_trajs, axis=0)
-        return np.zeros((len(states), 0, d), dtype=np.float32)
-
-    def _maybe_record() -> None:
-        if not record_env_rgb:
-            return
-        fr = env_render_rgb_u8(env)
-        if fr is not None:
-            rgb_frames.append(fr)
-
-    _maybe_record()
-
-    if goal_within_tol(cur, g_np, goal_stop_dims, float(goal_tol)):
-        hats = np.zeros((0, d), dtype=np.float32)
-        env_rgb = np.stack(rgb_frames, axis=0) if rgb_frames else None
-        return np.stack(states, axis=0), hats, 0, True, env_rgb, _pack_frame_plan_trajs()
 
     @jax.jit
     def _idm_actions(p, o_stack: jnp.ndarray, on_stack: jnp.ndarray) -> jnp.ndarray:
@@ -135,10 +108,13 @@ def rollout_dynamics_idm_env(
     plan_rng = jax.random.PRNGKey(int(planner_seed))
     use_stoch_plan = float(planner_noise_scale) > 0.0
 
-    for chunk_i in range(max_chunks):
-        s_np = np.asarray(states[-1], dtype=np.float32).reshape(-1)
-        s = jnp.asarray(s_np, dtype=jnp.float32)
-        g = jnp.asarray(s_g, dtype=jnp.float32)
+    hats_per_step: list[np.ndarray] = []
+    plan_trajs_per_step: list[np.ndarray] = [np.zeros((0, d), dtype=np.float32)]
+
+    def _idm_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        nonlocal plan_rng
+        s = jnp.asarray(obs, dtype=jnp.float32)
+        g = jnp.asarray(goal, dtype=jnp.float32)
         hat = agent.infer_subgoal(s, g)
         hat_np = np.asarray(jax.device_get(hat), dtype=np.float32).reshape(-1)
         hat_plot_np = xy_clamper(hat_np.copy())
@@ -150,38 +126,40 @@ def rollout_dynamics_idm_env(
             out = agent.plan(s, hat)
         chunk_traj_raw = np.asarray(jax.device_get(out['trajectory']), dtype=np.float32)
         if chunk_traj_raw.shape[0] < 2:
-            break
-        chunk_traj_plot = np.stack([xy_clamper(chunk_traj_raw[i].copy()) for i in range(chunk_traj_raw.shape[0])])
+            return np.zeros((0, low.shape[-1]), dtype=np.float32)
+        chunk_traj_plot = np.stack(
+            [xy_clamper(chunk_traj_raw[i].copy()) for i in range(chunk_traj_raw.shape[0])]
+        )
         plan_seg = np.asarray(chunk_traj_plot[1:], dtype=np.float32)
-        if len(frame_plan_trajs) < len(states):
-            frame_plan_trajs.append(plan_seg.copy())
+
         o_prev = jnp.asarray(chunk_traj_raw[:-1], dtype=jnp.float32)
         o_next = jnp.asarray(chunk_traj_raw[1:], dtype=jnp.float32)
         actions = np.asarray(jax.device_get(_idm_actions(idm_params, o_prev, o_next)), dtype=np.float32)
 
         n_exec = min(int(actions.shape[0]), max(1, int(action_chunk_horizon)))
-        for i in range(n_exec):
-            # One hat row per env transition (same as ``rollout.subgoal``) so
-            # ``overlay_rgb_frames_obs2d_panel(..., chunk_hat_stride=inv_dyn_freq)`` stays aligned.
-            hats_list.append(hat_plot_np.copy())
-            a = np.clip(actions[i], low, high)
-            ob, _r, terminated, truncated, _info = env.step(a)
-            ob_f = np.asarray(ob, dtype=np.float32).reshape(-1)
-            states.append(ob_f)
-            frame_plan_trajs.append(plan_seg.copy())
-            _maybe_record()
-            if goal_within_tol(ob_f, g_np, goal_stop_dims, float(goal_tol)):
-                hats = np.stack(hats_list, axis=0) if hats_list else np.zeros((0, d), dtype=np.float32)
-                env_rgb = np.stack(rgb_frames, axis=0) if rgb_frames else None
-                return np.stack(states, axis=0), hats, chunk_i + 1, True, env_rgb, _pack_frame_plan_trajs()
-            if terminated or truncated:
-                hats = np.stack(hats_list, axis=0) if hats_list else np.zeros((0, d), dtype=np.float32)
-                env_rgb = np.stack(rgb_frames, axis=0) if rgb_frames else None
-                return np.stack(states, axis=0), hats, chunk_i + 1, False, env_rgb, _pack_frame_plan_trajs()
+        for _ in range(n_exec):
+            hats_per_step.append(hat_plot_np.copy())
+            plan_trajs_per_step.append(plan_seg.copy())
+        return actions[:n_exec]
 
-    hats = np.stack(hats_list, axis=0) if hats_list else np.zeros((0, d), dtype=np.float32)
-    env_rgb = np.stack(rgb_frames, axis=0) if rgb_frames else None
-    return np.stack(states, axis=0), hats, max_chunks, False, env_rgb, _pack_frame_plan_trajs()
+    outcome = run_chunked_episode(
+        env,
+        cur,
+        g_np,
+        low=low,
+        high=high,
+        max_chunks=int(max_chunks),
+        sample_action_chunk=_idm_chunk,
+        record_rgb=bool(record_env_rgb),
+    )
+
+    hats = (
+        np.stack(hats_per_step[: outcome.states.shape[0] - 1], axis=0)
+        if hats_per_step and outcome.states.shape[0] > 1
+        else np.zeros((0, d), dtype=np.float32)
+    )
+    pkr = np.stack(plan_trajs_per_step[: outcome.states.shape[0]], axis=0) if outcome.states.shape[0] > 0 else np.zeros((0, 0, d), dtype=np.float32)
+    return outcome.states, hats, outcome.n_chunks, outcome.ok_env, outcome.rgb_frames, pkr
 
 
 def main() -> None:
@@ -220,11 +198,8 @@ def main() -> None:
         help='JAX PRNG seed for sample_plan splits; -1 means use --seed.',
     )
     p.add_argument('--mujoco_gl', type=str, default='', metavar='BACKEND')
-    p.add_argument('--goal_tol', type=float, default=0.5)
-    p.add_argument('--goal_stop', type=str, choices=('plot', 'full'), default='plot')
     p.add_argument('--plot_dim0', type=int, default=0)
     p.add_argument('--plot_dim1', type=int, default=1)
-    p.add_argument('--navigator', type=str, choices=('none', 'snap'), default='none')
     p.add_argument('--navigator_clamp', type=str, choices=('ij', 'oracle', 'union', 'center'), default='ij')
     p.add_argument('--navigator_edge_inset', type=float, default=0.08)
     p.add_argument('--maze_type', type=str, default='')
@@ -264,10 +239,8 @@ def main() -> None:
     ckpt_epoch = pick_epoch(int(args.checkpoint_epoch), list_checkpoint_suffixes(ckpt_dir))
 
     cfg, env_name = load_run_flags(run_dir)
-    navigator: MazeNavigatorMap | None = None
-    if args.navigator == 'snap':
-        navigator = load_maze_navigator_snap(args.maze_type, env_name)
-        print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
+    navigator = load_maze_navigator_snap(args.maze_type, env_name)
+    print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
 
     env, train_raw, _ = make_env_and_datasets(
         env_name, frame_stack=cfg.get('frame_stack'), render_mode='rgb_array',
@@ -286,13 +259,6 @@ def main() -> None:
     s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
     traj = np.stack([s0, s_g], axis=0)
     print(f'OGBench eval reset: task_id={tid}  obs_dim={s0.shape[-1]}  goal_dim={s_g.shape[-1]}')
-    tol = float(args.goal_tol)
-    if tol > 0 and args.goal_stop == 'plot':
-        stop_dims = (args.plot_dim0, args.plot_dim1)
-    elif tol > 0 and args.goal_stop == 'full':
-        stop_dims = None
-    else:
-        stop_dims = None
 
     ex = jnp.zeros((1, s0.shape[-1]), dtype=jnp.float32)
     act_dim = int(np.prod(env.action_space.shape))
@@ -374,8 +340,6 @@ def main() -> None:
         s0,
         s_g,
         int(args.max_steps),
-        goal_tol=tol,
-        goal_stop_dims=stop_dims,
         **nav_kw,
         action_low=low,
         action_high=high,
@@ -388,7 +352,7 @@ def main() -> None:
     steps_per_replan = min(action_chunk_horizon, dynamics_N)
     print(
         f'IDM rollout: {n_chunks} replans × up to {steps_per_replan} env steps/replan → '
-        f'{roll.shape[0]} obs ({n_trans} transitions), goal_reached={reached}'
+        f'{roll.shape[0]} obs ({n_trans} transitions), env_info_success={reached}'
     )
 
     d0, d1 = args.plot_dim0, args.plot_dim1

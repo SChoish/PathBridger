@@ -1,47 +1,15 @@
 # Linear-SDE dynamics + critic + actor offline training.
+# Baseline for antmaze-medium-navigate. Algorithm defaults
+# (theta_schedule=prefix_progress, subgoal_value_alpha=0.5,
+# spi_tau=10.0, final_eval_episodes_per_task=50) come from
+# agents/{dynamics,critic,actor}.py and main.py FLAGS.
 
 env_name: antmaze-medium-navigate-v0
-seed: 0
-run_group: antmaze_navigate
-
+run_group: antmaze_medium_navigate
 train_epochs: 200
-log_every_n_epochs: 10
-save_every_n_epochs: 100
-
-use_wandb: false
-use_tqdm: false
-
-batch_size: 1024
-horizon: 25
-plan_candidates: 8
-# Used only when plan_candidates > 1.
-plan_noise_scale: 0.01
-measure_timing: false
-eval_freq: 100
-eval_task_ids: "1,2,3,4,5"
-eval_episodes_per_task: 10
-eval_max_chunks: 200
-eval_goal_tol: 0.5
-eval_goal_dims: "0,1"
-
-# Only fields that override defaults from agents/dynamics.get_dynamics_config()
-# and agents/critic.get_config(). Everything else uses the agent defaults.
-dynamics:
-  rollout_loss_weight: 1.0      # default 0.25
-  value_geom_sample: false      # default true; uniform-future relabeling
-  subgoal_value_alpha: 0.1      # weight on V(ŝ_g, g) in subgoal loss; 0 disables
-
-  # --- Linear dynamics bridge denominator offset ---
-  bridge_gamma_inv: 0.0
-
-  # Hard endpoint bridge uses deterministic point subgoals.
-  subgoal_distribution: deterministic
 
 critic_agent:
-  action_chunk_horizon: 5       # default 10
+  action_chunk_horizon: 5      # default 10
 
 actor:
-  # SPI actor overrides over agents/actor.get_actor_config().
-  spi_tau: 1.0
-  spi_beta: 1.0
-  spi_actor_layer_norm: true
+  spi_beta: 1.0                # default 10.0

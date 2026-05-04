@@ -113,6 +113,19 @@ def format_maze_navigator_log(
     )
 
 
+def max_episode_steps_from_wrappers(env) -> int | None:
+    """Return ``TimeLimit._max_episode_steps`` if present on ``env`` or a nested wrapper."""
+    w = env
+    for _ in range(32):
+        m = getattr(w, '_max_episode_steps', None)
+        if m is not None:
+            return int(m)
+        w = getattr(w, 'env', None)
+        if w is None:
+            break
+    return None
+
+
 def env_render_rgb_u8(env) -> np.ndarray | None:
     """Return a single RGB uint8 frame from ``env.render()``, or None if unavailable."""
     try:

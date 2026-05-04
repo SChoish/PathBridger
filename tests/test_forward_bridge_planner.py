@@ -6,7 +6,7 @@ Covers:
    ``a[K]=0, b[K]=1, std[K]=0``).
 2. ``forward_bridge_plan`` returns ``[B, K+1, D]`` paths with
    ``path[:, 0] == z0`` and ``path[:, -1] == zK``.
-3. ``planner_type='reverse_score'`` (default) still runs and produces
+3. ``planner_type='exact_residual_chain'`` (default) still runs and produces
    trajectories with the same shape as before this change.
 4. ``planner_type='forward_bridge'`` and
    ``planner_type='forward_bridge_residual'`` go through ``plan()`` /
@@ -35,16 +35,16 @@ ACTION_DIM = 2
 BATCH = 8
 
 
-def _make_agent(planner_type: str = 'reverse_score'):
+def _make_agent(planner_type: str = 'exact_residual_chain'):
     cfg = get_dynamics_config()
     cfg.dynamics_N = 4
     cfg.subgoal_steps = 4
     cfg.rollout_horizon = 2
-    cfg.eps_hidden_dims = (32, 32)
+    cfg.residual_model_hidden_dims = (32, 32)
     cfg.subgoal_hidden_dims = (32, 32)
     cfg.subgoal_value_hidden_dims = (32, 32)
     cfg.idm_hidden_dims = (32, 32)
-    cfg.residual_hidden_dims = (32, 32)
+    cfg.path_residual_hidden_dims = (32, 32)
     cfg.planner_type = planner_type
     ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
     ex_act = np.zeros((BATCH, ACTION_DIM), dtype=np.float32)
@@ -188,8 +188,8 @@ def test_agent_forward_bridge_uses_configured_bridge_gamma_inv():
     assert not np.allclose(np.asarray(std_hard[1:-1]), np.asarray(std_soft[1:-1]))
 
 
-def test_reverse_score_plan_unchanged():
-    agent = _make_agent('reverse_score')
+def test_exact_residual_chain_plan_unchanged():
+    agent = _make_agent('exact_residual_chain')
     K = int(agent.config['dynamics_N'])
     obs = jnp.asarray(np.random.RandomState(3).randn(BATCH, STATE_DIM).astype(np.float32))
     goal = jnp.asarray(np.random.RandomState(4).randn(BATCH, STATE_DIM).astype(np.float32))
@@ -223,7 +223,7 @@ def test_forward_bridge_planner_dispatch():
 
 
 def test_forward_bridge_total_loss_finite():
-    for planner in ('reverse_score', 'forward_bridge', 'forward_bridge_residual'):
+    for planner in ('exact_residual_chain', 'forward_bridge', 'forward_bridge_residual'):
         agent = _make_agent(planner)
         batch = _make_batch(int(agent.config['dynamics_N']))
         agent2, info = agent.update(batch)
@@ -240,7 +240,7 @@ if __name__ == '__main__':
     test_forward_bridge_coefficients_use_bridge_gamma_inv()
     test_forward_bridge_plan_shapes_and_endpoints()
     test_agent_forward_bridge_uses_configured_bridge_gamma_inv()
-    test_reverse_score_plan_unchanged()
+    test_exact_residual_chain_plan_unchanged()
     test_forward_bridge_planner_dispatch()
     test_forward_bridge_total_loss_finite()
     print('OK: all forward_bridge planner smoke tests passed.')

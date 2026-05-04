@@ -29,14 +29,14 @@ from utils.dynamics import (
 )
 
 
-_VALID_PLANNER_TYPES = ('reverse_score', 'forward_bridge', 'forward_bridge_residual')
+_VALID_PLANNER_TYPES = ('exact_residual_chain', 'forward_bridge', 'forward_bridge_residual')
 _VALID_FORWARD_BRIDGE_MODES = ('mean', 'sample')
 _VALID_DYNAMICS_MODEL_TYPES = ('exact_residual',)
 
 
 def _planner_type(config) -> str:
     """Return the canonical planner_type string from the agent config."""
-    pt = str(config.get('planner_type', 'reverse_score')).lower()
+    pt = str(config.get('planner_type', 'exact_residual_chain')).lower()
     if pt not in _VALID_PLANNER_TYPES:
         raise ValueError(
             f'planner_type must be one of {_VALID_PLANNER_TYPES}, got {pt!r}.'
@@ -87,7 +87,7 @@ class SinusoidalEmbedding(nn.Module):
         return jnp.concatenate([jnp.sin(args), jnp.cos(args)], axis=-1)
 
 
-class EpsilonNet(nn.Module):
+class ResidualNet(nn.Module):
     hidden_dims: Sequence[int]
     state_dim: int
     time_embed_dim: int = 64
@@ -105,7 +105,7 @@ class EpsilonNet(nn.Module):
 
 
 class SubgoalEstimatorNet(nn.Module):
-    """Deterministic point subgoal estimator (legacy, ``subgoal_distribution='deterministic'``)."""
+    """Deterministic point subgoal estimator."""
 
     hidden_dims: Sequence[int]
     state_dim: int
@@ -125,8 +125,8 @@ class DistributionalSubgoalEstimatorNet(nn.Module):
     """Diagonal-Gaussian subgoal estimator (``subgoal_distribution='diag_gaussian'``).
 
     Returns ``(mu, log_std)`` for ``pi_phi(s_{t+K} | s_t, g)``.  The phase-1
-    subgoal objective trains the Gaussian mean with the same stable
-    ``MSE - alpha * V(mu, g)`` loss as deterministic mode; ``log_std`` is used
+    subgoal objective uses a reparameterized sample with a value-gap-weighted
+    MSE and optional ``- alpha * V(sample, g)`` bonus; ``log_std`` is also used
     for stochastic actor proposals and NLL diagnostics.  Actor proposals sample
     endpoint candidates from this distribution in
     :meth:`_DynamicsAgentCore.sample_subgoal_candidates`.
@@ -194,7 +194,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     def _learned_reverse_mean(self, x_n, x_T, x_0, n, schedule, goal=None, params=None):
-        eps = self.network.select('eps_net')(
+        eps = self.network.select('residual_net')(
             x_n, x_T, x_0, n.astype(jnp.float32), params=params,
         )
         # Exact bridge posterior mean as base transition + learned residual.
@@ -251,14 +251,14 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     # Forward-bridge planner (closed-form, endpoint-conditioned)
     # ------------------------------------------------------------------
     #
-    # For ``planner_type='reverse_score'`` (default) ``plan()`` / ``sample_plan()``
-    # take the existing learned-eps reverse chain.  For
+    # For ``planner_type='exact_residual_chain'`` (default) ``plan()`` /
+    # ``sample_plan()`` take the learned residual reverse chain.  For
     # ``planner_type='forward_bridge'`` and ``planner_type='forward_bridge_residual'``
     # they instead branch into the closed-form Gaussian bridge below.  The
     # convention follows DOURI's state-space *forward* time direction:
     #
-    #     z_0 = current state          (= x_T in legacy diffusion-time)
-    #     z_K = subgoal endpoint       (= x_0 in legacy diffusion-time)
+    #     z_0 = current state
+    #     z_K = subgoal endpoint
     #     trajectory[:, 0] = z_0
     #     trajectory[:, K] = z_K
     #
@@ -390,7 +390,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         path = path.at[:, 0, :].set(z0).at[:, -1, :].set(zK)
         return path
 
-    def _reverse_score_plan(self, current_state, desired_endpoint, num_steps: int | None = None, *, goal=None):
+    def _exact_residual_chain_plan(self, current_state, desired_endpoint, num_steps: int | None = None, *, goal=None):
         x_T = current_state
         x_0_goal = desired_endpoint
         n_total = int(self.config['dynamics_N'])
@@ -409,7 +409,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         traj = jnp.concatenate([x_T[None], traj_body], axis=0)
         return jnp.swapaxes(traj, 0, 1)
 
-    def _reverse_score_sample_plan(
+    def _exact_residual_chain_sample_plan(
         self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None, *, goal=None,
     ):
         x_T = current_state
@@ -455,7 +455,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 sample=False, noise_scale=0.0, num_steps=num_steps,
             )
         else:
-            traj = self._reverse_score_plan(
+            traj = self._exact_residual_chain_plan(
                 current_state, desired_endpoint, num_steps=num_steps, goal=goal,
             )
 
@@ -489,7 +489,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 num_steps=num_steps, rng=rng,
             )
         else:
-            traj = self._reverse_score_sample_plan(
+            traj = self._exact_residual_chain_sample_plan(
                 current_state, desired_endpoint, rng, noise_scale, num_steps=num_steps, goal=goal,
             )
 
@@ -516,7 +516,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 sample=sample_flag, noise_scale=noise_scale,
                 num_steps=num_steps, rng=rng,
             )
-        return self._reverse_score_sample_plan(
+        return self._exact_residual_chain_sample_plan(
             current_state, desired_endpoint, rng, noise_scale, num_steps=num_steps, goal=goal,
         )
 
@@ -598,7 +598,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
     @jax.jit
     def infer_subgoal_mean(self, observations, high_actor_goals):
-        """Distributional API: returns mu (== deterministic point in legacy mode)."""
+        """Distributional API: returns mu (== deterministic point in deterministic mode)."""
         return self.predict_subgoal(observations, high_actor_goals)
 
     @jax.jit
@@ -827,8 +827,8 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             progress_alpha=float(config.get('progress_alpha', 0.8)),
         )
 
-        eps_net_def = EpsilonNet(
-            hidden_dims=tuple(config['eps_hidden_dims']),
+        residual_net_def = ResidualNet(
+            hidden_dims=tuple(config['residual_model_hidden_dims']),
             state_dim=state_dim,
             time_embed_dim=config['time_embed_dim'],
             layer_norm=config['layer_norm'],
@@ -865,16 +865,19 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         dummy_next = jnp.zeros_like(ex_observations)
 
         network_info = dict(
-            eps_net=(eps_net_def, (dummy_x, dummy_x, dummy_x, dummy_n)),
+            residual_net=(residual_net_def, (dummy_x, dummy_x, dummy_x, dummy_n)),
             subgoal_net=(subgoal_def, (dummy_x, dummy_g)),
             idm_net=(idm_def, (dummy_x, dummy_next)),
         )
         # Optionally register the forward-bridge residual MLP.  Only created when
-        # ``planner_type == 'forward_bridge_residual'`` so existing reverse-score
-        # checkpoints stay loadable bit-for-bit (no extra params introduced).
-        planner_type = str(config.get('planner_type', 'reverse_score')).lower()
+        # ``planner_type == 'forward_bridge_residual'`` so the default exact
+        # residual chain does not allocate path-residual parameters.
+        planner_type = str(config.get('planner_type', 'exact_residual_chain')).lower()
         if planner_type == 'forward_bridge_residual':
-            residual_hidden = config.get('residual_hidden_dims', config.get('eps_hidden_dims', (512, 512, 512)))
+            residual_hidden = config.get(
+                'path_residual_hidden_dims',
+                config.get('residual_model_hidden_dims', (512, 512, 512)),
+            )
             if isinstance(residual_hidden, str):
                 residual_hidden = parse_hidden_dims(residual_hidden)
             else:
@@ -922,31 +925,48 @@ class DynamicsAgent(_DynamicsAgentCore):
                 )
         return super().create(seed, ex_observations, config, ex_actions=ex_actions)
 
-    def _subgoal_value_bonus(
+    def _subgoal_values(
         self,
-        pred_subgoals: jnp.ndarray,
+        states: jnp.ndarray,
         high_actor_goals: jnp.ndarray,
         critic_value_params: Any | None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        alpha = float(self.config.get('subgoal_value_alpha', 0.0))
-        zeros = jnp.zeros((pred_subgoals.shape[0],), dtype=jnp.float32)
-        if alpha <= 0.0 or critic_value_params is None:
-            return zeros, zeros
+    ) -> jnp.ndarray:
+        zeros = jnp.zeros((states.shape[0],), dtype=jnp.float32)
+        if critic_value_params is None:
+            return zeros
 
         value_def = ScalarValueNet(
             tuple(int(x) for x in self.config.get('subgoal_value_hidden_dims', (512, 512, 512))),
             layer_norm=bool(self.config.get('subgoal_value_layer_norm', True)),
         )
-        value_logits = value_def.apply({'params': critic_value_params}, pred_subgoals, high_actor_goals)
-        value = jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
-        return value, jnp.asarray(alpha, dtype=jnp.float32) * value
+        value_logits = value_def.apply({'params': critic_value_params}, states, high_actor_goals)
+        return jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
+
+    def _subgoal_value_terms(
+        self,
+        observations: jnp.ndarray,
+        pred_subgoals: jnp.ndarray,
+        high_actor_goals: jnp.ndarray,
+        critic_value_params: Any | None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        pred_value = self._subgoal_values(pred_subgoals, high_actor_goals, critic_value_params)
+        obs_value = self._subgoal_values(observations, high_actor_goals, critic_value_params)
+
+        gap_scale = jnp.asarray(
+            float(self.config.get('subgoal_value_gap_scale', 1.0)), dtype=jnp.float32,
+        )
+        mse_weight = jnp.exp(gap_scale * (pred_value - obs_value))
+
+        alpha = jnp.asarray(float(self.config.get('subgoal_value_alpha', 0.0)), dtype=jnp.float32)
+        subgoal_value_bonus = jnp.where(alpha > 0.0, alpha * pred_value, jnp.zeros_like(pred_value))
+        return pred_value, obs_value, subgoal_value_bonus, mse_weight
 
     def _compute_subgoal_loss(self, batch, grad_params, rng_fr, critic_value_params):
         """Compute the subgoal-net training loss + companion logging tensors.
 
-        Shared by both the legacy reverse-score path and the
-        ``forward_bridge`` / ``forward_bridge_residual`` path so the subgoal
-        estimator is trained identically across planners.
+        Shared by ``exact_residual_chain`` and the ``forward_bridge`` /
+        ``forward_bridge_residual`` paths so the subgoal estimator is trained
+        identically across planners.
         """
         s = batch['observations']
         g_high = batch['high_actor_goals']
@@ -957,29 +977,40 @@ class DynamicsAgent(_DynamicsAgentCore):
             pred_mu, pred_log_std = self.network.select('subgoal_net')(s, g_high, params=grad_params)
             pred_std = jnp.exp(pred_log_std)
             inv_var = jnp.exp(-2.0 * pred_log_std)
-            diff_sg = target - pred_mu
+            mean_diff = target - pred_mu
             nll_per_sample = 0.5 * jnp.sum(
-                diff_sg ** 2 * inv_var + 2.0 * pred_log_std + jnp.log(2.0 * jnp.pi), axis=-1
+                mean_diff ** 2 * inv_var + 2.0 * pred_log_std + jnp.log(2.0 * jnp.pi), axis=-1
             )
-            subgoal_mse = jnp.mean(diff_sg ** 2, axis=-1)
-            subgoal_value, subgoal_value_bonus = self._subgoal_value_bonus(
-                pred_mu, g_high, critic_value_params
+            eps = jax.random.normal(rng_fr, pred_mu.shape, dtype=pred_mu.dtype)
+            pred_sample = pred_mu + eps * pred_std
+            sample_diff = target - pred_sample
+            subgoal_mse = jnp.mean(sample_diff ** 2, axis=-1)
+            mean_mse = jnp.mean(mean_diff ** 2, axis=-1)
+            subgoal_value, current_value, subgoal_value_bonus, subgoal_mse_weight = self._subgoal_value_terms(
+                s, pred_sample, g_high, critic_value_params
             )
-            loss_sub = jnp.mean(subgoal_mse) - jnp.mean(subgoal_value_bonus)
-            pred_sg_out = pred_mu
+            weighted_subgoal_mse = subgoal_mse_weight * subgoal_mse
+            loss_sub = jnp.mean(weighted_subgoal_mse) - jnp.mean(subgoal_value_bonus)
+            pred_sg_out = pred_sample
             subgoal_extra_info = {
                 'phase1/subgoal_nll': jnp.mean(nll_per_sample),
+                'phase1/subgoal_mean_mse': jnp.mean(mean_mse),
+                'phase1/subgoal_sample_mse': jnp.mean(subgoal_mse),
+                'phase1/subgoal_weighted_mse': jnp.mean(weighted_subgoal_mse),
                 'phase1/subgoal_std_mean': jnp.mean(pred_std),
                 'phase1/subgoal_std_max': jnp.max(pred_std),
                 'phase1/subgoal_mode': jnp.asarray(1.0, dtype=jnp.float32),
+                'phase1/subgoal_current_value_mean': jnp.mean(current_value),
+                'phase1/subgoal_mse_weight_mean': jnp.mean(subgoal_mse_weight),
             }
         else:
             pred_sg = self.network.select('subgoal_net')(s, g_high, params=grad_params)
             subgoal_mse = jnp.mean((pred_sg - target) ** 2, axis=-1)
-            subgoal_value, subgoal_value_bonus = self._subgoal_value_bonus(
-                pred_sg, g_high, critic_value_params
+            subgoal_value, current_value, subgoal_value_bonus, subgoal_mse_weight = self._subgoal_value_terms(
+                s, pred_sg, g_high, critic_value_params
             )
-            loss_sub = jnp.mean(subgoal_mse) - jnp.mean(subgoal_value_bonus)
+            weighted_subgoal_mse = subgoal_mse_weight * subgoal_mse
+            loss_sub = jnp.mean(weighted_subgoal_mse) - jnp.mean(subgoal_value_bonus)
             pred_sg_out = pred_sg
             zero = jnp.asarray(0.0, dtype=jnp.float32)
             subgoal_extra_info = {
@@ -987,6 +1018,9 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_std_mean': zero,
                 'phase1/subgoal_std_max': zero,
                 'phase1/subgoal_mode': zero,
+                'phase1/subgoal_weighted_mse': jnp.mean(weighted_subgoal_mse),
+                'phase1/subgoal_current_value_mean': jnp.mean(current_value),
+                'phase1/subgoal_mse_weight_mean': jnp.mean(subgoal_mse_weight),
             }
         return loss_sub, subgoal_mse, subgoal_value, subgoal_value_bonus, pred_sg_out, subgoal_extra_info
 
@@ -996,7 +1030,7 @@ class DynamicsAgent(_DynamicsAgentCore):
             return (0, 1)
         return tuple(int(x) for x in pev)
 
-    def _total_loss_reverse_score(self, batch, grad_params, rng, critic_value_params):
+    def _total_loss_exact_residual_chain(self, batch, grad_params, rng, critic_value_params):
         """Mean-matching + path-aligned reverse + short rollout + subgoal MSE."""
         x_T = batch['observations']
         x_0 = batch['high_actor_targets']
@@ -1007,7 +1041,7 @@ class DynamicsAgent(_DynamicsAgentCore):
         sg_w = float(self.config.get('subgoal_loss_weight', 1.0))
         w_g = float(self.config.get('dynamics_loss_weight', 1.0))
         w_p = float(self.config.get('path_loss_weight', 1.0))
-        w_r = float(self.config.get('rollout_loss_weight', 0.25))
+        w_r = float(self.config.get('rollout_loss_weight', 1.0))
 
         rng1, rng2, rng_fr = jax.random.split(rng, 3)
         n = jax.random.randint(rng1, (B,), 1, N + 1)
@@ -1208,8 +1242,8 @@ class DynamicsAgent(_DynamicsAgentCore):
         planner_id = 1.0 if planner == 'forward_bridge' else 2.0
         info = {
             'phase1/loss': loss,
-            # Reverse-score legacy keys logged as 0 to keep the metrics dict
-            # shape-stable for existing csv/wandb consumers.
+            # These dynamics terms are inactive for closed-form forward-bridge
+            # training but kept shape-stable for CSV/W&B logging.
             'phase1/loss_dynamics': zero,
             'phase1/loss_roll': zero,
             'phase1/loss_path_step': loss_next,
@@ -1255,8 +1289,8 @@ class DynamicsAgent(_DynamicsAgentCore):
         the *actual* hard-bridge marginal weight at step
         ``min(5, dynamics_N)``. The prefix-progress *target* curve is only
         defined for the ``prefix_progress`` schedule; logging it under
-        ``linear_beta`` would emit ``NaN`` (legacy paths assert log finiteness),
-        so we omit that key in legacy mode.
+        ``linear_beta`` would emit ``NaN``, so we omit that key outside
+        prefix-progress mode.
         """
         sched = self.schedule
         prefix_idx = min(5, int(self.config['dynamics_N']))
@@ -1280,7 +1314,7 @@ class DynamicsAgent(_DynamicsAgentCore):
             return self._total_loss_forward_bridge(
                 batch, grad_params, rng, critic_value_params, planner,
             )
-        return self._total_loss_reverse_score(
+        return self._total_loss_exact_residual_chain(
             batch, grad_params, rng, critic_value_params,
         )
 
@@ -1289,7 +1323,6 @@ def _get_common_config():
     """Common defaults for linear dynamics training and rollout."""
     return ml_collections.ConfigDict(
         dict(
-            agent_name='dynamics',
             lr=3e-4,
             batch_size=1024,
             dynamics_N=25,
@@ -1298,24 +1331,30 @@ def _get_common_config():
             dynamics_lambda=1.0,
             # Linear-SDE bridge denominator offset. 0.0 is the hard endpoint bridge.
             bridge_gamma_inv=0.0,
-            # Theta schedule selector. ``linear_beta`` preserves the legacy
-            # diffusion-style schedule bit-for-bit. ``prefix_progress`` calibrates
+            # Theta schedule selector. ``linear_beta`` keeps the diffusion-style
+            # schedule. ``prefix_progress`` calibrates
             # the hard-bridge marginal interpolation so that the actor-visible
             # prefix already reaches a meaningful fraction of the subgoal
             # displacement (``c_i = (i / K) ** progress_alpha``); ``theta_total``
             # controls the cumulative rate ``Theta_K``.
-            theta_schedule='linear_beta',
+            theta_schedule='prefix_progress',
             theta_total=1.0,
             progress_alpha=0.8,
-            eps_hidden_dims=(512, 512, 512),
+            residual_model_hidden_dims=(512, 512, 512),
             time_embed_dim=64,
             layer_norm=True,
             subgoal_loss_weight=1.0,
-            subgoal_value_alpha=0.1,
+            subgoal_value_alpha=0.5,
+            subgoal_value_gap_scale=1.0,
+            # NOTE: in the standard `main.py` training path, these two are
+            # overwritten in `_prepare_configs` to mirror the critic's
+            # `value_hidden_dims` / `layer_norm` so that the borrowed critic
+            # head loads cleanly. They are honored only when DynamicsAgent is
+            # constructed outside of `main.py` (e.g. unit tests).
             subgoal_value_hidden_dims=(512, 512, 512),
             subgoal_value_layer_norm=True,
             subgoal_hidden_dims=(512, 512, 512),
-            # Distributional subgoal controls (default: legacy deterministic point).
+            # Distributional subgoal controls (default: deterministic point).
             subgoal_distribution='deterministic',
             subgoal_num_samples=1,
             subgoal_log_std_min=-5.0,
@@ -1333,17 +1372,17 @@ def _get_common_config():
             # and stay" at close goals so subgoal predictions near the goal stay
             # in-distribution and reduces hovering near the goal.
             clip_path_to_goal=True,
-            # Path-supervised planner switch.  Default 'reverse_score' keeps
-            # the legacy learned-eps reverse chain bit-for-bit.  Alternatives:
+            # Path-supervised planner switch.  Default 'exact_residual_chain'
+            # uses the learned residual reverse chain.  Alternatives:
             #   'forward_bridge'          : closed-form forward
             #                               bridge mean (no learned path params).
             #   'forward_bridge_residual' : bridge mean + endpoint-preserving
             #                               learned residual (PathResidualNet).
-            planner_type='reverse_score',
+            planner_type='exact_residual_chain',
             forward_bridge_mode='mean',
             forward_bridge_use_path_loss=True,
             # Hidden dims for the optional PathResidualNet (forward_bridge_residual).
-            residual_hidden_dims=(512, 512, 512),
+            path_residual_hidden_dims=(512, 512, 512),
             idm_loss_weight=1.0,
             idm_hidden_dims=(512, 512, 512),
             value_p_curgoal=0.2,

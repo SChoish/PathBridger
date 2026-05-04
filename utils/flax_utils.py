@@ -8,7 +8,6 @@ import flax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 
 nonpytree_field = functools.partial(flax.struct.field, pytree_node=False)
@@ -155,31 +154,6 @@ class TrainState(flax.struct.PyTreeNode):
             info.update(self._compute_grad_stats(grads))
 
         return self.apply_gradients(grads=grads), info
-
-
-def merge_checkpoint_state_dict(template: dict[str, Any], old: dict[str, Any]) -> dict[str, Any]:
-    """Merge ``old`` agent state dict into ``template`` (newer layout), copying only compatible leaves.
-
-    Used when resuming: new code may add modules (e.g. ``idm_net``); missing keys in ``old`` keep
-    ``template`` initialization; overlapping keys with matching shape take values from ``old`` (cast to template dtype).
-    """
-    if isinstance(template, dict) and isinstance(old, dict):
-        out: dict[str, Any] = {}
-        for k, tv in template.items():
-            if k in old:
-                out[k] = merge_checkpoint_state_dict(tv, old[k])
-            else:
-                out[k] = tv
-        return out
-    if isinstance(template, dict) or isinstance(old, dict):
-        return template
-    if hasattr(template, 'shape') and hasattr(old, 'shape'):
-        try:
-            if tuple(template.shape) == tuple(old.shape):
-                return np.asarray(old, dtype=getattr(template, 'dtype', np.asarray(template).dtype))
-        except (TypeError, ValueError):
-            pass
-    return template
 
 
 def save_agent(agent, save_dir, epoch):

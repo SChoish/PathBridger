@@ -3,14 +3,16 @@
 
 Loads ``checkpoints/dynamics/params_<epoch>.pkl`` and ``checkpoints/actor/params_<epoch>.pkl`` from a training run.
 
+Episode length is taken from the env's own ``TimeLimit`` wrapper (no user-defined chunk budget):
+the script runs ``ceil(max_episode_steps / actor_horizon) + 1`` replans, which is enough to walk the
+env to either ``info['success']`` or ``truncated``.
+
 Example::
 
     MUJOCO_GL=egl python rollout/actor.py \\
         --run_dir=runs/... \\
         --checkpoint_epoch=1000 \\
         --task_id=1 \\
-        --max_chunks=300 \\
-        --navigator=snap \\
         --out_mp4=runs/.../actor_rollout.mp4
 """
 
@@ -23,27 +25,28 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-from agents.actor import ActorAgent, normalize_actor_spi_config, get_actor_config
+from agents.actor import ActorAgent, get_actor_config
 from agents.dynamics import DynamicsAgent
 from utils.datasets import Dataset
 from utils.env_utils import make_env_and_datasets
 from rollout.env import (
     configure_mujoco_gl,
-    env_render_rgb_u8,
     format_maze_navigator_log,
     load_maze_navigator_snap,
+    max_episode_steps_from_wrappers,
     sync_env_state_from_obs_vector_aligned,
 )
+from rollout.episode_runner import make_actor_chunk_fn, run_chunked_episode
 from rollout.plot import (
     axis_limits,
     maze_navigator_for_xy_plot,
     overlay_rgb_frames_obs2d_panel,
     write_rgb_array_mp4,
 )
+from rollout.common import align_action_to_env
 from rollout.maze_navigator import MazeNavigatorMap
 from utils.run_io import (
     get_trajectory,
-    goal_within_tol,
     list_checkpoint_suffixes,
     load_checkpoint_pkl,
     load_run_flags,
@@ -66,18 +69,6 @@ def _load_actor_config_from_flags(flags_path: Path) -> dict:
     return d
 
 
-def _align_action_to_env(a: np.ndarray, env_dim: int) -> np.ndarray:
-    """Pad or truncate actor output to ``env_dim`` (handles mis-saved ``action_dim`` in flags)."""
-    a = np.asarray(a, dtype=np.float32).reshape(-1)
-    if a.shape[-1] == env_dim:
-        return a
-    if a.shape[-1] < env_dim:
-        out = np.zeros((env_dim,), dtype=np.float32)
-        out[: int(a.shape[-1])] = a
-        return out
-    return a[:env_dim].copy()
-
-
 def rollout_dynamics_actor_env(
     env,
     dynamics_agent: DynamicsAgent,
@@ -85,8 +76,6 @@ def rollout_dynamics_actor_env(
     s0: np.ndarray,
     s_g: np.ndarray,
     max_chunks: int,
-    goal_tol: float,
-    goal_stop_dims: tuple[int, ...] | None,
     *,
     low: np.ndarray,
     high: np.ndarray,
@@ -94,62 +83,48 @@ def rollout_dynamics_actor_env(
     env_action_dim: int,
     record_env_rgb: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None]:
+    """Chunked dynamics-subgoal + actor rollout via the shared runner.
+
+    Success is decided **only** by the env (``info['success']``); no user-defined
+    tolerance is applied here.
+    """
     cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
     goal = np.asarray(s_g, dtype=np.float32).reshape(-1)
-    states: list[np.ndarray] = [cur.copy()]
-    hats_list: list[np.ndarray] = []
-    rgb_frames: list[np.ndarray] = []
 
-    def _maybe_record() -> None:
-        if not record_env_rgb:
-            return
-        fr = env_render_rgb_u8(env)
-        if fr is not None:
-            rgb_frames.append(fr)
+    base_chunk_fn = make_actor_chunk_fn(dynamics_agent, actor_agent, int(actor_horizon), int(env_action_dim))
+    hats_per_step: list[np.ndarray] = []
 
-    _maybe_record()
+    def _chunk(obs: np.ndarray, g: np.ndarray) -> np.ndarray:
+        import jax
+        import jax.numpy as jnp
 
-    if goal_within_tol(cur, goal, goal_stop_dims, float(goal_tol)):
-        return np.stack(states, axis=0), np.zeros((0, cur.shape[-1]), dtype=np.float32), 0, True, (
-            np.stack(rgb_frames, axis=0) if rgb_frames else None
-        )
+        pred = np.asarray(
+            jax.device_get(
+                dynamics_agent.infer_subgoal(jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(g, dtype=jnp.float32))
+            ),
+            dtype=np.float32,
+        ).reshape(-1)
+        chunk = base_chunk_fn(obs, g)
+        for _ in range(int(chunk.shape[0])):
+            hats_per_step.append(pred.copy())
+        return chunk
 
-    reached = False
-    terminated = False
-    truncated = False
-    n_chunks_used = 0
-    for _ in range(max(1, int(max_chunks))):
-        obs = states[-1]
-        if goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol)):
-            reached = True
-            break
-        # ``pred`` (dynamics subgoal) is the actor conditioning vector (matches training).
-        pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-        actor_cond = pred
-        chunk = np.asarray(actor_agent.sample_actions(obs, actor_cond), dtype=np.float32).reshape(actor_horizon, -1)
-        chunk_done = False
-        for _i in range(int(chunk.shape[0])):
-            a = _align_action_to_env(chunk[_i], env_action_dim)
-            a = np.clip(a, low, high)
-            ob, _r, term, trunc, info = env.step(a)
-            obs = np.asarray(ob, dtype=np.float32).reshape(-1)
-            states.append(obs.copy())
-            hats_list.append(actor_cond.copy())
-            _maybe_record()
-            succ_flag = bool(info.get('success', False)) if isinstance(info, dict) else False
-            reached = succ_flag or goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol))
-            terminated = bool(term)
-            truncated = bool(trunc)
-            if reached or terminated or truncated:
-                chunk_done = True
-                break
-        n_chunks_used += 1
-        if chunk_done:
-            break
-
-    hats = np.stack(hats_list, axis=0) if hats_list else np.zeros((0, states[0].shape[-1]), dtype=np.float32)
-    env_rgb = np.stack(rgb_frames, axis=0) if rgb_frames else None
-    return np.stack(states, axis=0), hats, n_chunks_used, reached, env_rgb
+    outcome = run_chunked_episode(
+        env,
+        cur,
+        goal,
+        low=np.asarray(low, dtype=np.float32).reshape(-1),
+        high=np.asarray(high, dtype=np.float32).reshape(-1),
+        max_chunks=int(max_chunks),
+        sample_action_chunk=_chunk,
+        record_rgb=bool(record_env_rgb),
+    )
+    hats = (
+        np.stack(hats_per_step[: outcome.states.shape[0] - 1], axis=0)
+        if hats_per_step and outcome.states.shape[0] > 1
+        else np.zeros((0, cur.shape[-1]), dtype=np.float32)
+    )
+    return outcome.states, hats, outcome.n_chunks, outcome.ok_env, outcome.rgb_frames
 
 
 def main() -> None:
@@ -165,12 +140,8 @@ def main() -> None:
     p.add_argument('--actor_epoch', type=int, default=-1, help='Override actor checkpoint suffix (-1 = same as --checkpoint_epoch).')
     p.add_argument('--traj_idx', type=int, default=0, help='Offline episode index when --task_id=0.')
     p.add_argument('--task_id', type=int, default=0, help='OGBench task id [1..num_tasks]; 0 uses offline traj start/goal.')
-    p.add_argument('--max_chunks', type=int, default=1000, help='Max replan rounds (same sense as training eval).')
-    p.add_argument('--goal_tol', type=float, default=0.5)
-    p.add_argument('--goal_stop', type=str, choices=('plot', 'full'), default='plot')
     p.add_argument('--plot_dim0', type=int, default=0)
     p.add_argument('--plot_dim1', type=int, default=1)
-    p.add_argument('--navigator', type=str, choices=('none', 'snap'), default='none')
     p.add_argument('--navigator_clamp', type=str, choices=('ij', 'oracle', 'union', 'center'), default='ij')
     p.add_argument('--navigator_edge_inset', type=float, default=0.08)
     p.add_argument('--maze_type', type=str, default='')
@@ -209,10 +180,8 @@ def main() -> None:
     dynamics_cfg, env_name = load_run_flags(run_dir)
     actor_cfg = _load_actor_config_from_flags(flags_path)
 
-    navigator: MazeNavigatorMap | None = None
-    if args.navigator == 'snap':
-        navigator = load_maze_navigator_snap(args.maze_type, env_name)
-        print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
+    navigator = load_maze_navigator_snap(args.maze_type, env_name)
+    print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
 
     env, train_raw, _ = make_env_and_datasets(
         env_name, frame_stack=dynamics_cfg.get('frame_stack'), render_mode='rgb_array',
@@ -236,14 +205,6 @@ def main() -> None:
         s0 = np.asarray(traj[0], dtype=np.float32).reshape(-1)
         s_g = np.asarray(traj[-1], dtype=np.float32).reshape(-1)
 
-    tol = float(args.goal_tol)
-    if tol > 0 and args.goal_stop == 'plot':
-        stop_dims: tuple[int, ...] | None = (int(args.plot_dim0), int(args.plot_dim1))
-    elif tol > 0 and args.goal_stop == 'full':
-        stop_dims = None
-    else:
-        stop_dims = None
-
     ex = jnp.zeros((1, s0.shape[-1]), dtype=jnp.float32)
     act_dim = int(np.prod(env.action_space.shape))
     saved_actor_dim = int(actor_cfg.get('action_dim', act_dim))
@@ -258,7 +219,6 @@ def main() -> None:
     actor_agent = ActorAgent.create(int(args.seed), ex, actor_cfg, ex_goals=ex_goal)
     actor_pkl = actor_ckpt_dir / f'params_{actor_ep}.pkl'
     actor_agent = load_checkpoint_pkl(actor_agent, actor_pkl)
-    actor_agent = normalize_actor_spi_config(actor_agent)
     print(f'Loaded actor {actor_pkl}')
 
     from rollout.value_field import value_mesh_for_xy, load_critic_for_run
@@ -283,16 +243,24 @@ def main() -> None:
             f'Corrected flags actor action_dim={saved_actor_dim} to env action dim={env_action_dim} '
             'before loading the actor checkpoint.'
         )
-    print('Actor conditioning at inference: predicted dynamics subgoal (spi_goals).')
+    env_max_steps = max_episode_steps_from_wrappers(env)
+    if env_max_steps is None:
+        raise RuntimeError(
+            f'{env_name!r} has no TimeLimit wrapper; cannot derive replan budget from the env. '
+            'Add a TimeLimit wrapper or hard-code the budget here.'
+        )
+    max_chunks = (int(env_max_steps) + int(actor_horizon) - 1) // int(actor_horizon) + 1
+    print(
+        f'Actor conditioning at inference: predicted dynamics subgoal (spi_goals). '
+        f'env_max_steps={int(env_max_steps)} actor_horizon={actor_horizon} → max_chunks={int(max_chunks)}'
+    )
     roll, hats, n_chunks, reached, env_frames = rollout_dynamics_actor_env(
         env,
         dynamics_agent,
         actor_agent,
         s0,
         s_g,
-        int(args.max_chunks),
-        goal_tol=tol,
-        goal_stop_dims=stop_dims,
+        int(max_chunks),
         low=low,
         high=high,
         actor_horizon=actor_horizon,
@@ -302,7 +270,7 @@ def main() -> None:
     n_trans = max(0, int(roll.shape[0]) - 1)
     print(
         f'Actor rollout: {n_chunks} replan rounds, actor_horizon={actor_horizon} → '
-        f'{roll.shape[0]} obs ({n_trans} transitions), goal_reached={reached}'
+        f'{roll.shape[0]} obs ({n_trans} transitions), env_info_success={reached}'
     )
 
     d0, d1 = int(args.plot_dim0), int(args.plot_dim1)

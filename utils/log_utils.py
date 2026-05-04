@@ -60,7 +60,7 @@ class CsvLogger:
 def get_exp_name(seed, env_name=None, agent_name=None):
     """Return the experiment name (wandb run name / save subdir).
 
-    Order: {agent_name}_{env_name}_sd{seed}_... when agent/env given; else legacy sd{seed}_...
+    Order: {agent_name}_{env_name}_sd{seed}_... when agent/env given; else sd{seed}_...
     """
     tail = f'sd{seed:03d}_'
     if 'SLURM_JOB_ID' in os.environ:

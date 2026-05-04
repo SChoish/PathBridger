@@ -14,7 +14,6 @@ from ml_collections import ConfigDict
 
 from agents.dynamics import get_dynamics_config
 from utils.datasets import Dataset
-from utils.flax_utils import merge_checkpoint_state_dict
 
 
 # --- checkpoint helpers -------------------------------------------------------
@@ -47,9 +46,7 @@ def load_checkpoint_pkl(agent: Any, pkl_path: Path) -> Any:
     """Load ``params_*.pkl`` (training runs save under ``{'agent': state_dict}``) into ``agent``."""
     with open(pkl_path, 'rb') as f:
         load_dict = pickle.load(f)
-    template = flax.serialization.to_state_dict(agent)
-    merged = merge_checkpoint_state_dict(template, load_dict['agent'])
-    return flax.serialization.from_state_dict(agent, merged)
+    return flax.serialization.from_state_dict(agent, load_dict['agent'])
 
 
 def resolve_dynamics_checkpoint_dir(run_dir: Path) -> Path:

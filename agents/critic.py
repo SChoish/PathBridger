@@ -354,7 +354,6 @@ def extract_critic_primary_score(info: dict) -> float:
 def get_config():
     return ml_collections.ConfigDict(
         dict(
-            agent_name='critic',
             lr=3e-4,
             batch_size=256,
             tau=0.005,
