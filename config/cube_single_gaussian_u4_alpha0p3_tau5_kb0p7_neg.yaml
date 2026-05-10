@@ -1,0 +1,31 @@
+# Linear-SDE dynamics + critic + actor offline training.
+# Cube-single ablation off the 20260505_212010 baseline:
+#   - subgoal: diag_gaussian with U=4 sampled subgoals per state.
+#   - plan_candidates: 1 bridge/action candidate per sampled subgoal (N=1).
+#   - subgoal_value_alpha: 0.3 (V-bonus on predicted subgoal).
+#   - SPI tau: 5.0.
+#   - critic kappa_b lowered from 0.93 to 0.7.
+#   - critic gc_negative enabled: non-success steps contribute -1 before target clipping.
+# Other knobs preserved from the alpha0p0 baseline (discount=0.995, kappa_d=0.8,
+# action_chunk_horizon=5, spi_beta=1.0).
+
+env_name: cube-single-play-v0
+run_group: cube_single_gaussian_u4_alpha0p3_tau5_kb0p7_neg
+train_epochs: 1000
+plan_candidates: 1
+
+dynamics:
+  subgoal_distribution: diag_gaussian
+  subgoal_num_samples: 4
+  subgoal_value_alpha: 0.3
+
+critic_agent:
+  action_chunk_horizon: 5      # default 10
+  discount: 0.995              # default 0.99
+  kappa_b: 0.7                 # default 0.7
+  kappa_d: 0.8                 # default 0.7
+  gc_negative: true
+
+actor:
+  spi_beta: 1.0                # default 10.0
+  spi_tau: 5.0                 # default 10.0

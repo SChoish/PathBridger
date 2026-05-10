@@ -1,0 +1,21 @@
+# Linear-SDE dynamics + critic + actor offline training.
+# Cube-single ablation: expectile weighting, value bonus alpha 0.5,
+# gamma 0.99, and default kappa values.
+
+env_name: cube-single-play-v0
+run_group: cube_single_expectile0p7_alpha0p5_gamma0p99_kappa0p7
+train_epochs: 1000
+
+dynamics:
+  subgoal_value_style: expectile
+  subgoal_value_expectile: 0.7
+  subgoal_value_alpha: 0.5
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.99
+  kappa_b: 0.7
+  kappa_d: 0.7
+
+actor:
+  spi_beta: 1.0

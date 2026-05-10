@@ -76,6 +76,17 @@ class CriticAgent(flax.struct.PyTreeNode):
             return jnp.min(qs, axis=0)
         raise ValueError(f"q_agg must be 'mean' or 'min', got {q_agg!r}")
 
+    def _critic_type(self) -> str:
+        return str(self.config.get('critic_type', 'dqc')).lower()
+
+    def _has_chunk_critic(self) -> bool:
+        """True iff ``critic_type='dqc'`` and ``use_chunk_critic`` is enabled.
+
+        IQL mode never instantiates the chunk critic, so any code path gated on this
+        flag must be skipped to avoid touching missing modules.
+        """
+        return self._critic_type() == 'dqc' and bool(self.config.get('use_chunk_critic', False))
+
     def _valid_mask(self, batch: dict) -> jnp.ndarray:
         valids = batch.get('valids', None)
         if valids is None:
@@ -115,23 +126,42 @@ class CriticAgent(flax.struct.PyTreeNode):
         }
 
     def partial_critic_loss(self, batch: dict, grad_params: dict) -> tuple[jnp.ndarray, dict]:
+        """Train the partial ``action_critic`` head.
+
+        - DQC w/ chunk_critic: target = ``aggregate(target_chunk_critic(s, g, a_full))``.
+          (chunk-to-action distillation; horizon ``H_full``.)
+        - DQC w/o chunk_critic: target = ``r_full + gamma^{H_full} * mask * V(s_{t+H_full})``.
+        - IQL: target = ``r_action + gamma^{H_action} * mask * V(s_{t+H_action})``.
+          ``value`` gradient flows here because IQL Q is regressed against the *current* V
+          rather than a separate target V; use ``stop_gradient`` only on the V output if you
+          want vanilla IQL semantics — current code keeps the existing pattern shared with
+          the DQC bootstrap branch (gradient through V) for symmetry.
+        """
         goals = batch.get('value_goals', None)
         valid_mask = self._valid_mask(batch)
+        critic_type = self._critic_type()
 
-        if bool(self.config['use_chunk_critic']):
+        if self._has_chunk_critic():
             target_logits = self.network.select('target_chunk_critic')(
                 batch['observations'], goals, batch['full_chunk_actions']
             )
             target_v = self.aggregate_ensemble_q(jax.nn.sigmoid(target_logits))
         else:
-            full_chunk_horizon = jnp.asarray(batch['full_chunk_horizon'], dtype=jnp.float32)
-            next_v_logit = self.network.select('value')(
-                batch['full_chunk_next_observations'], goals, params=grad_params
-            )
+            if critic_type == 'iql':
+                horizon_arr = jnp.asarray(batch['action_chunk_horizon_per_sample'], dtype=jnp.float32)
+                next_obs = batch['action_chunk_next_observations']
+                rewards = batch['action_chunk_rewards']
+                masks = batch['action_chunk_masks']
+            else:
+                horizon_arr = jnp.asarray(batch['full_chunk_horizon'], dtype=jnp.float32)
+                next_obs = batch['full_chunk_next_observations']
+                rewards = batch['full_chunk_rewards']
+                masks = batch['full_chunk_masks']
+            next_v_logit = self.network.select('value')(next_obs, goals, params=grad_params)
             next_v = jax.nn.sigmoid(next_v_logit)
-            target_v = jnp.asarray(batch['full_chunk_rewards'], dtype=jnp.float32) + jnp.power(
-                float(self.config['discount']), full_chunk_horizon
-            ) * jnp.asarray(batch['full_chunk_masks'], dtype=jnp.float32) * next_v
+            target_v = jnp.asarray(rewards, dtype=jnp.float32) + jnp.power(
+                float(self.config['discount']), horizon_arr
+            ) * jnp.asarray(masks, dtype=jnp.float32) * next_v
         target_v = jnp.clip(jax.lax.stop_gradient(target_v), 0.0, 1.0)
 
         q_logits = self.network.select('action_critic')(
@@ -226,15 +256,20 @@ class CriticAgent(flax.struct.PyTreeNode):
         flat_actions = actions.reshape(obs.shape[0] * num_candidates, -1)
         partial_dim = int(self.config['action_chunk_horizon']) * int(self.config['action_dim'])
         full_dim = int(self.config['full_chunk_horizon']) * int(self.config['action_dim'])
+        critic_type = self._critic_type()
         if use_partial_critic is None:
-            if flat_actions.shape[-1] == partial_dim and partial_dim != full_dim:
+            if critic_type == 'iql':
+                use_partial_critic = True
+            elif flat_actions.shape[-1] == partial_dim and partial_dim != full_dim:
                 use_partial_critic = True
             elif flat_actions.shape[-1] == full_dim and partial_dim != full_dim:
                 use_partial_critic = False
             else:
                 use_partial_critic = True
 
-        if bool(use_partial_critic) or not bool(self.config['use_chunk_critic']):
+        # IQL: never call chunk_critic (module not initialized).
+        force_partial = (critic_type == 'iql')
+        if force_partial or bool(use_partial_critic) or not bool(self.config['use_chunk_critic']):
             logits = self.network.select('action_critic')(obs_rep, goal_rep, flat_actions, params=network_params)
         else:
             logits = self.network.select('chunk_critic')(obs_rep, goal_rep, flat_actions, params=network_params)
@@ -246,7 +281,7 @@ class CriticAgent(flax.struct.PyTreeNode):
         batch = jax.tree_util.tree_map(lambda x: jnp.asarray(x), batch)
         info = {}
         total = jnp.asarray(0.0, dtype=jnp.float32)
-        if bool(self.config['use_chunk_critic']):
+        if self._has_chunk_critic():
             cl, ci = self.chunk_critic_loss(batch, grad_params)
             total = total + cl
             info.update(ci)
@@ -260,14 +295,15 @@ class CriticAgent(flax.struct.PyTreeNode):
         info['total_loss'] = total
         return total, info
 
-    @staticmethod
-    def _ema_target_critics(network: TrainState, tau: float) -> TrainState:
+    def _ema_target_critics(self, network: TrainState, tau: float) -> TrainState:
+        """EMA-update target critics. Skips ``target_chunk_critic`` when not initialized (IQL)."""
         updated = dict(network.params)
-        updated['modules_target_chunk_critic'] = jax.tree_util.tree_map(
-            lambda p, tp: p * tau + tp * (1.0 - tau),
-            updated['modules_chunk_critic'],
-            updated['modules_target_chunk_critic'],
-        )
+        if self._has_chunk_critic():
+            updated['modules_target_chunk_critic'] = jax.tree_util.tree_map(
+                lambda p, tp: p * tau + tp * (1.0 - tau),
+                updated['modules_chunk_critic'],
+                updated['modules_target_chunk_critic'],
+            )
         updated['modules_target_action_critic'] = jax.tree_util.tree_map(
             lambda p, tp: p * tau + tp * (1.0 - tau),
             updated['modules_action_critic'],
@@ -291,7 +327,7 @@ class CriticAgent(flax.struct.PyTreeNode):
         cls,
         seed: int,
         ex_observations: np.ndarray,
-        ex_full_chunk_actions: np.ndarray,
+        ex_full_chunk_actions: np.ndarray | None,
         ex_action_chunk_actions: np.ndarray,
         config: dict,
         ex_goals: np.ndarray | None = None,
@@ -299,37 +335,54 @@ class CriticAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(int(seed))
         rng, network_init_rng = jax.random.split(rng)
         ex_obs = jnp.asarray(ex_observations, dtype=jnp.float32)
-        ex_full = jnp.asarray(ex_full_chunk_actions, dtype=jnp.float32)
         ex_part = jnp.asarray(ex_action_chunk_actions, dtype=jnp.float32)
         ex_goal = jnp.asarray(ex_observations if ex_goals is None else ex_goals, dtype=jnp.float32)
 
         hdims = tuple(config['value_hidden_dims'])
         ln = bool(config['layer_norm'])
         nq = int(config['num_qs'])
+        critic_type = str(config.get('critic_type', 'dqc')).lower()
+        if critic_type not in ('dqc', 'iql'):
+            raise ValueError(f"critic_type must be 'dqc' or 'iql', got {critic_type!r}")
+
         value_def = ScalarValueNet(hdims, layer_norm=ln)
-        chunk_critic_def = BinaryChunkCritic(hdims, nq, ln)
         action_critic_def = BinaryChunkCritic(hdims, nq, ln)
         target_action_critic_def = BinaryChunkCritic(hdims, nq, ln)
-        target_chunk_critic_def = BinaryChunkCritic(hdims, nq, ln)
 
         network_info = {
-            'chunk_critic': (chunk_critic_def, (ex_obs, ex_goal, ex_full)),
-            'target_chunk_critic': (target_chunk_critic_def, (ex_obs, ex_goal, ex_full)),
             'action_critic': (action_critic_def, (ex_obs, ex_goal, ex_part)),
             'target_action_critic': (target_action_critic_def, (ex_obs, ex_goal, ex_part)),
             'value': (value_def, (ex_obs, ex_goal)),
         }
+
+        if critic_type == 'dqc':
+            if ex_full_chunk_actions is None:
+                raise ValueError(
+                    "critic_type='dqc' requires ex_full_chunk_actions for chunk_critic init."
+                )
+            ex_full = jnp.asarray(ex_full_chunk_actions, dtype=jnp.float32)
+            chunk_critic_def = BinaryChunkCritic(hdims, nq, ln)
+            target_chunk_critic_def = BinaryChunkCritic(hdims, nq, ln)
+            network_info['chunk_critic'] = (chunk_critic_def, (ex_obs, ex_goal, ex_full))
+            network_info['target_chunk_critic'] = (target_chunk_critic_def, (ex_obs, ex_goal, ex_full))
+
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
         network_def = ModuleDict(networks)
         network_params = network_def.init(network_init_rng, **network_args)['params']
-        network_params['modules_target_chunk_critic'] = network_params['modules_chunk_critic']
+        if critic_type == 'dqc':
+            network_params['modules_target_chunk_critic'] = network_params['modules_chunk_critic']
         network_params['modules_target_action_critic'] = network_params['modules_action_critic']
         network = TrainState.create(network_def, network_params, tx=optax.adam(float(config['lr'])))
         return cls(rng=rng, network=network, config=flax.core.FrozenDict(**config))
 
 
 def validate_config(critic_config, actor_config=None) -> None:
+    critic_type = str(critic_config.get('critic_type', 'dqc')).lower()
+    if critic_type not in ('dqc', 'iql'):
+        raise ValueError(f"critic_type must be 'dqc' or 'iql', got {critic_type!r}")
+    critic_config['critic_type'] = critic_type
+
     action_chunk_horizon = int(critic_config.get('action_chunk_horizon', 0))
     full_chunk_horizon = int(critic_config.get('full_chunk_horizon', 0))
     if action_chunk_horizon < 1:
@@ -339,6 +392,9 @@ def validate_config(critic_config, actor_config=None) -> None:
             f'full_chunk_horizon must be >= action_chunk_horizon, '
             f'got full_chunk_horizon={full_chunk_horizon}, action_chunk_horizon={action_chunk_horizon}.'
         )
+    if critic_type == 'iql' and bool(critic_config.get('use_chunk_critic', False)):
+        # IQL never trains chunk_critic; force the flag off so downstream branches stay sane.
+        critic_config['use_chunk_critic'] = False
     if actor_config is None:
         return
     if int(actor_config.get('actor_chunk_horizon', 0)) < 1:
@@ -363,9 +419,17 @@ def get_config():
             q_agg='mean',
             full_chunk_horizon=25,
             action_chunk_horizon=10,
+            # Match dynamics' default clip_path_to_goal semantics for critic backups:
+            # if the sampled value goal lies within the chunk window, use the goal
+            # state as next_obs, shorten backup_horizon to steps-to-goal, and set
+            # mask=0 so Q terminates at the goal.
+            clip_chunk_to_goal=True,
             value_hidden_dims=(512, 512, 512),
             discount=0.99,
             num_qs=2,
+            # 'dqc' (default): chunk_critic + partial action_critic + value (current behavior).
+            # 'iql':           action_critic + value only; Q backup uses V at s_{t+H_action}.
+            critic_type='dqc',
             use_chunk_critic=True,
             distill_method='expectile',
             kappa_d=0.7,

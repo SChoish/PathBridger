@@ -17,7 +17,14 @@ from utils.datasets import (
 
 @dataclasses.dataclass
 class CriticSequenceDataset:
-    """Samples full/action chunks without crossing episode boundaries."""
+    """Samples full/action chunks without crossing episode boundaries.
+
+    ``clip_chunk_to_goal`` (default from critic config: ``True``) mirrors the
+    dynamics dataset's ``clip_path_to_goal`` behavior for Q backups. If a sampled
+    same-trajectory value goal lies inside the backup window, the target terminates
+    at the goal: ``next_obs=s_goal``, ``backup_horizon=steps_to_goal``, and ``mask=0``.
+    Random goals or goals outside the window keep the fixed-horizon bootstrap.
+    """
 
     dataset: Dataset
     config: Any
@@ -56,10 +63,17 @@ class CriticSequenceDataset:
         self.full_offsets = np.arange(self.full_chunk_horizon, dtype=np.int64)
         self.action_offsets = np.arange(self.action_chunk_horizon, dtype=np.int64)
         self.discount_pows = np.power(float(self.config['discount']), self.full_offsets.astype(np.float32))
+        # Per-step discount over the *partial* action-chunk window (used by chunk-IQL Q backup).
+        self.action_discount_pows = np.power(
+            float(self.config['discount']), self.action_offsets.astype(np.float32)
+        )
         self.valids_template = np.ones((self.action_chunk_horizon,), dtype=np.float32)
         self.full_chunk_horizon_template = np.full((1,), self.full_chunk_horizon, dtype=np.float32)
-        # valid_starts guarantee no terminal inside full chunk; masks are always ones.
+        self.action_chunk_horizon_template = np.full((1,), self.action_chunk_horizon, dtype=np.float32)
+        self.clip_chunk_to_goal = bool(self.config.get('clip_chunk_to_goal', True))
+        # valid_starts guarantee no terminal inside full chunk; default masks are ones.
         self.full_chunk_masks_template = np.ones((1,), dtype=np.float32)
+        self.action_chunk_masks_template = np.ones((1,), dtype=np.float32)
 
         if self.config.get('frame_stack') is not None:
             assert 'next_observations' not in self.dataset
@@ -85,6 +99,41 @@ class CriticSequenceDataset:
 
     def _build_full_chunk_indices(self, idxs: np.ndarray) -> np.ndarray:
         return idxs[:, None] + self.full_offsets[None, :]
+
+    def _chunk_backup(
+        self,
+        idxs: np.ndarray,
+        value_goal_idxs: np.ndarray,
+        *,
+        horizon: int,
+        discount_pows: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Build clipped or fixed-horizon GC backup fields for one chunk horizon.
+
+        The reward window is ``k = 0 .. horizon-1``. A goal at ``t+horizon`` is
+        therefore not considered reached by this chunk; it is handled by the
+        bootstrap value at ``s_{t+horizon}``.
+        """
+        offsets = np.arange(int(horizon), dtype=np.int64)[None, :]
+        chunk_idxs = idxs[:, None] + offsets
+        success_steps = (chunk_idxs == value_goal_idxs[:, None]).astype(np.float32)
+        reward_offset = 1.0 if bool(self.config.get('gc_negative', True)) else 0.0
+        step_rewards = success_steps - reward_offset
+        rewards = np.sum(step_rewards * discount_pows[None, :], axis=1).astype(np.float32)
+
+        if self.clip_chunk_to_goal:
+            goal_offsets = value_goal_idxs - idxs
+            reached = (0 <= goal_offsets) & (goal_offsets < int(horizon))
+            backup_horizon = np.where(reached, goal_offsets, int(horizon)).astype(np.float32)
+            next_idxs = np.where(reached, value_goal_idxs, idxs + int(horizon)).astype(np.int64)
+            masks = (1.0 - reached.astype(np.float32)).astype(np.float32)
+        else:
+            backup_horizon = np.full((idxs.shape[0],), int(horizon), dtype=np.float32)
+            next_idxs = (idxs + int(horizon)).astype(np.int64)
+            masks = np.ones((idxs.shape[0],), dtype=np.float32)
+
+        next_observations = np.asarray(self.get_observations(next_idxs), dtype=np.float32)
+        return rewards, next_observations, backup_horizon, masks
 
     def sample_goals(self, idxs):
         batch_size = len(idxs)
@@ -136,16 +185,25 @@ class CriticSequenceDataset:
 
         value_goal_idxs = self.sample_goals(idxs)
         value_goals = np.asarray(self.get_observations(value_goal_idxs), dtype=np.float32)
-        success_steps = (full_idx == value_goal_idxs[:, None]).astype(np.float32)
-        reward_offset = 1.0 if bool(self.config.get('gc_negative', True)) else 0.0
-        step_rewards = success_steps - reward_offset
-        full_chunk_rewards = np.sum(step_rewards * self.discount_pows[None, :], axis=1).astype(np.float32)
-
-        full_chunk_masks = np.repeat(self.full_chunk_masks_template, idxs.shape[0]).astype(np.float32)
-        full_chunk_next_observations = np.asarray(
-            self.get_observations(idxs + self.full_chunk_horizon), dtype=np.float32
+        full_chunk_rewards, full_chunk_next_observations, full_chunk_horizon, full_chunk_masks = (
+            self._chunk_backup(
+                idxs,
+                value_goal_idxs,
+                horizon=self.full_chunk_horizon,
+                discount_pows=self.discount_pows,
+            )
         )
-        full_chunk_horizon = np.repeat(self.full_chunk_horizon_template, idxs.shape[0]).astype(np.float32)
+        # Partial-window (action-chunk) backup quantities. Always emitted so the critic
+        # can switch between full-chunk (DQC) and action-chunk (IQL) horizons without
+        # re-sampling.
+        action_chunk_rewards, action_chunk_next_observations, action_chunk_horizon_per_sample, action_chunk_masks = (
+            self._chunk_backup(
+                idxs,
+                value_goal_idxs,
+                horizon=self.action_chunk_horizon,
+                discount_pows=self.action_discount_pows,
+            )
+        )
         valids = np.repeat(self.valids_template[None, :], idxs.shape[0], axis=0).astype(np.float32)
 
         batch = {
@@ -159,9 +217,22 @@ class CriticSequenceDataset:
             'full_chunk_rewards': full_chunk_rewards,
             'full_chunk_masks': full_chunk_masks,
             'full_chunk_horizon': full_chunk_horizon,
+            'action_chunk_next_observations': action_chunk_next_observations,
+            'action_chunk_rewards': action_chunk_rewards,
+            'action_chunk_masks': action_chunk_masks,
+            'action_chunk_horizon_per_sample': action_chunk_horizon_per_sample,
             'valids': valids,
         }
 
         if not evaluation:
-            self.augment(batch, ['observations', 'next_observations', 'value_goals', 'full_chunk_next_observations'])
+            self.augment(
+                batch,
+                [
+                    'observations',
+                    'next_observations',
+                    'value_goals',
+                    'full_chunk_next_observations',
+                    'action_chunk_next_observations',
+                ],
+            )
         return batch

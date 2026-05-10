@@ -1,0 +1,27 @@
+# Linear-SDE dynamics + chunk-IQL critic + actor offline training.
+# Same hyperparameters as the expectile cube_single ablation, but the critic
+# trains a single action-chunk Q (no chunk_critic) with IQL-style backup:
+#   Q(s, g, a_chunk_5) <- r_chunk + gamma^5 * mask * V(s_{t+5})
+#   V(s, g) <- expectile_kappa_b of target_action_critic.
+
+env_name: cube-single-play-v0
+run_group: cube_single_iql_expectile0p7_alpha0p5_gamma0p99_kappa0p7
+train_epochs: 1000
+
+dynamics:
+  subgoal_value_style: expectile
+  subgoal_value_expectile: 0.7
+  subgoal_value_alpha: 0.5
+
+critic_agent:
+  critic_type: iql
+  use_chunk_critic: false
+  action_chunk_horizon: 5
+  discount: 0.99
+  kappa_b: 0.7
+  kappa_d: 0.5     # IQL-style: vanilla Q backup (no AWR-asymmetry on Q).
+  distill_method: expectile
+  implicit_backup_type: expectile
+
+actor:
+  spi_beta: 1.0

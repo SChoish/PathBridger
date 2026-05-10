@@ -82,6 +82,8 @@ dynamics:
 | `subgoal_distribution` | `deterministic` | hard-bridge sweep은 deterministic point subgoal. 분포 학습 ablation에서는 `diag_gaussian` |
 | `subgoal_loss_weight` | `1.0` | subgoal MSE/value loss 가중치 |
 | `subgoal_value_alpha` | `0.5` | subgoal loss의 $V(\hat s_g, g)$ critic value bonus 계수. `0`이면 비활성화 |
+| `subgoal_value_style` | `exponential` | subgoal MSE value-gap weight 방식. `exponential`은 기존 $\exp(c\Delta V)$, `expectile`은 $\Delta V>0$이면 `subgoal_value_expectile`, 아니면 `1-subgoal_value_expectile` |
+| `subgoal_value_expectile` | `0.7` | `subgoal_value_style=expectile`일 때 양의 value gap에 주는 MSE weight |
 | `subgoal_value_gap_scale` | `1.0` | subgoal MSE 앞의 $\exp(c(V(\hat s_{s+K}, g) - V(s, g)))$에서 value gap scale $c$ |
 | `subgoal_num_samples` | `1` | `diag_gaussian` planning에서 뽑을 subgoal endpoint 수 `U` |
 | `subgoal_temperature` | `1.0` | `diag_gaussian` subgoal sampling std multiplier |
@@ -194,7 +196,7 @@ Dynamics agent는 다음 손실을 함께 학습합니다.
 - `phase1/loss_dynamics`: reverse mean matching (또는 `forward_bridge*` 모드의 forward bridge mean matching)
 - `phase1/loss_path_step`: dataset segment와 step-aligned path loss
 - `phase1/loss_roll`: short rollout consistency
-- `phase1/loss_subgoal`: deterministic은 value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 reparameterized sample에 대해 `exp(c * (V(sample, g) - V(s, g))) * MSE(sample, target) - alpha * V(sample, g)`를 쓰고, mean MSE/NLL/std는 진단으로 로깅
+- `phase1/loss_subgoal`: deterministic은 target-value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 reparameterized sample에 대해 `stopgrad(w(Delta V)) * MSE(sample, target) - alpha * V(sample, g)`를 쓰고, mean MSE/NLL/std는 진단으로 로깅. `subgoal_value_style=exponential`이면 기존처럼 `w(Delta V)=exp(c * (V(target, g) - V(s, g)))`, `expectile`이면 gap이 양수일 때 `subgoal_value_expectile`, 그 외에는 `1-subgoal_value_expectile`
 - `phase1/loss_idm`: embedded inverse dynamics MSE
 
 Critic + SPI actor:

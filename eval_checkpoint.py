@@ -85,6 +85,23 @@ def main() -> None:
         help='Env-eval IDM: env steps per replan (passed as critic_config action_chunk_horizon only for _evaluate_env_tasks).',
     )
     p.add_argument('--mujoco_gl', type=str, default='', metavar='BACKEND')
+    p.add_argument(
+        '--subgoal_filter',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='If V(predicted_subgoal, goal) <= V(current_state, goal) and V(current_state, predicted_subgoal) > R, replace goal-representation channels.',
+    )
+    p.add_argument(
+        '--subgoal_filter_threshold',
+        type=float,
+        default=0.5,
+        help='Reachability threshold R for value filtering, applied to sigmoid V(current_state, predicted_subgoal).',
+    )
+    p.add_argument(
+        '--subgoal_override_goal',
+        action='store_true',
+        help='Ablation: ignore predicted subgoals and use the final goal for both IDM and actor.',
+    )
     args = p.parse_args()
 
     if str(args.mujoco_gl).strip():
@@ -155,6 +172,9 @@ def main() -> None:
     print(
         f'eval task_ids={task_ids} episodes_per_task={ep_task} max_chunks={max_chunks} '
         f'idm_action_chunk_horizon={idm_h} '
+        f'subgoal_filter={bool(args.subgoal_filter)} '
+        f'subgoal_filter_threshold={float(args.subgoal_filter_threshold):.4f} '
+        f'subgoal_override_goal={bool(args.subgoal_override_goal)} '
         f'(training critic had {int(critic_config["action_chunk_horizon"])})'
     )
 
@@ -172,6 +192,9 @@ def main() -> None:
         video_frame_skip=4,
         video_fps=15,
         wandb_enabled=False,
+        subgoal_filter=bool(args.subgoal_filter),
+        subgoal_filter_threshold=float(args.subgoal_filter_threshold),
+        subgoal_override_goal=bool(args.subgoal_override_goal),
     )
     print('--- IDM --- (success = any step info["success"])')
     print(f"eval_idm/success_rate_mean={metrics.get('eval_idm/success_rate_mean', float('nan')):.4f}")
@@ -185,6 +208,25 @@ def main() -> None:
         k = f'eval/task_{tid}/success_rate'
         if k in metrics:
             print(f'  {k}={metrics[k]:.4f}')
+    print('--- Subgoal Filter ---')
+    print(
+        'eval/subgoal_filter/ratio='
+        f"{metrics.get('eval/subgoal_filter/ratio', float('nan')):.4f} "
+        f"({int(metrics.get('eval/subgoal_filter/filtered_count', 0))}/"
+        f"{int(metrics.get('eval/subgoal_filter/total_count', 0))})"
+    )
+    print(
+        '  eval/subgoal_filter/actor_ratio='
+        f"{metrics.get('eval/subgoal_filter/actor_ratio', float('nan')):.4f} "
+        f"({int(metrics.get('eval/subgoal_filter/actor_filtered_count', 0))}/"
+        f"{int(metrics.get('eval/subgoal_filter/actor_total_count', 0))})"
+    )
+    print(
+        '  eval/subgoal_filter/idm_ratio='
+        f"{metrics.get('eval/subgoal_filter/idm_ratio', float('nan')):.4f} "
+        f"({int(metrics.get('eval/subgoal_filter/idm_filtered_count', 0))}/"
+        f"{int(metrics.get('eval/subgoal_filter/idm_total_count', 0))})"
+    )
 
 
 if __name__ == '__main__':

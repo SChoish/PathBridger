@@ -25,6 +25,7 @@ from rollout.env import env_render_rgb_u8
 
 SampleActionChunk = Callable[[np.ndarray, np.ndarray], np.ndarray]
 PreChunkHook = Callable[[np.ndarray, np.ndarray], None]
+SubgoalFilter = Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]
 
 
 @dataclass
@@ -115,7 +116,11 @@ def run_chunked_episode(
     )
 
 
-def make_idm_chunk_fn(dynamics_agent: Any, idm_horizon: int) -> SampleActionChunk:
+def make_idm_chunk_fn(
+    dynamics_agent: Any,
+    idm_horizon: int,
+    subgoal_filter: SubgoalFilter | None = None,
+) -> SampleActionChunk:
     """Return ``(obs, goal) -> action_chunk`` using dynamics ``infer_subgoal`` + IDM."""
     from main import _idm_action_chunk
 
@@ -123,6 +128,8 @@ def make_idm_chunk_fn(dynamics_agent: Any, idm_horizon: int) -> SampleActionChun
         s = jnp.asarray(obs, dtype=jnp.float32)
         g = jnp.asarray(goal, dtype=jnp.float32)
         pred = np.asarray(jax.device_get(dynamics_agent.infer_subgoal(s, g)), dtype=np.float32).reshape(-1)
+        if subgoal_filter is not None:
+            pred = np.asarray(subgoal_filter(obs, pred, goal), dtype=np.float32).reshape(-1)
         return _idm_action_chunk(dynamics_agent, np.asarray(obs, dtype=np.float32).reshape(-1), pred, int(idm_horizon))
 
     return _chunk
@@ -133,6 +140,7 @@ def make_actor_chunk_fn(
     actor_agent: Any,
     actor_horizon: int,
     env_action_dim: int,
+    subgoal_filter: SubgoalFilter | None = None,
 ) -> SampleActionChunk:
     """Return ``(obs, goal) -> action_chunk`` using dynamics subgoal + actor."""
 
@@ -140,6 +148,8 @@ def make_actor_chunk_fn(
         s = jnp.asarray(obs, dtype=jnp.float32)
         g = jnp.asarray(goal, dtype=jnp.float32)
         pred = np.asarray(jax.device_get(dynamics_agent.infer_subgoal(s, g)), dtype=np.float32).reshape(-1)
+        if subgoal_filter is not None:
+            pred = np.asarray(subgoal_filter(obs, pred, goal), dtype=np.float32).reshape(-1)
         chunk = np.asarray(
             jax.device_get(actor_agent.sample_actions(s, jnp.asarray(pred, dtype=jnp.float32))),
             dtype=np.float32,

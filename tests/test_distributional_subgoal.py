@@ -49,6 +49,7 @@ def _make_dynamics_agent(
     subgoal_distribution: str,
     bridge_gamma_inv: float = 0.0,
     subgoal_num_samples: int = 1,
+    config_updates: dict | None = None,
 ):
     cfg = get_dynamics_config()
     cfg.dynamics_N = 4
@@ -61,6 +62,9 @@ def _make_dynamics_agent(
     cfg.subgoal_hidden_dims = (32, 32)
     cfg.subgoal_value_hidden_dims = (32, 32)
     cfg.idm_hidden_dims = (32, 32)
+    if config_updates:
+        for key, value in config_updates.items():
+            cfg[key] = value
     ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
     ex_act = np.zeros((BATCH, ACTION_DIM), dtype=np.float32)
     return DynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
@@ -309,9 +313,12 @@ def test_distributional_subgoal_loss_is_finite():
     # Required new keys are present.
     for required in (
         'phase1/subgoal_nll',
+        'phase1/subgoal_stochastic_loss',
+        'phase1/subgoal_stochastic_loss_mode',
         'phase1/subgoal_mean_mse',
         'phase1/subgoal_sample_mse',
         'phase1/subgoal_weighted_mse',
+        'phase1/subgoal_weighted_nll',
         'phase1/subgoal_current_value_mean',
         'phase1/subgoal_mse_weight_mean',
         'phase1/subgoal_std_mean',
@@ -323,6 +330,22 @@ def test_distributional_subgoal_loss_is_finite():
         assert required in info, f'missing log key {required}'
     # subgoal_mode == 1.0 in diag_gaussian mode.
     assert float(info['phase1/subgoal_mode']) == 1.0
+    assert float(info['phase1/subgoal_stochastic_loss_mode']) == 0.0
+
+
+def test_distributional_subgoal_nll_loss_option_is_finite():
+    agent = _make_dynamics_agent('diag_gaussian', config_updates={'subgoal_stochastic_loss': 'nll'})
+    batch = _make_phase1_batch()
+    _, info = agent.update(batch, critic_value_params=None)
+    for k, v in info.items():
+        assert np.all(np.isfinite(np.asarray(v))), f'non-finite log value at {k}: {v}'
+    assert float(info['phase1/subgoal_stochastic_loss_mode']) == 1.0
+    np.testing.assert_allclose(
+        np.asarray(info['phase1/subgoal_stochastic_loss']),
+        np.asarray(info['phase1/subgoal_weighted_nll']),
+        rtol=1e-5,
+        atol=1e-6,
+    )
 
 
 def test_deterministic_subgoal_loss_is_finite_and_logs_are_stable():
@@ -334,6 +357,21 @@ def test_deterministic_subgoal_loss_is_finite_and_logs_are_stable():
     # In deterministic mode the new metrics should be zero placeholders.
     assert float(info['phase1/subgoal_mode']) == 0.0
     assert float(info['phase1/subgoal_nll']) == 0.0
+    assert float(info['phase1/subgoal_stochastic_loss_mode']) == 0.0
+
+
+def test_subgoal_expectile_value_style_weights_by_gap_sign():
+    agent = _make_dynamics_agent(
+        'deterministic',
+        config_updates={
+            'subgoal_value_style': 'expectile',
+            'subgoal_value_alpha': 0.1,
+            'subgoal_value_expectile': 0.3,
+        },
+    )
+    gap = jnp.asarray([0.2, -0.1, 0.0], dtype=jnp.float32)
+    weight = agent._subgoal_mse_weight_from_gap(gap)
+    np.testing.assert_allclose(np.asarray(weight), np.asarray([0.3, 0.7, 0.7]), rtol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -343,9 +381,21 @@ def test_deterministic_subgoal_loss_is_finite_and_logs_are_stable():
 def test_dynamics_config_defaults_are_usable():
     cfg = get_dynamics_config()
     assert str(cfg.subgoal_distribution) == 'deterministic'
+    assert str(cfg.subgoal_stochastic_loss) == 'mse'
     assert bool(cfg.subgoal_use_mean_for_actor_goal) is True
     assert int(cfg.subgoal_num_samples) == 1
+    assert str(cfg.subgoal_value_style) == 'exponential'
+    assert float(cfg.subgoal_value_expectile) == 0.7
     assert float(cfg.subgoal_value_gap_scale) == 1.0
+
+
+def test_invalid_subgoal_stochastic_loss_rejected():
+    raised = False
+    try:
+        _make_dynamics_agent('diag_gaussian', config_updates={'subgoal_stochastic_loss': 'bad'})
+    except ValueError:
+        raised = True
+    assert raised
 
 
 if __name__ == '__main__':

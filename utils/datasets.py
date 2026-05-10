@@ -438,12 +438,13 @@ class PathHGCDataset(HGCDataset):
     (does not cross ``terminals``). ``high_actor_targets`` is overwritten to match
     ``trajectory_segment[:, -1]`` so the bridge endpoint and segment tail stay consistent.
 
-    The optional ``clip_path_to_goal`` config flag controls behaviour near the episode goal:
+    The optional ``clip_path_to_goal`` config flag controls behaviour near the episode goal
+    (the dynamics-agent default is ``True``):
 
-    - ``False`` (default): segment endpoint is always ``s_{t+K}`` regardless of where
+    - ``False``: segment endpoint is always ``s_{t+K}`` regardless of where
       the sampled goal ``s_{t_g}`` is. Subgoal_net teacher is ``s_{t+K}`` so it may "overshoot"
       past close goals.
-    - ``True``: per-row endpoint becomes ``s_{min(t+K, t_g)}``; segment tail past ``t_g`` is
+    - ``True`` (default): per-row endpoint becomes ``s_{min(t+K, t_g)}``; segment tail past ``t_g`` is
       padded with ``s_{t_g}``. Both the dynamics bridge and the subgoal_net teacher then learn
       to "arrive and stay" at close goals, keeping inference subgoals in-distribution.
 

@@ -467,6 +467,106 @@ def overlay_rgb_frames_obs2d_panel(
     return np.stack(out_frames, axis=0)
 
 
+def compose_state_subgoal_env_frames(
+    state_frames: np.ndarray,
+    subgoal_frames: np.ndarray,
+    *,
+    output_scale: float = 1.0,
+    label_left: str | None = 'state',
+    label_right: str | None = 'subgoal',
+    label_pad: int = 4,
+    label_font_size: int = 14,
+) -> np.ndarray:
+    """Stack two same-length env-render streams horizontally into a single RGB video.
+
+    ``state_frames`` and ``subgoal_frames`` are uint8 ``(T, H, W, 3)`` arrays. If their per-frame
+    sizes differ, the right panel is resized to match the left panel's height. A small label
+    bar is drawn above each panel when ``label_left`` / ``label_right`` are non-empty (best-effort
+    PIL; falls back to no labels if PIL is unavailable).
+    """
+    if state_frames.ndim != 4 or state_frames.shape[-1] != 3:
+        raise ValueError(f'Expected uint8 state_frames (T,H,W,3), got {state_frames.shape}')
+    if subgoal_frames.ndim != 4 or subgoal_frames.shape[-1] != 3:
+        raise ValueError(f'Expected uint8 subgoal_frames (T,H,W,3), got {subgoal_frames.shape}')
+    T_left = int(state_frames.shape[0])
+    T_right = int(subgoal_frames.shape[0])
+    if T_left != T_right:
+        raise ValueError(f'state/subgoal frame counts must match, got {T_left} vs {T_right}.')
+    if T_left == 0:
+        return np.zeros((0, 1, 2, 3), dtype=np.uint8)
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        pil_ok = True
+    except ImportError:
+        pil_ok = False
+
+    H_left = int(state_frames.shape[1])
+    if int(subgoal_frames.shape[1]) != H_left and pil_ok:
+        target_w = int(round(int(subgoal_frames.shape[2]) * H_left / int(subgoal_frames.shape[1])))
+        resized: list[np.ndarray] = []
+        for t in range(T_right):
+            resized.append(
+                np.asarray(
+                    Image.fromarray(subgoal_frames[t]).resize((target_w, H_left), Image.Resampling.LANCZOS),
+                    dtype=np.uint8,
+                )
+            )
+        subgoal_frames = np.stack(resized, axis=0)
+
+    show_labels = bool(label_left or label_right) and pil_ok
+    label_h = 0
+    font = None
+    if show_labels:
+        for fp in (
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+        ):
+            try:
+                font = ImageFont.truetype(fp, int(label_font_size))
+                break
+            except OSError:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        label_h = int(label_font_size) + 2 * int(label_pad)
+
+    out = []
+    for t in range(T_left):
+        left = state_frames[t]
+        right = subgoal_frames[t]
+        body = np.concatenate([left, right], axis=1)
+        if show_labels:
+            full = np.full((label_h + body.shape[0], body.shape[1], 3), 22, dtype=np.uint8)
+            full[label_h:] = body
+            img = Image.fromarray(full)
+            draw = ImageDraw.Draw(img)
+            if label_left:
+                draw.text((int(label_pad), int(label_pad)), str(label_left), fill=(240, 240, 245), font=font)
+            if label_right:
+                draw.text(
+                    (int(left.shape[1]) + int(label_pad), int(label_pad)),
+                    str(label_right),
+                    fill=(240, 240, 245),
+                    font=font,
+                )
+            body = np.asarray(img, dtype=np.uint8)
+        if float(output_scale) > 1.0 and pil_ok:
+            ch, cw, _ = body.shape
+            up_w = max(int(round(cw * float(output_scale))), cw)
+            up_h = max(int(round(ch * float(output_scale))), ch)
+            if up_w % 2 == 1:
+                up_w += 1
+            if up_h % 2 == 1:
+                up_h += 1
+            body = np.asarray(
+                Image.fromarray(body).resize((up_w, up_h), Image.Resampling.LANCZOS), dtype=np.uint8
+            )
+        out.append(body)
+    return np.stack(out, axis=0)
+
+
 def overlay_rgb_frames_english_caption(
     frames: np.ndarray,
     lines: list[str],

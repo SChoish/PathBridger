@@ -1,0 +1,27 @@
+# Linear-SDE dynamics + critic + actor offline training.
+# Cube-single ablation off cube_single_gaussian_u4_alpha0p3_tau5_kb0p7_neg_nll:
+#   - Same U=4 diag-Gaussian NLL setup.
+#   - Increase exponential subgoal value-gap scale from 1.0 to 5.0.
+
+env_name: cube-single-play-v0
+run_group: cube_single_gaussian_u4_alpha0p3_gap5_tau5_kb0p7_neg_nll
+train_epochs: 1000
+plan_candidates: 1
+
+dynamics:
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 4
+  subgoal_value_alpha: 0.3
+  subgoal_value_gap_scale: 5.0
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.995
+  kappa_b: 0.7
+  kappa_d: 0.8
+  gc_negative: true
+
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0

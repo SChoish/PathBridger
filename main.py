@@ -38,6 +38,7 @@ from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from utils.ogbench_eval_rollout import rollout_chunked_eval_episode
 from utils.run_io import parse_int_list
+from utils.subgoal_filter import make_value_subgoal_filter_from_params
 
 FLAGS = flags.FLAGS
 _DEFAULT_HORIZON = 25
@@ -90,12 +91,12 @@ flags.DEFINE_boolean(
 flags.DEFINE_string('run_group', 'Debug', 'W&B group.')
 flags.DEFINE_integer('seed', 0, 'Seed.')
 flags.DEFINE_string('env_name', 'antmaze-medium-navigate-v0', 'OGBench env / dataset name.')
-flags.DEFINE_integer('train_epochs', 10, 'Training epochs.')
-flags.DEFINE_integer('log_every_n_epochs', 1, 'Log interval (epochs).')
+flags.DEFINE_integer('train_epochs', 1000, 'Training epochs.')
+flags.DEFINE_integer('log_every_n_epochs', 10, 'Log interval (epochs).')
 flags.DEFINE_integer('save_every_n_epochs', 100, 'Checkpoint interval.')
 flags.DEFINE_boolean('use_wandb', False, 'W&B.')
 flags.DEFINE_boolean('use_tqdm', False, 'tqdm over epochs.')
-flags.DEFINE_integer('batch_size', 256, 'Shared batch size for dynamics, critic, and actor.')
+flags.DEFINE_integer('batch_size', 1024, 'Shared batch size for dynamics, critic, and actor.')
 flags.DEFINE_integer(
     'horizon', _DEFAULT_HORIZON, 'Shared horizon for dynamics_N, subgoal_steps, and full_chunk_horizon.'
 )
@@ -132,6 +133,21 @@ flags.DEFINE_integer(
     'Save env.render() every N env steps during video episodes (plus last frame when done).',
 )
 flags.DEFINE_integer('eval_video_fps', 15, 'FPS for W&B eval videos built from eval_video_episodes_per_task.')
+flags.DEFINE_boolean(
+    'subgoal_filter',
+    True,
+    'Inference/eval only: if V(predicted_subgoal, goal) <= V(current_state, goal) and V(current_state, predicted_subgoal) > subgoal_filter_threshold, replace goal-representation channels. Use --nosubgoal_filter to disable.',
+)
+flags.DEFINE_float(
+    'subgoal_filter_threshold',
+    0.5,
+    'Reachability threshold R for value filtering, applied to sigmoid V(current_state, predicted_subgoal).',
+)
+flags.DEFINE_boolean(
+    'subgoal_override_goal',
+    False,
+    'Inference/eval ablation: ignore predicted subgoals and condition IDM/actor directly on the final goal.',
+)
 
 _SPI_ACTOR_KEYS = {
     'spi_tau',
@@ -753,10 +769,12 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
 
 
 def _create_critic_agent(seed: int, ex: dict, critic_config):
+    critic_type = str(critic_config.get('critic_type', 'dqc')).lower()
+    ex_full = ex['full_chunk_actions'] if critic_type == 'dqc' else None
     return CriticAgent.create(
         seed,
         ex['observations'],
-        ex['full_chunk_actions'],
+        ex_full,
         ex['action_chunk_actions'],
         critic_config,
         ex_goals=ex.get('value_goals'),
@@ -806,6 +824,9 @@ def _evaluate_env_tasks(
     video_frame_skip: int = 4,
     video_fps: int = 15,
     wandb_enabled: bool = False,
+    subgoal_filter: bool = True,
+    subgoal_filter_threshold: float = 0.5,
+    subgoal_override_goal: bool = False,
 ) -> dict[str, Any]:
     """OGBench-style eval: success is decided **only** by ``info['success']`` (any step). No tolerance diagnostic."""
     if not task_ids:
@@ -830,13 +851,46 @@ def _evaluate_env_tasks(
 
     actor_video_by_task: dict[int, np.ndarray] = {}
     idm_video_by_task: dict[int, np.ndarray] = {}
+    value_subgoal_filter = (
+        make_value_subgoal_filter_from_params(
+            critic_config,
+            critic_value_params,
+            reachability_threshold=float(subgoal_filter_threshold),
+        )
+        if bool(subgoal_filter)
+        else None
+    )
+    actor_filter_count = 0
+    actor_filter_total = 0
+    idm_filter_count = 0
+    idm_filter_total = 0
+
+    def _reset_subgoal_filter_stats() -> None:
+        if value_subgoal_filter is not None and hasattr(value_subgoal_filter, 'reset_stats'):
+            value_subgoal_filter.reset_stats()
+
+    def _read_subgoal_filter_stats() -> tuple[int, int]:
+        if value_subgoal_filter is None or not hasattr(value_subgoal_filter, 'get_stats'):
+            return 0, 0
+        st = value_subgoal_filter.get_stats()
+        return int(st.get('filtered', 0)), int(st.get('total', 0))
 
     def _actor_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
-        pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+        if bool(subgoal_override_goal):
+            pred = np.asarray(goal, dtype=np.float32).reshape(-1)
+        else:
+            pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+        if (not bool(subgoal_override_goal)) and value_subgoal_filter is not None:
+            pred = np.asarray(value_subgoal_filter(obs, pred, goal), dtype=np.float32).reshape(-1)
         return np.asarray(actor_agent.sample_actions(obs, pred), dtype=np.float32).reshape(actor_horizon, -1)
 
     def _idm_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
-        pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+        if bool(subgoal_override_goal):
+            pred = np.asarray(goal, dtype=np.float32).reshape(-1)
+        else:
+            pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+        if (not bool(subgoal_override_goal)) and value_subgoal_filter is not None:
+            pred = np.asarray(value_subgoal_filter(obs, pred, goal), dtype=np.float32).reshape(-1)
         return _idm_action_chunk(dynamics_agent, obs, pred, idm_horizon)
 
     for task_id in task_ids:
@@ -859,6 +913,7 @@ def _evaluate_env_tasks(
             record_wb = bool(wandb_enabled and should_render and num_video > 0 and ep_ix == num_eval)
             actor_buf: list[np.ndarray] = [] if record_wb else []
 
+            _reset_subgoal_filter_stats()
             ok_env = rollout_chunked_eval_episode(
                 env,
                 obs,
@@ -874,6 +929,9 @@ def _evaluate_env_tasks(
             )
             if count_stats:
                 actor_episode_successes.append(1.0 if ok_env else 0.0)
+                filtered, total = _read_subgoal_filter_stats()
+                actor_filter_count += filtered
+                actor_filter_total += total
             if record_wb and actor_buf:
                 actor_video_by_task[int(task_id)] = np.stack(actor_buf, axis=0)
 
@@ -887,6 +945,7 @@ def _evaluate_env_tasks(
                 goal_frame = np.asarray(goal_frame, dtype=np.uint8)
 
             idm_buf: list[np.ndarray] = [] if record_wb else []
+            _reset_subgoal_filter_stats()
             ok_env_i = rollout_chunked_eval_episode(
                 env,
                 obs,
@@ -902,6 +961,9 @@ def _evaluate_env_tasks(
             )
             if count_stats:
                 idm_episode_successes.append(1.0 if ok_env_i else 0.0)
+                filtered, total = _read_subgoal_filter_stats()
+                idm_filter_count += filtered
+                idm_filter_total += total
             if record_wb and idm_buf:
                 idm_video_by_task[int(task_id)] = np.stack(idm_buf, axis=0)
 
@@ -923,6 +985,23 @@ def _evaluate_env_tasks(
     metrics['eval/episodes_per_task'] = float(num_eval)
     metrics['eval/video_episodes_per_task'] = float(num_video)
     metrics['eval/total_episodes_per_task'] = float(total_eps)
+    total_filter_count = actor_filter_count + idm_filter_count
+    total_filter_estimates = actor_filter_total + idm_filter_total
+    metrics['eval/subgoal_filter/actor_filtered_count'] = float(actor_filter_count)
+    metrics['eval/subgoal_filter/actor_total_count'] = float(actor_filter_total)
+    metrics['eval/subgoal_filter/actor_ratio'] = (
+        float(actor_filter_count / actor_filter_total) if actor_filter_total > 0 else 0.0
+    )
+    metrics['eval/subgoal_filter/idm_filtered_count'] = float(idm_filter_count)
+    metrics['eval/subgoal_filter/idm_total_count'] = float(idm_filter_total)
+    metrics['eval/subgoal_filter/idm_ratio'] = (
+        float(idm_filter_count / idm_filter_total) if idm_filter_total > 0 else 0.0
+    )
+    metrics['eval/subgoal_filter/filtered_count'] = float(total_filter_count)
+    metrics['eval/subgoal_filter/total_count'] = float(total_filter_estimates)
+    metrics['eval/subgoal_filter/ratio'] = (
+        float(total_filter_count / total_filter_estimates) if total_filter_estimates > 0 else 0.0
+    )
 
     if wandb_enabled and num_video > 0 and len(actor_video_by_task) == len(task_ids) == len(idm_video_by_task):
         n_cols = max(1, len(task_ids))
@@ -1095,14 +1174,17 @@ def main(_):
         float(dynamics_config.get('dynamics_beta_max', 0.0)),
     )
     run_logger.info(
-        'subgoal mode=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_gap_scale=%.4g use_mean_for_actor_goal=%s',
+        'subgoal mode=%s stochastic_loss=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_style=%s value_expectile=%.4g value_gap_scale=%.4g use_mean_for_actor_goal=%s',
         str(dynamics_config.get('subgoal_distribution', '')),
+        str(dynamics_config.get('subgoal_stochastic_loss', 'mse')),
         int(dynamics_config.get('subgoal_steps', 0)),
         int(dynamics_config.get('subgoal_num_samples', 1)),
         int(FLAGS.plan_candidates),
         int(dynamics_config.get('subgoal_num_samples', 1)) * int(FLAGS.plan_candidates),
         float(dynamics_config.get('subgoal_temperature', 0.0)),
         float(dynamics_config.get('subgoal_value_alpha', 0.0)),
+        str(dynamics_config.get('subgoal_value_style', 'exponential')),
+        float(dynamics_config.get('subgoal_value_expectile', 0.7)),
         float(dynamics_config.get('subgoal_value_gap_scale', 1.0)),
         bool(dynamics_config.get('subgoal_use_mean_for_actor_goal', True)),
     )
@@ -1116,13 +1198,19 @@ def main(_):
         float(dynamics_config.get('rollout_loss_weight', 0.0)),
     )
     run_logger.info(
-        'critic_actor critic_chunk_h=%d action_chunk_h=%d spi_tau=%.4g spi_beta=%.4g q_agg=%s expectile=%.4g discount=%.4g',
+        'critic_actor type=%s use_chunk_critic=%s critic_chunk_h=%d action_chunk_h=%d spi_tau=%.4g spi_beta=%.4g '
+        'q_agg=%s distill=%s kappa_d=%.4g implicit_backup=%s kappa_b=%.4g discount=%.4g',
+        str(critic_config.get('critic_type', 'dqc')),
+        str(bool(critic_config.get('use_chunk_critic', False))),
         int(critic_config.get('full_chunk_horizon', 0)),
         int(critic_config.get('action_chunk_horizon', 0)),
         float(actor_config.get('spi_tau', 0.0)),
         float(actor_config.get('spi_beta', 0.0)),
         str(critic_config.get('q_agg', '')),
-        float(critic_config.get('expectile', 0.0)),
+        str(critic_config.get('distill_method', '')),
+        float(critic_config.get('kappa_d', 0.0)),
+        str(critic_config.get('implicit_backup_type', '')),
+        float(critic_config.get('kappa_b', 0.0)),
         float(critic_config.get('discount', 0.0)),
     )
     run_logger.info(
@@ -1294,6 +1382,9 @@ def main(_):
                         video_frame_skip=int(FLAGS.eval_video_frame_skip),
                         video_fps=int(FLAGS.eval_video_fps),
                         wandb_enabled=bool(FLAGS.use_wandb),
+                        subgoal_filter=bool(FLAGS.subgoal_filter),
+                        subgoal_filter_threshold=float(FLAGS.subgoal_filter_threshold),
+                        subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
                     )
                 )
             if measure_timing:

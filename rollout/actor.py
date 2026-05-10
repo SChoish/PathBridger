@@ -31,14 +31,18 @@ from utils.datasets import Dataset
 from utils.env_utils import make_env_and_datasets
 from rollout.env import (
     configure_mujoco_gl,
+    env_render_rgb_u8,
     format_maze_navigator_log,
+    is_manipspace_env,
     load_maze_navigator_snap,
     max_episode_steps_from_wrappers,
+    sync_env_state_from_compact_manip_obs,
     sync_env_state_from_obs_vector_aligned,
 )
 from rollout.episode_runner import make_actor_chunk_fn, run_chunked_episode
 from rollout.plot import (
     axis_limits,
+    compose_state_subgoal_env_frames,
     maze_navigator_for_xy_plot,
     overlay_rgb_frames_obs2d_panel,
     write_rgb_array_mp4,
@@ -54,6 +58,7 @@ from utils.run_io import (
     resolve_actor_checkpoint_dir,
     resolve_dynamics_checkpoint_dir,
 )
+from utils.subgoal_filter import SubgoalFilterFn, make_value_subgoal_filter_from_critic_agent
 
 
 def _load_actor_config_from_flags(flags_path: Path) -> dict:
@@ -82,16 +87,32 @@ def rollout_dynamics_actor_env(
     actor_horizon: int,
     env_action_dim: int,
     record_env_rgb: bool = True,
-) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None]:
+    subgoal_filter: SubgoalFilterFn | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray]:
     """Chunked dynamics-subgoal + actor rollout via the shared runner.
 
     Success is decided **only** by the env (``info['success']``); no user-defined
     tolerance is applied here.
     """
-    cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
+    if is_manipspace_env(env):
+        # ManipSpace uses compact observations, not qpos||qvel. For task-mode rollouts
+        # the caller has already reset the env to s0; for offline traj rollouts we can
+        # reconstruct a faithful-enough visual/physics state from the compact obs.
+        try:
+            cur = sync_env_state_from_compact_manip_obs(env, s0)
+        except Exception:
+            cur = np.asarray(s0, dtype=np.float32).reshape(-1)
+    else:
+        cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
     goal = np.asarray(s_g, dtype=np.float32).reshape(-1)
 
-    base_chunk_fn = make_actor_chunk_fn(dynamics_agent, actor_agent, int(actor_horizon), int(env_action_dim))
+    base_chunk_fn = make_actor_chunk_fn(
+        dynamics_agent,
+        actor_agent,
+        int(actor_horizon),
+        int(env_action_dim),
+        subgoal_filter=subgoal_filter,
+    )
     hats_per_step: list[np.ndarray] = []
 
     def _chunk(obs: np.ndarray, g: np.ndarray) -> np.ndarray:
@@ -104,6 +125,8 @@ def rollout_dynamics_actor_env(
             ),
             dtype=np.float32,
         ).reshape(-1)
+        if subgoal_filter is not None:
+            pred = np.asarray(subgoal_filter(obs, pred, g), dtype=np.float32).reshape(-1)
         chunk = base_chunk_fn(obs, g)
         for _ in range(int(chunk.shape[0])):
             hats_per_step.append(pred.copy())
@@ -124,7 +147,12 @@ def rollout_dynamics_actor_env(
         if hats_per_step and outcome.states.shape[0] > 1
         else np.zeros((0, cur.shape[-1]), dtype=np.float32)
     )
-    return outcome.states, hats, outcome.n_chunks, outcome.ok_env, outcome.rgb_frames
+    hats_steps_full = (
+        np.stack(hats_per_step, axis=0)
+        if hats_per_step
+        else np.zeros((0, cur.shape[-1]), dtype=np.float32)
+    )
+    return outcome.states, hats, outcome.n_chunks, outcome.ok_env, outcome.rgb_frames, hats_steps_full
 
 
 def main() -> None:
@@ -152,12 +180,32 @@ def main() -> None:
     p.add_argument('--no_mp4', action='store_true')
     p.add_argument('--mujoco_gl', type=str, default='', metavar='BACKEND')
     p.add_argument(
+        '--render_subgoal_env',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'Replace the right-side 2D panel with a second env render of the predicted subgoal '
+            '(OGBench manipspace envs only). Default: enabled when the env is manipspace.'
+        ),
+    )
+    p.add_argument(
         '--value_heatmap',
         action=argparse.BooleanOptionalAction,
         default=True,
         help='Overlay scalar value V(s, goal) on the right XY panel (checkpoints/critic/).',
     )
     p.add_argument('--value_grid_n', type=int, default=56)
+    p.add_argument(
+        '--subgoal_filter',
+        action='store_true',
+        help='If V(predicted_subgoal, goal) <= V(current_state, goal) and V(current_state, predicted_subgoal) > R, replace goal-representation channels.',
+    )
+    p.add_argument(
+        '--subgoal_filter_threshold',
+        type=float,
+        default=0.5,
+        help='Reachability threshold R for value filtering, applied to sigmoid V(current_state, predicted_subgoal).',
+    )
     p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = dynamics epoch used.')
     args = p.parse_args()
 
@@ -180,8 +228,14 @@ def main() -> None:
     dynamics_cfg, env_name = load_run_flags(run_dir)
     actor_cfg = _load_actor_config_from_flags(flags_path)
 
-    navigator = load_maze_navigator_snap(args.maze_type, env_name)
-    print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
+    try:
+        navigator = load_maze_navigator_snap(args.maze_type, env_name)
+        print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
+    except ValueError as nav_err:
+        if str(args.maze_type).strip():
+            raise
+        navigator = None
+        print(f'Maze navigator disabled for env_name={env_name!r} ({nav_err.__cause__ or nav_err})')
 
     env, train_raw, _ = make_env_and_datasets(
         env_name, frame_stack=dynamics_cfg.get('frame_stack'), render_mode='rgb_array',
@@ -233,6 +287,19 @@ def main() -> None:
     )
     critic_value_params = critic_agent.network.params.get('modules_value', None)
     print(f'Loaded critic for actor inference/value heatmap (epoch suffix {ce})')
+    value_subgoal_filter = (
+        make_value_subgoal_filter_from_critic_agent(
+            critic_agent,
+            reachability_threshold=float(args.subgoal_filter_threshold),
+        )
+        if bool(args.subgoal_filter)
+        else None
+    )
+    if value_subgoal_filter is not None:
+        print(
+            'Subgoal filter enabled: replace phi(predicted_subgoal) with phi(goal) when '
+            f'V(subgoal,g) <= V(s,g) and V(s,subgoal) > {float(args.subgoal_filter_threshold):.4f}.'
+        )
 
     low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
@@ -254,7 +321,7 @@ def main() -> None:
         f'Actor conditioning at inference: predicted dynamics subgoal (spi_goals). '
         f'env_max_steps={int(env_max_steps)} actor_horizon={actor_horizon} → max_chunks={int(max_chunks)}'
     )
-    roll, hats, n_chunks, reached, env_frames = rollout_dynamics_actor_env(
+    roll, hats, n_chunks, reached, env_frames, hats_per_step = rollout_dynamics_actor_env(
         env,
         dynamics_agent,
         actor_agent,
@@ -266,6 +333,7 @@ def main() -> None:
         actor_horizon=actor_horizon,
         env_action_dim=env_action_dim,
         record_env_rgb=True,
+        subgoal_filter=value_subgoal_filter,
     )
     n_trans = max(0, int(roll.shape[0]) - 1)
     print(
@@ -293,28 +361,66 @@ def main() -> None:
         )
         heat_mesh = (XX, YY, ZZ)
 
+    use_subgoal_env_panel = (
+        bool(is_manipspace_env(env)) if args.render_subgoal_env is None else bool(args.render_subgoal_env)
+    )
+    if use_subgoal_env_panel and not is_manipspace_env(env):
+        print('Warning: --render_subgoal_env requested but env is not OGBench manipspace; falling back to 2D panel.')
+        use_subgoal_env_panel = False
+
     if (not args.no_mp4) and env_frames is not None and env_frames.size > 0:
         mp4_out = Path(args.out_mp4.strip()) if str(args.out_mp4).strip() else Path(args.out_path).with_suffix('.mp4')
         mp4_out.parent.mkdir(parents=True, exist_ok=True)
         try:
-            frames = overlay_rgb_frames_obs2d_panel(
-                env_frames,
-                traj,
-                roll,
-                hats,
-                None,
-                s0,
-                s_g,
-                d0,
-                d1,
-                plot_nav,
-                env_name=env_name,
-                chunk_hat_stride=actor_horizon,
-                value_heatmap=heat_mesh,
-                value_heatmap_vmin=heat_vmin,
-                value_heatmap_vmax=heat_vmax,
-            )
-            write_rgb_array_mp4(frames, mp4_out, float(args.fps))
+            if use_subgoal_env_panel:
+                if int(env_frames.shape[0]) <= 1 or int(hats_per_step.shape[0]) == 0:
+                    raise RuntimeError('No subgoal-aligned frames to render.')
+                step_env_frames = env_frames[1:]
+                T_steps = min(int(step_env_frames.shape[0]), int(hats_per_step.shape[0]))
+                step_env_frames = step_env_frames[:T_steps]
+
+                sub_env, _, _ = make_env_and_datasets(
+                    env_name, frame_stack=dynamics_cfg.get('frame_stack'), render_mode='rgb_array',
+                )
+                if tid != 0:
+                    sub_env.reset(options=dict(task_id=tid, render_goal=False))
+                else:
+                    sub_env.reset()
+                subgoal_frames: list[np.ndarray] = []
+                for t in range(T_steps):
+                    sync_env_state_from_compact_manip_obs(sub_env, hats_per_step[t])
+                    fr = env_render_rgb_u8(sub_env)
+                    if fr is None:
+                        raise RuntimeError(f'Failed to render subgoal frame at step {t}.')
+                    subgoal_frames.append(fr)
+                sub_frames_np = np.stack(subgoal_frames, axis=0)
+                try:
+                    sub_env.close()
+                except Exception:
+                    pass
+
+                frames = compose_state_subgoal_env_frames(step_env_frames, sub_frames_np, output_scale=1.1)
+                caption = ['left: actor env state', 'right: env @ predicted subgoal']
+                write_rgb_array_mp4(frames, mp4_out, float(args.fps), caption_lines=caption)
+            else:
+                frames = overlay_rgb_frames_obs2d_panel(
+                    env_frames,
+                    traj,
+                    roll,
+                    hats,
+                    None,
+                    s0,
+                    s_g,
+                    d0,
+                    d1,
+                    plot_nav,
+                    env_name=env_name,
+                    chunk_hat_stride=actor_horizon,
+                    value_heatmap=heat_mesh,
+                    value_heatmap_vmin=heat_vmin,
+                    value_heatmap_vmax=heat_vmax,
+                )
+                write_rgb_array_mp4(frames, mp4_out, float(args.fps))
             print(f'Wrote MP4 {mp4_out.resolve()}')
         except Exception as e:
             print(f'Warning: MP4 failed ({e!r}). pip install imageio imageio-ffmpeg pillow')

@@ -46,6 +46,7 @@ from rollout.episode_runner import (
     run_chunked_episode,
 )
 from rollout.plot import write_rgb_array_mp4
+from rollout.value_field import load_critic_for_run
 from utils.env_utils import make_env_and_datasets
 from utils.run_io import (
     list_checkpoint_suffixes,
@@ -56,6 +57,7 @@ from utils.run_io import (
     resolve_actor_checkpoint_dir,
     resolve_dynamics_checkpoint_dir,
 )
+from utils.subgoal_filter import make_value_subgoal_filter_from_critic_agent
 
 
 def _chunk_budget_for_full_episode(env, chunk_h: int, flags_max_chunks: int) -> int:
@@ -188,13 +190,15 @@ def _run_one_task(
     actor_max_chunks: int,
     fps: float,
     min_mp4_seconds: float,
+    subgoal_filter: bool,
+    subgoal_filter_threshold: float,
 ) -> dict[str, Any]:
     configure_mujoco_gl(mujoco_gl)
     cfg, env_name = load_run_flags(run_dir)
     family = manip_play_family(env_name)
     em, idm_h, act_h = _load_eval_rollout_limits(run_dir)
 
-    env, _train_raw, _ = make_env_and_datasets(
+    env, train_raw, _ = make_env_and_datasets(
         env_name,
         frame_stack=cfg.get('frame_stack'),
         render_mode='rgb_array',
@@ -221,6 +225,23 @@ def _run_one_task(
     agent = DynamicsAgent.create(int(seed), ex, cfg, ex_actions=ex_act)
     dyn_pkl = dyn_dir / f'params_{ckpt_epoch}.pkl'
     agent = load_checkpoint_pkl(agent, dyn_pkl)
+    value_subgoal_filter = None
+    if bool(subgoal_filter):
+        critic_agent = load_critic_for_run(
+            run_dir,
+            int(ckpt_epoch),
+            env,
+            train_raw,
+            seed=int(seed),
+        )
+        value_subgoal_filter = make_value_subgoal_filter_from_critic_agent(
+            critic_agent,
+            reachability_threshold=float(subgoal_filter_threshold),
+        )
+        print(
+            '[subgoal_filter] enabled: replace phi(predicted_subgoal) with phi(goal) when '
+            f'V(subgoal,g) <= V(s,g) and V(s,subgoal) > {float(subgoal_filter_threshold):.4f}.'
+        )
 
     low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
@@ -241,7 +262,7 @@ def _run_one_task(
         low=low,
         high=high,
         max_chunks=int(idm_chunks),
-        sample_action_chunk=make_idm_chunk_fn(agent, int(idm_h)),
+        sample_action_chunk=make_idm_chunk_fn(agent, int(idm_h), subgoal_filter=value_subgoal_filter),
         record_rgb=True,
     )
     idm_out_tag = 'success' if idm_outcome.ok_env else 'fail'
@@ -285,7 +306,13 @@ def _run_one_task(
         low=low,
         high=high,
         max_chunks=int(actor_chunks),
-        sample_action_chunk=make_actor_chunk_fn(agent, actor_agent, int(act_h), int(act_dim)),
+        sample_action_chunk=make_actor_chunk_fn(
+            agent,
+            actor_agent,
+            int(act_h),
+            int(act_dim),
+            subgoal_filter=value_subgoal_filter,
+        ),
         record_rgb=True,
     )
     ac_out_tag = 'success' if actor_outcome.ok_env else 'fail'
@@ -358,6 +385,17 @@ def main() -> None:
         help='If >0, pad MP4 by repeating the last frame until at least this duration (0 = actual length only).',
     )
     p.add_argument(
+        '--subgoal_filter',
+        action='store_true',
+        help='If V(predicted_subgoal, goal) <= V(current_state, goal) and V(current_state, predicted_subgoal) > R, replace goal-representation channels.',
+    )
+    p.add_argument(
+        '--subgoal_filter_threshold',
+        type=float,
+        default=0.5,
+        help='Reachability threshold R for value filtering, applied to sigmoid V(current_state, predicted_subgoal).',
+    )
+    p.add_argument(
         '--no_exclusive_lock',
         action='store_true',
         help='기본 배타 락(out_dir/.manip_play_rollouts.lock)을 쓰지 않음 (디버그용; 중복 실행 주의).',
@@ -398,6 +436,8 @@ def main() -> None:
                     actor_max_chunks=int(args.actor_max_chunks),
                     fps=float(args.fps),
                     min_mp4_seconds=float(args.min_mp4_seconds),
+                    subgoal_filter=bool(args.subgoal_filter),
+                    subgoal_filter_threshold=float(args.subgoal_filter_threshold),
                 )
             )
         summary_path = _write_rollout_task_summary_csv(out_dir, rows)

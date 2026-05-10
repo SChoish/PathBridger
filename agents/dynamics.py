@@ -185,6 +185,10 @@ def _subgoal_mode(config) -> str:
     return str(config.get('subgoal_distribution', 'deterministic')).lower()
 
 
+def _subgoal_stochastic_loss(config) -> str:
+    return str(config.get('subgoal_stochastic_loss', 'mse')).lower()
+
+
 class _DynamicsAgentCore(flax.struct.PyTreeNode):
     """Shared linear-SDE dynamics planner / inference core."""
 
@@ -834,6 +838,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
         )
         sub_mode = _subgoal_mode(config)
+        stochastic_loss = _subgoal_stochastic_loss(config)
+        if stochastic_loss not in ('mse', 'nll'):
+            raise ValueError(
+                f"subgoal_stochastic_loss must be 'mse' or 'nll', got {stochastic_loss!r}."
+            )
         if sub_mode == 'deterministic':
             subgoal_def = SubgoalEstimatorNet(
                 hidden_dims=tuple(config['subgoal_hidden_dims']),
@@ -925,6 +934,27 @@ class DynamicsAgent(_DynamicsAgentCore):
                 )
         return super().create(seed, ex_observations, config, ex_actions=ex_actions)
 
+    def _subgoal_mse_weight_from_gap(self, gap: jnp.ndarray) -> jnp.ndarray:
+        value_style = str(self.config.get('subgoal_value_style', 'exponential')).lower()
+        if value_style == 'exponential':
+            gap_scale = jnp.asarray(
+                float(self.config.get('subgoal_value_gap_scale', 1.0)), dtype=jnp.float32,
+            )
+            return jnp.exp(gap_scale * gap)
+
+        if value_style == 'expectile':
+            expectile = float(self.config.get('subgoal_value_expectile', 0.7))
+            if not 0.0 <= expectile <= 1.0:
+                raise ValueError(
+                    'subgoal_value_expectile must be in [0, 1] when subgoal_value_style="expectile".'
+                )
+            expectile_arr = jnp.asarray(expectile, dtype=jnp.float32)
+            return jnp.where(gap > 0.0, expectile_arr, 1.0 - expectile_arr)
+
+        raise ValueError(
+            f"Unknown subgoal_value_style={value_style!r}; expected 'exponential' or 'expectile'."
+        )
+
     def _subgoal_values(
         self,
         states: jnp.ndarray,
@@ -946,20 +976,19 @@ class DynamicsAgent(_DynamicsAgentCore):
         self,
         observations: jnp.ndarray,
         pred_subgoals: jnp.ndarray,
+        target_subgoals: jnp.ndarray,
         high_actor_goals: jnp.ndarray,
         critic_value_params: Any | None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         pred_value = self._subgoal_values(pred_subgoals, high_actor_goals, critic_value_params)
         obs_value = self._subgoal_values(observations, high_actor_goals, critic_value_params)
+        target_value = self._subgoal_values(target_subgoals, high_actor_goals, critic_value_params)
 
-        gap_scale = jnp.asarray(
-            float(self.config.get('subgoal_value_gap_scale', 1.0)), dtype=jnp.float32,
-        )
-        mse_weight = jnp.exp(gap_scale * (pred_value - obs_value))
-
+        gap = target_value - obs_value
+        mse_weight = self._subgoal_mse_weight_from_gap(gap)
         alpha = jnp.asarray(float(self.config.get('subgoal_value_alpha', 0.0)), dtype=jnp.float32)
         subgoal_value_bonus = jnp.where(alpha > 0.0, alpha * pred_value, jnp.zeros_like(pred_value))
-        return pred_value, obs_value, subgoal_value_bonus, mse_weight
+        return pred_value, obs_value, target_value, subgoal_value_bonus, mse_weight
 
     def _compute_subgoal_loss(self, batch, grad_params, rng_fr, critic_value_params):
         """Compute the subgoal-net training loss + companion logging tensors.
@@ -974,6 +1003,7 @@ class DynamicsAgent(_DynamicsAgentCore):
         sub_mode = _subgoal_mode(self.config)
 
         if sub_mode == 'diag_gaussian':
+            stochastic_loss = _subgoal_stochastic_loss(self.config)
             pred_mu, pred_log_std = self.network.select('subgoal_net')(s, g_high, params=grad_params)
             pred_std = jnp.exp(pred_log_std)
             inv_var = jnp.exp(-2.0 * pred_log_std)
@@ -986,40 +1016,61 @@ class DynamicsAgent(_DynamicsAgentCore):
             sample_diff = target - pred_sample
             subgoal_mse = jnp.mean(sample_diff ** 2, axis=-1)
             mean_mse = jnp.mean(mean_diff ** 2, axis=-1)
-            subgoal_value, current_value, subgoal_value_bonus, subgoal_mse_weight = self._subgoal_value_terms(
-                s, pred_sample, g_high, critic_value_params
+            subgoal_value, current_value, target_value, subgoal_value_bonus, subgoal_mse_weight = self._subgoal_value_terms(
+                s, pred_sample, target, g_high, critic_value_params
             )
-            weighted_subgoal_mse = subgoal_mse_weight * subgoal_mse
-            loss_sub = jnp.mean(weighted_subgoal_mse) - jnp.mean(subgoal_value_bonus)
+            # Weight better dataset targets more strongly, without adding a gradient path through exp(V gap).
+            subgoal_weight = jax.lax.stop_gradient(subgoal_mse_weight)
+            weighted_subgoal_mse = subgoal_weight * subgoal_mse
+            weighted_subgoal_nll = subgoal_weight * nll_per_sample
+            if stochastic_loss == 'mse':
+                stochastic_loss_term = jnp.mean(weighted_subgoal_mse)
+                stochastic_loss_mode = jnp.asarray(0.0, dtype=jnp.float32)
+            elif stochastic_loss == 'nll':
+                stochastic_loss_term = jnp.mean(weighted_subgoal_nll)
+                stochastic_loss_mode = jnp.asarray(1.0, dtype=jnp.float32)
+            else:
+                raise ValueError(
+                    f"subgoal_stochastic_loss must be 'mse' or 'nll', got {stochastic_loss!r}."
+                )
+            loss_sub = stochastic_loss_term - jnp.mean(subgoal_value_bonus)
             pred_sg_out = pred_sample
             subgoal_extra_info = {
                 'phase1/subgoal_nll': jnp.mean(nll_per_sample),
+                'phase1/subgoal_stochastic_loss': stochastic_loss_term,
+                'phase1/subgoal_stochastic_loss_mode': stochastic_loss_mode,
                 'phase1/subgoal_mean_mse': jnp.mean(mean_mse),
                 'phase1/subgoal_sample_mse': jnp.mean(subgoal_mse),
                 'phase1/subgoal_weighted_mse': jnp.mean(weighted_subgoal_mse),
+                'phase1/subgoal_weighted_nll': jnp.mean(weighted_subgoal_nll),
                 'phase1/subgoal_std_mean': jnp.mean(pred_std),
                 'phase1/subgoal_std_max': jnp.max(pred_std),
                 'phase1/subgoal_mode': jnp.asarray(1.0, dtype=jnp.float32),
                 'phase1/subgoal_current_value_mean': jnp.mean(current_value),
+                'phase1/subgoal_target_value_mean': jnp.mean(target_value),
                 'phase1/subgoal_mse_weight_mean': jnp.mean(subgoal_mse_weight),
             }
         else:
             pred_sg = self.network.select('subgoal_net')(s, g_high, params=grad_params)
             subgoal_mse = jnp.mean((pred_sg - target) ** 2, axis=-1)
-            subgoal_value, current_value, subgoal_value_bonus, subgoal_mse_weight = self._subgoal_value_terms(
-                s, pred_sg, g_high, critic_value_params
+            subgoal_value, current_value, target_value, subgoal_value_bonus, subgoal_mse_weight = self._subgoal_value_terms(
+                s, pred_sg, target, g_high, critic_value_params
             )
-            weighted_subgoal_mse = subgoal_mse_weight * subgoal_mse
+            weighted_subgoal_mse = jax.lax.stop_gradient(subgoal_mse_weight) * subgoal_mse
             loss_sub = jnp.mean(weighted_subgoal_mse) - jnp.mean(subgoal_value_bonus)
             pred_sg_out = pred_sg
             zero = jnp.asarray(0.0, dtype=jnp.float32)
             subgoal_extra_info = {
                 'phase1/subgoal_nll': zero,
+                'phase1/subgoal_stochastic_loss': jnp.mean(weighted_subgoal_mse),
+                'phase1/subgoal_stochastic_loss_mode': zero,
                 'phase1/subgoal_std_mean': zero,
                 'phase1/subgoal_std_max': zero,
                 'phase1/subgoal_mode': zero,
                 'phase1/subgoal_weighted_mse': jnp.mean(weighted_subgoal_mse),
+                'phase1/subgoal_weighted_nll': zero,
                 'phase1/subgoal_current_value_mean': jnp.mean(current_value),
+                'phase1/subgoal_target_value_mean': jnp.mean(target_value),
                 'phase1/subgoal_mse_weight_mean': jnp.mean(subgoal_mse_weight),
             }
         return loss_sub, subgoal_mse, subgoal_value, subgoal_value_bonus, pred_sg_out, subgoal_extra_info
@@ -1345,6 +1396,8 @@ def _get_common_config():
             layer_norm=True,
             subgoal_loss_weight=1.0,
             subgoal_value_alpha=0.5,
+            subgoal_value_style='exponential',
+            subgoal_value_expectile=0.7,
             subgoal_value_gap_scale=1.0,
             # NOTE: in the standard `main.py` training path, these two are
             # overwritten in `_prepare_configs` to mirror the critic's
@@ -1356,6 +1409,7 @@ def _get_common_config():
             subgoal_hidden_dims=(512, 512, 512),
             # Distributional subgoal controls (default: deterministic point).
             subgoal_distribution='deterministic',
+            subgoal_stochastic_loss='mse',
             subgoal_num_samples=1,
             subgoal_log_std_min=-5.0,
             subgoal_log_std_max=1.0,
@@ -1363,10 +1417,10 @@ def _get_common_config():
             subgoal_use_mean_for_actor_goal=True,
             discount=0.99,
             subgoal_steps=25,
-            # When False (default): PathHGCDataset overrides high_actor_targets with the
+            # When False: PathHGCDataset overrides high_actor_targets with the
             # K-step horizon endpoint s_{t+K}, so the dynamics bridge / subgoal_net teacher is
             # always K steps ahead even if the episode goal s_{t_g} is closer than K.
-            # When True: clip per-row to s_{min(t+K, t_g)} for both the bridge endpoint
+            # Default True: clip per-row to s_{min(t+K, t_g)} for both the bridge endpoint
             # (high_actor_targets) and the subgoal_net teacher, and pad trajectory_segment
             # tail with s_{t_g} for steps beyond t_g. This trains the bridge to "arrive
             # and stay" at close goals so subgoal predictions near the goal stay

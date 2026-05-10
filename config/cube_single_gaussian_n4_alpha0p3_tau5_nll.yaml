@@ -1,0 +1,27 @@
+# Linear-SDE dynamics + critic + actor offline training.
+# Cube-single diag-Gaussian subgoal ablation:
+#   - U=1 sampled subgoal endpoint.
+#   - N=4 bridge/action candidates per sampled subgoal.
+#   - stochastic subgoal loss: Gaussian NLL - alpha * V(sample).
+#   - subgoal_value_alpha: 0.3, SPI tau: 5.0.
+
+env_name: cube-single-play-v0
+run_group: cube_single_gaussian_n4_alpha0p3_tau5_nll
+train_epochs: 1000
+plan_candidates: 4
+
+dynamics:
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 1
+  subgoal_value_alpha: 0.3
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.995
+  kappa_b: 0.93
+  kappa_d: 0.8
+
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0

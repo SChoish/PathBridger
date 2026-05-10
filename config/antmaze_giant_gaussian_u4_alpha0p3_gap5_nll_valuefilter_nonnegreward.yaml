@@ -1,0 +1,29 @@
+# Linear-SDE dynamics + critic + actor offline training.
+# Antmaze giant ablation off antmaze_giant_gaussian_u4_alpha0p3_gap5_nll_valuefilter:
+#   - Same U=4 diag-Gaussian NLL setup.
+#   - Keep exponential subgoal value-gap scale at 5.0.
+#   - Disable negative reward/goal-conditioned negative relabeling.
+#   - Reduce critic kappa from the previous 0.7/0.7 setting to 0.5/0.5.
+# Env eval uses value filtering by default (main.py --subgoal_filter default).
+
+env_name: antmaze-giant-navigate-v0
+run_group: antmaze_giant_gaussian_u4_alpha0p3_gap5_nll_valuefilter_nonnegreward
+train_epochs: 1000
+
+dynamics:
+  gc_negative: false
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 4
+  subgoal_value_alpha: 0.3
+  subgoal_value_gap_scale: 5.0
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.995
+  kappa_b: 0.5
+  kappa_d: 0.5
+  gc_negative: false
+
+actor:
+  spi_beta: 1.0

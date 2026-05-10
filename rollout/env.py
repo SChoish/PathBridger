@@ -41,6 +41,106 @@ def sync_env_state_from_obs_vector(env, obs: np.ndarray, goal_obs: np.ndarray) -
     return np.asarray(u.get_ob(), dtype=np.float32)
 
 
+_MANIP_XYZ_CENTER = np.array([0.425, 0.0, 0.0], dtype=np.float64)
+_MANIP_XYZ_SCALER = 10.0
+_MANIP_GRIPPER_SCALER = 3.0
+_MANIP_RIGHT_DRIVER_LIMIT = 0.8
+
+
+def is_manipspace_env(env) -> bool:
+    """Heuristic: True for OGBench manipspace envs (cube/scene/puzzle) that emit compact obs."""
+    u = getattr(env, 'unwrapped', env)
+    return (
+        hasattr(u, 'compute_ob_info')
+        and hasattr(u, '_gripper_opening_joint_id')
+        and hasattr(u, '_data')
+        and hasattr(u, '_model')
+    )
+
+
+def sync_env_state_from_compact_manip_obs(env, obs: np.ndarray) -> np.ndarray:
+    """Decode an OGBench manipspace compact observation into ``qpos``/``qvel`` and apply via ``set_state``.
+
+    Compact obs layout (per ``ogbench/manipspace/envs/manipspace_env.py::compute_observation``)::
+
+        [joint_pos (J),
+         joint_vel (J),
+         (effector_pos - xyz_center) * 10 (3),
+         cos(effector_yaw), sin(effector_yaw),
+         gripper_opening * 3, gripper_contact,
+         per-cube i: (block_pos - xyz_center) * 10 (3), block_quat (4),
+                     cos(block_yaw), sin(block_yaw)]
+
+    ``effector_pos``, ``effector_yaw``, and the per-cube ``cos/sin yaw`` channels are derivable from
+    arm joints and the cube quat respectively, so we ignore them when reconstructing state.
+
+    Gripper: only ``gripper_opening`` is recoverable from the obs. We invert
+    ``opening = clip(qpos[right_driver_joint] / 0.8, 0, 1)`` and mirror the value onto
+    ``left_driver_joint`` (mimicked by an equality constraint in the model). The other 6 robotiq
+    follower/coupler/spring joints are left at zero, which gives a slightly cartoonish gripper but
+    keeps cube + arm pose faithful — sufficient for subgoal visualization.
+
+    Velocities of the cube and gripper are not in the compact obs, so they are zeroed.
+    """
+    u = getattr(env, 'unwrapped', env)
+    if not is_manipspace_env(env):
+        raise ValueError('sync_env_state_from_compact_manip_obs: env is not an OGBench manipspace env.')
+    obs = np.asarray(obs, dtype=np.float64).reshape(-1)
+
+    ob_info = u.compute_ob_info()
+    J = int(np.asarray(ob_info['proprio/joint_pos']).shape[0])
+    n_cubes = int(getattr(u, '_num_cubes', 0))
+    head_dim = 2 * J + 3 + 1 + 1 + 1 + 1
+    needed = head_dim + n_cubes * (3 + 4 + 1 + 1)
+    if obs.shape[0] < needed:
+        raise ValueError(
+            f'compact manip obs too short: dim={obs.shape[0]} < required {needed} for J={J}, n_cubes={n_cubes}.'
+        )
+
+    p = 0
+    arm_qpos = obs[p:p + J]; p += J
+    arm_qvel = obs[p:p + J]; p += J
+    p += 3 + 1 + 1  # skip effector_pos / cos/sin yaw (FK).
+    grip_open_scaled = float(obs[p]); p += 1
+    p += 1  # skip gripper_contact (sensor).
+
+    cube_pos_quat: list[tuple[np.ndarray, np.ndarray]] = []
+    for _ in range(n_cubes):
+        c_pos_scaled = obs[p:p + 3]; p += 3
+        c_quat = obs[p:p + 4]; p += 4
+        p += 1 + 1  # skip cos/sin yaw.
+        cube_pos_quat.append((c_pos_scaled, c_quat))
+
+    qpos = np.array(u._data.qpos, dtype=np.float64).copy()
+    qvel = np.zeros_like(np.asarray(u._data.qvel, dtype=np.float64))
+    qpos[0:J] = arm_qpos
+    qvel[0:J] = arm_qvel
+
+    grip_open = float(np.clip(grip_open_scaled / _MANIP_GRIPPER_SCALER, 0.0, 1.0))
+    grip_qpos = grip_open * _MANIP_RIGHT_DRIVER_LIMIT
+    right_driver_id = int(getattr(u, '_gripper_opening_joint_id'))
+    qpos[int(u._model.jnt_qposadr[right_driver_id])] = grip_qpos
+    try:
+        ldj_id = u._model.joint('ur5e/robotiq/left_driver_joint').id
+        qpos[int(u._model.jnt_qposadr[ldj_id])] = grip_qpos
+    except Exception:
+        pass
+
+    for i, (c_pos_scaled, c_quat) in enumerate(cube_pos_quat):
+        try:
+            jid = u._model.joint(f'object_joint_{i}').id
+        except Exception:
+            jid = u._model.joint('object_joint_0').id
+        qadr = int(u._model.jnt_qposadr[jid])
+        qpos[qadr:qadr + 3] = np.asarray(c_pos_scaled, dtype=np.float64) / _MANIP_XYZ_SCALER + _MANIP_XYZ_CENTER
+        q = np.asarray(c_quat, dtype=np.float64)
+        qn = float(np.linalg.norm(q))
+        qpos[qadr + 3:qadr + 7] = q / qn if qn > 1e-9 else np.array([1.0, 0.0, 0.0, 0.0])
+
+    u.set_state(qpos, qvel)
+    return np.asarray(u.compute_observation(), dtype=np.float32).reshape(-1)
+
+
 def sync_env_state_from_obs_vector_aligned(env, obs: np.ndarray, goal_obs: np.ndarray) -> np.ndarray:
     """Update physics like :func:`sync_env_state_from_obs_vector` and return an obs matching ``env``'s space.
 

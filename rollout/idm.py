@@ -48,19 +48,24 @@ from utils.run_io import (
 )
 from rollout.env import (
     configure_mujoco_gl,
+    env_render_rgb_u8,
     format_maze_navigator_log,
+    is_manipspace_env,
     load_maze_navigator_snap,
     make_xy_clamper,
+    sync_env_state_from_compact_manip_obs,
     sync_env_state_from_obs_vector_aligned,
 )
 from rollout.episode_runner import run_chunked_episode
 from rollout.plot import (
     axis_limits,
+    compose_state_subgoal_env_frames,
     maze_navigator_for_xy_plot,
     overlay_rgb_frames_obs2d_panel,
     write_rgb_array_mp4,
 )
 from utils.inverse_dynamics import InverseDynamicsMLP
+from utils.subgoal_filter import SubgoalFilterFn, make_value_subgoal_filter_from_critic_agent
 from rollout.maze_navigator import MazeNavigatorMap
 
 
@@ -84,7 +89,8 @@ def rollout_dynamics_idm_env(
     record_env_rgb: bool = True,
     planner_noise_scale: float = 0.0,
     planner_seed: int = 0,
-) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray]:
+    subgoal_filter: SubgoalFilterFn | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray, np.ndarray]:
     """Chunked dynamics bridge + inverse dynamics in the real environment.
 
     Success is decided **only** by the env (``info['success']`` in the shared
@@ -98,7 +104,14 @@ def rollout_dynamics_idm_env(
         g_np, navigator, clamp_dim0, clamp_dim1, navigator_clamp_mode, navigator_edge_inset
     )
 
-    cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
+    if is_manipspace_env(env):
+        # OGBench manipspace envs use compact (28-dim) observations that are NOT qpos||qvel,
+        # so we cannot replay physics from ``s0`` here. The caller already set the env to ``s0``
+        # via ``env.reset(options=dict(task_id=...))`` and there is no ``set_goal`` analogue, so
+        # we trust the reset state and only normalize ``s0``'s dtype.
+        cur = np.asarray(s0, dtype=np.float32).reshape(-1)
+    else:
+        cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
     d = int(cur.shape[-1])
 
     @jax.jit
@@ -117,6 +130,9 @@ def rollout_dynamics_idm_env(
         g = jnp.asarray(goal, dtype=jnp.float32)
         hat = agent.infer_subgoal(s, g)
         hat_np = np.asarray(jax.device_get(hat), dtype=np.float32).reshape(-1)
+        if subgoal_filter is not None:
+            hat_np = np.asarray(subgoal_filter(obs, hat_np, goal), dtype=np.float32).reshape(-1)
+            hat = jnp.asarray(hat_np, dtype=jnp.float32)
         hat_plot_np = xy_clamper(hat_np.copy())
 
         if use_stoch_plan:
@@ -158,8 +174,30 @@ def rollout_dynamics_idm_env(
         if hats_per_step and outcome.states.shape[0] > 1
         else np.zeros((0, d), dtype=np.float32)
     )
-    pkr = np.stack(plan_trajs_per_step[: outcome.states.shape[0]], axis=0) if outcome.states.shape[0] > 0 else np.zeros((0, 0, d), dtype=np.float32)
-    return outcome.states, hats, outcome.n_chunks, outcome.ok_env, outcome.rgb_frames, pkr
+    if outcome.states.shape[0] > 0:
+        pkr_slice = plan_trajs_per_step[: outcome.states.shape[0]]
+        try:
+            pkr = np.stack(pkr_slice, axis=0)
+        except ValueError:
+            # First entry is a zero-length stub (no plan available before the first replan); the
+            # rest are constant-length ``plan_seg``. Stacking heterogeneous shapes fails: pad the
+            # stub by repeating the first real plan, so callers always get a regular array.
+            non_stub = next((p for p in pkr_slice if p.shape[0] > 0), None)
+            if non_stub is None:
+                pkr = np.zeros((len(pkr_slice), 0, d), dtype=np.float32)
+            else:
+                fixed = [non_stub if p.shape[0] == 0 else p for p in pkr_slice]
+                pkr = np.stack(fixed, axis=0)
+    else:
+        pkr = np.zeros((0, 0, d), dtype=np.float32)
+    # Per-step subgoal series (length = total executed env steps). Distinct from ``hats``,
+    # which is truncated to one entry per replan-chunk for the existing 2D panel overlay.
+    hats_steps_full = (
+        np.stack(hats_per_step, axis=0)
+        if hats_per_step
+        else np.zeros((0, d), dtype=np.float32)
+    )
+    return outcome.states, hats, outcome.n_chunks, outcome.ok_env, outcome.rgb_frames, pkr, hats_steps_full
 
 
 def main() -> None:
@@ -216,7 +254,27 @@ def main() -> None:
         default=True,
         help='Overlay scalar value V(s, goal) on the right XY panel (requires checkpoints/critic/).',
     )
+    p.add_argument(
+        '--render_subgoal_env',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'Replace the right-side 2D panel with a second env render of the predicted subgoal '
+            '(OGBench manipspace envs only). Default: enabled when the env is manipspace.'
+        ),
+    )
     p.add_argument('--value_grid_n', type=int, default=56, help='Square grid resolution for value heatmap.')
+    p.add_argument(
+        '--subgoal_filter',
+        action='store_true',
+        help='If V(predicted_subgoal, goal) <= V(current_state, goal) and V(current_state, predicted_subgoal) > R, replace goal-representation channels.',
+    )
+    p.add_argument(
+        '--subgoal_filter_threshold',
+        type=float,
+        default=0.5,
+        help='Reachability threshold R for value filtering, applied to sigmoid V(current_state, predicted_subgoal).',
+    )
     p.add_argument(
         '--critic_epoch',
         type=int,
@@ -239,8 +297,15 @@ def main() -> None:
     ckpt_epoch = pick_epoch(int(args.checkpoint_epoch), list_checkpoint_suffixes(ckpt_dir))
 
     cfg, env_name = load_run_flags(run_dir)
-    navigator = load_maze_navigator_snap(args.maze_type, env_name)
-    print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
+    try:
+        navigator = load_maze_navigator_snap(args.maze_type, env_name)
+        print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
+    except ValueError as nav_err:
+        # Non-maze envs (e.g. OGBench manipspace) have no maze metadata; navigator stays disabled.
+        if str(args.maze_type).strip():
+            raise
+        navigator = None
+        print(f'Maze navigator disabled for env_name={env_name!r} ({nav_err.__cause__ or nav_err})')
 
     env, train_raw, _ = make_env_and_datasets(
         env_name, frame_stack=cfg.get('frame_stack'), render_mode='rgb_array',
@@ -331,8 +396,21 @@ def main() -> None:
     )
     critic_value_params = critic_agent.network.params.get('modules_value', None)
     print(f'Loaded critic for IDM inference/value heatmap (epoch suffix {ce})')
+    value_subgoal_filter = (
+        make_value_subgoal_filter_from_critic_agent(
+            critic_agent,
+            reachability_threshold=float(args.subgoal_filter_threshold),
+        )
+        if bool(args.subgoal_filter)
+        else None
+    )
+    if value_subgoal_filter is not None:
+        print(
+            'Subgoal filter enabled: replace phi(predicted_subgoal) with phi(goal) when '
+            f'V(subgoal,g) <= V(s,g) and V(s,subgoal) > {float(args.subgoal_filter_threshold):.4f}.'
+        )
 
-    roll, hats, n_chunks, reached, env_frames, frame_plan_trajs = rollout_dynamics_idm_env(
+    roll, hats, n_chunks, reached, env_frames, frame_plan_trajs, hats_per_step = rollout_dynamics_idm_env(
         env,
         agent,
         idm_model,
@@ -346,6 +424,7 @@ def main() -> None:
         action_chunk_horizon=int(args.action_chunk_horizon),
         planner_noise_scale=float(args.planner_noise_scale),
         planner_seed=planner_seed,
+        subgoal_filter=value_subgoal_filter,
     )
     n_trans = max(0, int(roll.shape[0]) - 1)
     action_chunk_horizon = int(args.action_chunk_horizon)
@@ -375,29 +454,68 @@ def main() -> None:
         )
         heat_mesh = (XX, YY, ZZ)
 
+    use_subgoal_env_panel = (
+        bool(is_manipspace_env(env)) if args.render_subgoal_env is None else bool(args.render_subgoal_env)
+    )
+    if use_subgoal_env_panel and not is_manipspace_env(env):
+        print('Warning: --render_subgoal_env requested but env is not OGBench manipspace; falling back to 2D panel.')
+        use_subgoal_env_panel = False
+
     if (not args.no_mp4) and env_frames is not None and env_frames.size > 0:
         mp4_out = Path(args.out_mp4.strip()) if str(args.out_mp4).strip() else Path(args.out_path).with_suffix('.mp4')
         mp4_out.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _pf = min(action_chunk_horizon, dynamics_N)
-            frames = overlay_rgb_frames_obs2d_panel(
-                env_frames,
-                traj,
-                roll,
-                hats,
-                frame_plan_trajs,
-                s0,
-                s_g,
-                d0,
-                d1,
-                plot_nav,
-                env_name=env_name,
-                chunk_hat_stride=_pf,
-                value_heatmap=heat_mesh,
-                value_heatmap_vmin=heat_vmin,
-                value_heatmap_vmax=heat_vmax,
-            )
-            write_rgb_array_mp4(frames, mp4_out, float(args.fps))
+            if use_subgoal_env_panel:
+                # Render the predicted subgoal in a second env instance, one frame per executed step.
+                # ``env_frames`` is step-aligned with one extra initial frame (``T+1`` total),
+                # ``hats_per_step`` has T entries (one hat per env step). Drop the initial env
+                # frame so the two panels share the same length.
+                if int(env_frames.shape[0]) <= 1 or int(hats_per_step.shape[0]) == 0:
+                    raise RuntimeError('No subgoal-aligned frames to render.')
+                step_env_frames = env_frames[1:]
+                T_steps = min(int(step_env_frames.shape[0]), int(hats_per_step.shape[0]))
+                step_env_frames = step_env_frames[:T_steps]
+
+                sub_env, _, _ = make_env_and_datasets(
+                    env_name, frame_stack=cfg.get('frame_stack'), render_mode='rgb_array',
+                )
+                sub_env.reset(options=dict(task_id=tid, render_goal=False))
+                subgoal_frames: list[np.ndarray] = []
+                for t in range(T_steps):
+                    sync_env_state_from_compact_manip_obs(sub_env, hats_per_step[t])
+                    fr = env_render_rgb_u8(sub_env)
+                    if fr is None:
+                        raise RuntimeError(f'Failed to render subgoal frame at step {t}.')
+                    subgoal_frames.append(fr)
+                sub_frames_np = np.stack(subgoal_frames, axis=0)
+                try:
+                    sub_env.close()
+                except Exception:
+                    pass
+
+                frames = compose_state_subgoal_env_frames(step_env_frames, sub_frames_np, output_scale=1.1)
+                caption = ['left: env state', 'right: env @ predicted subgoal']
+                write_rgb_array_mp4(frames, mp4_out, float(args.fps), caption_lines=caption)
+            else:
+                _pf = min(action_chunk_horizon, dynamics_N)
+                frames = overlay_rgb_frames_obs2d_panel(
+                    env_frames,
+                    traj,
+                    roll,
+                    hats,
+                    frame_plan_trajs,
+                    s0,
+                    s_g,
+                    d0,
+                    d1,
+                    plot_nav,
+                    env_name=env_name,
+                    chunk_hat_stride=_pf,
+                    value_heatmap=heat_mesh,
+                    value_heatmap_vmin=heat_vmin,
+                    value_heatmap_vmax=heat_vmax,
+                )
+                write_rgb_array_mp4(frames, mp4_out, float(args.fps))
             print(f'Wrote MP4 {mp4_out.resolve()}')
         except Exception as e:
             print(f'Warning: MP4 failed ({e!r}). pip install imageio imageio-ffmpeg')
