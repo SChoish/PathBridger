@@ -17,6 +17,7 @@ import numpy as np
 import optax
 
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
+from utils.goal_representation import goal_representation
 from utils.networks import MLP
 
 
@@ -28,12 +29,13 @@ def _safe_logit(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
 class ScalarValueNet(nn.Module):
     hidden_dims: Sequence[int]
     layer_norm: bool = True
+    goal_representation: str = 'full'
 
     @nn.compact
     def __call__(self, observations: jnp.ndarray, goals: jnp.ndarray | None = None) -> jnp.ndarray:
         xs = [observations]
         if goals is not None:
-            xs.append(goals)
+            xs.append(goal_representation(goals, self.goal_representation))
         x = jnp.concatenate(xs, axis=-1)
         return MLP((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)(x).squeeze(-1)
 
@@ -42,6 +44,7 @@ class BinaryChunkCritic(nn.Module):
     hidden_dims: Sequence[int]
     num_qs: int
     layer_norm: bool = True
+    goal_representation: str = 'full'
 
     @nn.compact
     def __call__(
@@ -52,7 +55,7 @@ class BinaryChunkCritic(nn.Module):
     ) -> jnp.ndarray:
         xs = [observations]
         if goals is not None:
-            xs.append(goals)
+            xs.append(goal_representation(goals, self.goal_representation))
         if actions_flat is not None:
             xs.append(actions_flat)
         x = jnp.concatenate(xs, axis=-1)
@@ -341,13 +344,14 @@ class CriticAgent(flax.struct.PyTreeNode):
         hdims = tuple(config['value_hidden_dims'])
         ln = bool(config['layer_norm'])
         nq = int(config['num_qs'])
+        goal_rep = str(config.get('goal_representation', 'full')).lower()
         critic_type = str(config.get('critic_type', 'dqc')).lower()
         if critic_type not in ('dqc', 'iql'):
             raise ValueError(f"critic_type must be 'dqc' or 'iql', got {critic_type!r}")
 
-        value_def = ScalarValueNet(hdims, layer_norm=ln)
-        action_critic_def = BinaryChunkCritic(hdims, nq, ln)
-        target_action_critic_def = BinaryChunkCritic(hdims, nq, ln)
+        value_def = ScalarValueNet(hdims, layer_norm=ln, goal_representation=goal_rep)
+        action_critic_def = BinaryChunkCritic(hdims, nq, ln, goal_representation=goal_rep)
+        target_action_critic_def = BinaryChunkCritic(hdims, nq, ln, goal_representation=goal_rep)
 
         network_info = {
             'action_critic': (action_critic_def, (ex_obs, ex_goal, ex_part)),
@@ -361,8 +365,8 @@ class CriticAgent(flax.struct.PyTreeNode):
                     "critic_type='dqc' requires ex_full_chunk_actions for chunk_critic init."
                 )
             ex_full = jnp.asarray(ex_full_chunk_actions, dtype=jnp.float32)
-            chunk_critic_def = BinaryChunkCritic(hdims, nq, ln)
-            target_chunk_critic_def = BinaryChunkCritic(hdims, nq, ln)
+            chunk_critic_def = BinaryChunkCritic(hdims, nq, ln, goal_representation=goal_rep)
+            target_chunk_critic_def = BinaryChunkCritic(hdims, nq, ln, goal_representation=goal_rep)
             network_info['chunk_critic'] = (chunk_critic_def, (ex_obs, ex_goal, ex_full))
             network_info['target_chunk_critic'] = (target_chunk_critic_def, (ex_obs, ex_goal, ex_full))
 
@@ -417,6 +421,10 @@ def get_config():
             frame_stack=None,
             p_aug=0.0,
             q_agg='mean',
+            # Goal input to value/Q nets. 'full' preserves the historical raw
+            # full-goal concatenation; 'phi' uses task goal-representation
+            # channels (ManipSpace cube positions, else maze xy).
+            goal_representation='full',
             full_chunk_horizon=25,
             action_chunk_horizon=10,
             # Match dynamics' default clip_path_to_goal semantics for critic backups:
@@ -440,6 +448,10 @@ def get_config():
             value_p_trajgoal=0.5,
             value_p_randomgoal=0.3,
             value_geom_sample=False,
+            # Optional cap for same-trajectory sampled value goals. None/<=0
+            # preserves terminal-only clipping.
+            max_goal_steps=None,
+            max_goal_steps_from_env=False,
             gc_negative=False,
         )
     )

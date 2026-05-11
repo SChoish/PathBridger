@@ -369,6 +369,35 @@ def _apply_horizon(dynamics_config: Any, critic_config: Any) -> tuple[Any, Any]:
     return dynamics_config, critic_config
 
 
+def _env_max_episode_steps(env: Any) -> int:
+    """Return the environment episode cap advertised by Gym/Gymnasium wrappers."""
+    spec = getattr(env, 'spec', None)
+    max_steps = getattr(spec, 'max_episode_steps', None) if spec is not None else None
+    if max_steps is None:
+        max_steps = getattr(env, '_max_episode_steps', None)
+    if max_steps is None:
+        raise ValueError(
+            'max_goal_steps="env" requested, but the environment does not expose max_episode_steps.'
+        )
+    max_steps = int(max_steps)
+    if max_steps < 1:
+        raise ValueError(f'env max_episode_steps must be >= 1, got {max_steps}.')
+    return max_steps
+
+
+def _resolve_max_goal_steps_from_env(config: Any, env: Any) -> bool:
+    """Resolve ``max_goal_steps: env`` in-place. Return True when resolved."""
+    if bool(config.get('max_goal_steps_from_env', False)):
+        config['max_goal_steps'] = _env_max_episode_steps(env)
+        return True
+    value = config.get('max_goal_steps', None)
+    if isinstance(value, str) and value.lower() in ('env', 'env_max_episode_steps', 'max_episode_steps'):
+        with config.ignore_type():
+            config['max_goal_steps'] = _env_max_episode_steps(env)
+        return True
+    return False
+
+
 def _require_matching_frame_stack(dynamics_config: Any, critic_config: Any) -> None:
     frame_stacks = {
         'dynamics': dynamics_config.get('frame_stack', None),
@@ -757,6 +786,9 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     # architecture must mirror the critic; force-sync here so users only configure it once.
     dynamics_config['subgoal_value_hidden_dims'] = tuple(int(x) for x in critic_config['value_hidden_dims'])
     dynamics_config['subgoal_value_layer_norm'] = bool(critic_config['layer_norm'])
+    dynamics_config['subgoal_value_goal_representation'] = str(
+        critic_config.get('goal_representation', 'full'),
+    )
     validate_config(critic_config, actor_config)
     shared_batch = int(FLAGS.batch_size)
     if shared_batch < 1:
@@ -1091,9 +1123,18 @@ def main(_):
         dataset_dir=FLAGS.dataset_dir,
         render_mode='rgb_array',
     )
+    resolved_dyn_goal_cap = _resolve_max_goal_steps_from_env(dynamics_config, env)
+    resolved_critic_goal_cap = _resolve_max_goal_steps_from_env(critic_config, env)
     action_dim = int(np.asarray(env.action_space.shape).prod())
     critic_config['action_dim'] = action_dim
     actor_config['action_dim'] = action_dim
+    if resolved_dyn_goal_cap or resolved_critic_goal_cap:
+        run_logger.info(
+            'resolved max_goal_steps from env max_episode_steps=%d (dynamics=%s critic=%s)',
+            _env_max_episode_steps(env),
+            dynamics_config.get('max_goal_steps', None),
+            critic_config.get('max_goal_steps', None),
+        )
 
     with open(os.path.join(run_dir, 'flags.json'), 'w', encoding='utf-8') as f:
         json.dump(

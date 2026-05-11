@@ -27,6 +27,7 @@ from utils.dynamics import (
     posterior_mean,
     sample_from_reverse_mean,
 )
+from utils.goal_representation import goal_representation
 
 
 _VALID_PLANNER_TYPES = ('exact_residual_chain', 'forward_bridge', 'forward_bridge_residual')
@@ -110,10 +111,12 @@ class SubgoalEstimatorNet(nn.Module):
     hidden_dims: Sequence[int]
     state_dim: int
     layer_norm: bool = True
+    goal_representation: str = 'full'
 
     @nn.compact
     def __call__(self, observations, high_actor_goals):
-        inp = jnp.concatenate([observations, high_actor_goals], axis=-1)
+        goal_inp = goal_representation(high_actor_goals, self.goal_representation)
+        inp = jnp.concatenate([observations, goal_inp], axis=-1)
         return MLP(
             hidden_dims=(*self.hidden_dims, self.state_dim),
             activate_final=False,
@@ -137,10 +140,12 @@ class DistributionalSubgoalEstimatorNet(nn.Module):
     layer_norm: bool = True
     log_std_min: float = -5.0
     log_std_max: float = 1.0
+    goal_representation: str = 'full'
 
     @nn.compact
     def __call__(self, observations, high_actor_goals):
-        inp = jnp.concatenate([observations, high_actor_goals], axis=-1)
+        goal_inp = goal_representation(high_actor_goals, self.goal_representation)
+        inp = jnp.concatenate([observations, goal_inp], axis=-1)
         trunk = MLP(
             hidden_dims=tuple(self.hidden_dims),
             activate_final=True,
@@ -848,6 +853,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 hidden_dims=tuple(config['subgoal_hidden_dims']),
                 state_dim=state_dim,
                 layer_norm=config['layer_norm'],
+                goal_representation=str(
+                    config.get('subgoal_goal_representation', config.get('goal_representation', 'full')),
+                ),
             )
         elif sub_mode == 'diag_gaussian':
             subgoal_def = DistributionalSubgoalEstimatorNet(
@@ -856,6 +864,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 layer_norm=config['layer_norm'],
                 log_std_min=float(config.get('subgoal_log_std_min', -5.0)),
                 log_std_max=float(config.get('subgoal_log_std_max', 1.0)),
+                goal_representation=str(
+                    config.get('subgoal_goal_representation', config.get('goal_representation', 'full')),
+                ),
             )
         else:
             raise ValueError(
@@ -955,6 +966,16 @@ class DynamicsAgent(_DynamicsAgentCore):
             f"Unknown subgoal_value_style={value_style!r}; expected 'exponential' or 'expectile'."
         )
 
+    def _subgoal_adv_logit_from_gap(self, gap: jnp.ndarray) -> jnp.ndarray:
+        """Return the scalar inside the exponential subgoal weight."""
+        value_style = str(self.config.get('subgoal_value_style', 'exponential')).lower()
+        if value_style == 'exponential':
+            gap_scale = jnp.asarray(
+                float(self.config.get('subgoal_value_gap_scale', 1.0)), dtype=jnp.float32,
+            )
+            return gap_scale * gap
+        return jnp.zeros_like(gap)
+
     def _subgoal_values(
         self,
         states: jnp.ndarray,
@@ -968,6 +989,7 @@ class DynamicsAgent(_DynamicsAgentCore):
         value_def = ScalarValueNet(
             tuple(int(x) for x in self.config.get('subgoal_value_hidden_dims', (512, 512, 512))),
             layer_norm=bool(self.config.get('subgoal_value_layer_norm', True)),
+            goal_representation=str(self.config.get('subgoal_value_goal_representation', 'full')),
         )
         value_logits = value_def.apply({'params': critic_value_params}, states, high_actor_goals)
         return jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
@@ -979,16 +1001,17 @@ class DynamicsAgent(_DynamicsAgentCore):
         target_subgoals: jnp.ndarray,
         high_actor_goals: jnp.ndarray,
         critic_value_params: Any | None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         pred_value = self._subgoal_values(pred_subgoals, high_actor_goals, critic_value_params)
         obs_value = self._subgoal_values(observations, high_actor_goals, critic_value_params)
         target_value = self._subgoal_values(target_subgoals, high_actor_goals, critic_value_params)
 
         gap = target_value - obs_value
+        adv_logit = self._subgoal_adv_logit_from_gap(gap)
         mse_weight = self._subgoal_mse_weight_from_gap(gap)
         alpha = jnp.asarray(float(self.config.get('subgoal_value_alpha', 0.0)), dtype=jnp.float32)
         subgoal_value_bonus = jnp.where(alpha > 0.0, alpha * pred_value, jnp.zeros_like(pred_value))
-        return pred_value, obs_value, target_value, subgoal_value_bonus, mse_weight
+        return pred_value, obs_value, target_value, subgoal_value_bonus, mse_weight, gap, adv_logit
 
     def _compute_subgoal_loss(self, batch, grad_params, rng_fr, critic_value_params):
         """Compute the subgoal-net training loss + companion logging tensors.
@@ -1016,7 +1039,15 @@ class DynamicsAgent(_DynamicsAgentCore):
             sample_diff = target - pred_sample
             subgoal_mse = jnp.mean(sample_diff ** 2, axis=-1)
             mean_mse = jnp.mean(mean_diff ** 2, axis=-1)
-            subgoal_value, current_value, target_value, subgoal_value_bonus, subgoal_mse_weight = self._subgoal_value_terms(
+            (
+                subgoal_value,
+                current_value,
+                target_value,
+                subgoal_value_bonus,
+                subgoal_mse_weight,
+                subgoal_value_gap,
+                subgoal_adv_logit,
+            ) = self._subgoal_value_terms(
                 s, pred_sample, target, g_high, critic_value_params
             )
             # Weight better dataset targets more strongly, without adding a gradient path through exp(V gap).
@@ -1049,11 +1080,25 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_current_value_mean': jnp.mean(current_value),
                 'phase1/subgoal_target_value_mean': jnp.mean(target_value),
                 'phase1/subgoal_mse_weight_mean': jnp.mean(subgoal_mse_weight),
+                'phase1/subgoal_value_gap_mean': jnp.mean(subgoal_value_gap),
+                'phase1/subgoal_value_gap_min': jnp.min(subgoal_value_gap),
+                'phase1/subgoal_value_gap_max': jnp.max(subgoal_value_gap),
+                'phase1/subgoal_adv_logit_mean': jnp.mean(subgoal_adv_logit),
+                'phase1/subgoal_adv_logit_min': jnp.min(subgoal_adv_logit),
+                'phase1/subgoal_adv_logit_max': jnp.max(subgoal_adv_logit),
             }
         else:
             pred_sg = self.network.select('subgoal_net')(s, g_high, params=grad_params)
             subgoal_mse = jnp.mean((pred_sg - target) ** 2, axis=-1)
-            subgoal_value, current_value, target_value, subgoal_value_bonus, subgoal_mse_weight = self._subgoal_value_terms(
+            (
+                subgoal_value,
+                current_value,
+                target_value,
+                subgoal_value_bonus,
+                subgoal_mse_weight,
+                subgoal_value_gap,
+                subgoal_adv_logit,
+            ) = self._subgoal_value_terms(
                 s, pred_sg, target, g_high, critic_value_params
             )
             weighted_subgoal_mse = jax.lax.stop_gradient(subgoal_mse_weight) * subgoal_mse
@@ -1072,6 +1117,12 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_current_value_mean': jnp.mean(current_value),
                 'phase1/subgoal_target_value_mean': jnp.mean(target_value),
                 'phase1/subgoal_mse_weight_mean': jnp.mean(subgoal_mse_weight),
+                'phase1/subgoal_value_gap_mean': jnp.mean(subgoal_value_gap),
+                'phase1/subgoal_value_gap_min': jnp.min(subgoal_value_gap),
+                'phase1/subgoal_value_gap_max': jnp.max(subgoal_value_gap),
+                'phase1/subgoal_adv_logit_mean': jnp.mean(subgoal_adv_logit),
+                'phase1/subgoal_adv_logit_min': jnp.min(subgoal_adv_logit),
+                'phase1/subgoal_adv_logit_max': jnp.max(subgoal_adv_logit),
             }
         return loss_sub, subgoal_mse, subgoal_value, subgoal_value_bonus, pred_sg_out, subgoal_extra_info
 
@@ -1399,6 +1450,10 @@ def _get_common_config():
             subgoal_value_style='exponential',
             subgoal_value_expectile=0.7,
             subgoal_value_gap_scale=1.0,
+            # Goal input to the subgoal estimator. 'full' preserves historical
+            # behavior; 'phi' uses task goal-representation channels
+            # (ManipSpace cube positions, else maze xy).
+            subgoal_goal_representation='full',
             # NOTE: in the standard `main.py` training path, these two are
             # overwritten in `_prepare_configs` to mirror the critic's
             # `value_hidden_dims` / `layer_norm` so that the borrowed critic
@@ -1406,6 +1461,7 @@ def _get_common_config():
             # constructed outside of `main.py` (e.g. unit tests).
             subgoal_value_hidden_dims=(512, 512, 512),
             subgoal_value_layer_norm=True,
+            subgoal_value_goal_representation='full',
             subgoal_hidden_dims=(512, 512, 512),
             # Distributional subgoal controls (default: deterministic point).
             subgoal_distribution='deterministic',
@@ -1447,6 +1503,10 @@ def _get_common_config():
             actor_p_trajgoal=1.0,
             actor_p_randomgoal=0.0,
             actor_geom_sample=False,
+            # Optional cap for same-trajectory sampled goals. None/<=0 keeps
+            # the historical behavior of sampling up to the episode terminal.
+            max_goal_steps=None,
+            max_goal_steps_from_env=False,
             gc_negative=True,
             p_aug=0.0,
             frame_stack=ml_collections.config_dict.placeholder(int),

@@ -13,7 +13,7 @@ rather than an evaluation metric.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Optional
 
 import numpy as np
 import jax
@@ -57,6 +57,7 @@ def run_chunked_episode(
     max_chunks: int,
     sample_action_chunk: SampleActionChunk,
     pre_chunk_hook: PreChunkHook | None = None,
+    post_step_hook: Optional[Callable[[Any], None]] = None,
     record_rgb: bool = True,
 ) -> RolloutOutcome:
     """Replan + step loop shared by manip and maze rollouts.
@@ -64,7 +65,9 @@ def run_chunked_episode(
     Each chunk: (optional) ``pre_chunk_hook`` for visualization side effects,
     ``sample_action_chunk(obs, goal)`` to get the next action chunk, then the
     env is stepped action-by-action, an RGB frame is captured per env step
-    (when ``record_rgb=True``). The episode ends when the env reports
+    (when ``record_rgb=True``). If ``post_step_hook`` is set, it is called with
+    ``env`` after each successful ``step`` (and after optional RGB capture).
+    The episode ends when the env reports
     ``info['success']`` at any step, or returns ``terminated``/``truncated``,
     or the chunk budget is exhausted.
     """
@@ -100,6 +103,8 @@ def run_chunked_episode(
             cum_env = cum_env or success_flag
             if record_rgb:
                 _maybe_append_rgb(env, rgb_frames)
+            if post_step_hook is not None:
+                post_step_hook(env)
             if success_flag:
                 break
         states.append(obs.copy())

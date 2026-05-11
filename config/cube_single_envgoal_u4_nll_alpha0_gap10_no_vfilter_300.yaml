@@ -1,0 +1,32 @@
+# Cube-single 300-epoch run with env-capped same-trajectory goal sampling.
+# U=4 diagonal-Gaussian NLL, no subgoal value bonus, stronger value-gap weighting.
+# Eval value-based subgoal filtering is disabled via `--nosubgoal_filter`.
+
+env_name: cube-single-play-v0
+run_group: cube_single_envgoal_u4_nll_alpha0_gap10_no_vfilter
+train_epochs: 300
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+horizon: 25
+plan_candidates: 1
+
+dynamics:
+  max_goal_steps_from_env: true
+  clip_path_to_goal: true
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 4
+  subgoal_value_alpha: 0.0
+  subgoal_value_gap_scale: 10.0
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.995
+  kappa_b: 0.93
+  kappa_d: 0.8
+  max_goal_steps_from_env: true
+  clip_chunk_to_goal: true
+
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0

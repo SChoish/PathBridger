@@ -9,13 +9,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from agents.critic import ScalarValueNet
+from utils.goal_representation import manip_cube_pos_indices
 
 
 SubgoalFilterFn = Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]
 
-_MANIP_ARM_JOINT_DIM = 6
-_MANIP_HEAD_DIM = 2 * _MANIP_ARM_JOINT_DIM + 3 + 1 + 1 + 1 + 1
-_MANIP_CUBE_STRIDE = 3 + 4 + 1 + 1
 _DEFAULT_GOAL_REP_DIM = 2
 
 
@@ -33,14 +31,7 @@ def _manip_cube_pos_indices(obs_dim: int) -> tuple[int, ...]:
     from the final goal, leaving arm/gripper and cube orientation untouched.
     """
 
-    dim = int(obs_dim)
-    rem = dim - _MANIP_HEAD_DIM
-    if rem < _MANIP_CUBE_STRIDE or rem % _MANIP_CUBE_STRIDE != 0:
-        return ()
-    idxs: list[int] = []
-    for start in range(_MANIP_HEAD_DIM, dim, _MANIP_CUBE_STRIDE):
-        idxs.extend((start, start + 1, start + 2))
-    return tuple(idxs)
+    return manip_cube_pos_indices(obs_dim)
 
 
 def _filter_replacement_target(subgoal_b: jnp.ndarray, goal_b: jnp.ndarray) -> jnp.ndarray:
@@ -73,6 +64,7 @@ def make_value_subgoal_filter_from_params(
     value_def = ScalarValueNet(
         tuple(int(x) for x in critic_config['value_hidden_dims']),
         layer_norm=bool(critic_config.get('layer_norm', True)),
+        goal_representation=str(critic_config.get('goal_representation', 'full')),
     )
 
     @jax.jit

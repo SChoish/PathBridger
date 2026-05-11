@@ -58,10 +58,38 @@ def is_manipspace_env(env) -> bool:
     )
 
 
+def snapshot_manip_mocap(env) -> tuple[np.ndarray, np.ndarray] | None:
+    """Copy MuJoCo mocap buffers (goal markers, etc.) for ManipSpace envs; else None."""
+    u = getattr(env, 'unwrapped', env)
+    if not is_manipspace_env(u):
+        return None
+    d = u._data
+    return (np.asarray(d.mocap_pos, dtype=np.float64).copy(), np.asarray(d.mocap_quat, dtype=np.float64).copy())
+
+
+def apply_snapshot_manip_mocap(dst_env, mocap_pos: np.ndarray, mocap_quat: np.ndarray) -> bool:
+    """Paste mocap pose into ``dst_env`` and run ``mj_forward`` so renders match the source episode."""
+    import mujoco
+
+    du = getattr(dst_env, 'unwrapped', dst_env)
+    if not is_manipspace_env(du):
+        return False
+    dp, dq = du._data.mocap_pos, du._data.mocap_quat
+    if dp.shape != mocap_pos.shape or dq.shape != mocap_quat.shape:
+        return False
+    dp[:] = np.asarray(mocap_pos, dtype=np.float64).reshape(dp.shape)
+    dq[:] = np.asarray(mocap_quat, dtype=np.float64).reshape(dq.shape)
+    mujoco.mj_forward(du._model, du._data)
+    return True
+
+
+_MANIP_BUTTON_SCALER = 120.0
+
+
 def sync_env_state_from_compact_manip_obs(env, obs: np.ndarray) -> np.ndarray:
     """Decode an OGBench manipspace compact observation into ``qpos``/``qvel`` and apply via ``set_state``.
 
-    Compact obs layout (per ``ogbench/manipspace/envs/manipspace_env.py::compute_observation``)::
+    Cube-family obs layout (per ``ogbench/manipspace/envs/manipspace_env.py::compute_observation``)::
 
         [joint_pos (J),
          joint_vel (J),
@@ -70,6 +98,11 @@ def sync_env_state_from_compact_manip_obs(env, obs: np.ndarray) -> np.ndarray:
          gripper_opening * 3, gripper_contact,
          per-cube i: (block_pos - xyz_center) * 10 (3), block_quat (4),
                      cos(block_yaw), sin(block_yaw)]
+
+    Puzzle-family obs (``ogbench/manipspace/envs/puzzle_env.py::compute_observation``) shares the
+    head and trails ``per-button: [one_hot_state(n_states), button_pos*120, button_vel]`` instead.
+    For puzzle envs we additionally restore ``_cur_button_states`` (argmax of one-hot) and call
+    ``PuzzleEnv.set_state(qpos, qvel, button_states)`` which requires the third arg.
 
     ``effector_pos``, ``effector_yaw``, and the per-cube ``cos/sin yaw`` channels are derivable from
     arm joints and the cube quat respectively, so we ignore them when reconstructing state.
@@ -90,11 +123,23 @@ def sync_env_state_from_compact_manip_obs(env, obs: np.ndarray) -> np.ndarray:
     ob_info = u.compute_ob_info()
     J = int(np.asarray(ob_info['proprio/joint_pos']).shape[0])
     n_cubes = int(getattr(u, '_num_cubes', 0))
+    n_buttons = int(getattr(u, '_num_buttons', 0))
+    n_button_states = int(getattr(u, '_num_button_states', 2))
+
+    if n_buttons > 0:
+        b0_pos_dim = int(np.asarray(ob_info['privileged/button_0_pos']).shape[0])
+        b0_vel_dim = int(np.asarray(ob_info['privileged/button_0_vel']).shape[0])
+    else:
+        b0_pos_dim = b0_vel_dim = 0
+
     head_dim = 2 * J + 3 + 1 + 1 + 1 + 1
-    needed = head_dim + n_cubes * (3 + 4 + 1 + 1)
+    cube_block = 3 + 4 + 1 + 1
+    button_block = n_button_states + b0_pos_dim + b0_vel_dim
+    needed = head_dim + n_cubes * cube_block + n_buttons * button_block
     if obs.shape[0] < needed:
         raise ValueError(
-            f'compact manip obs too short: dim={obs.shape[0]} < required {needed} for J={J}, n_cubes={n_cubes}.'
+            f'compact manip obs too short: dim={obs.shape[0]} < required {needed} '
+            f'for J={J}, n_cubes={n_cubes}, n_buttons={n_buttons}.'
         )
 
     p = 0
@@ -110,6 +155,15 @@ def sync_env_state_from_compact_manip_obs(env, obs: np.ndarray) -> np.ndarray:
         c_quat = obs[p:p + 4]; p += 4
         p += 1 + 1  # skip cos/sin yaw.
         cube_pos_quat.append((c_pos_scaled, c_quat))
+
+    button_states = np.zeros((n_buttons,), dtype=np.int64)
+    button_pos: list[np.ndarray] = []
+    for i in range(n_buttons):
+        oh = obs[p:p + n_button_states]; p += n_button_states
+        bp = obs[p:p + b0_pos_dim]; p += b0_pos_dim
+        p += b0_vel_dim  # button_vel ignored (qvel zeroed below).
+        button_states[i] = int(np.argmax(oh))
+        button_pos.append(np.asarray(bp, dtype=np.float64) / _MANIP_BUTTON_SCALER)
 
     qpos = np.array(u._data.qpos, dtype=np.float64).copy()
     qvel = np.zeros_like(np.asarray(u._data.qvel, dtype=np.float64))
@@ -137,7 +191,18 @@ def sync_env_state_from_compact_manip_obs(env, obs: np.ndarray) -> np.ndarray:
         qn = float(np.linalg.norm(q))
         qpos[qadr + 3:qadr + 7] = q / qn if qn > 1e-9 else np.array([1.0, 0.0, 0.0, 0.0])
 
-    u.set_state(qpos, qvel)
+    for i, bp in enumerate(button_pos):
+        try:
+            jid = u._model.joint(f'buttonbox_joint_{i}').id
+        except Exception:
+            continue
+        qadr = int(u._model.jnt_qposadr[jid])
+        qpos[qadr:qadr + bp.shape[0]] = bp
+
+    if n_buttons > 0:
+        u.set_state(qpos, qvel, button_states)
+    else:
+        u.set_state(qpos, qvel)
     return np.asarray(u.compute_observation(), dtype=np.float32).reshape(-1)
 
 

@@ -38,15 +38,21 @@ import numpy as np
 
 from agents.actor import ActorAgent, get_actor_config
 from agents.dynamics import DynamicsAgent
-from rollout.common import manip_play_family, slug_from_env
-from rollout.env import configure_mujoco_gl, max_episode_steps_from_wrappers
+from rollout.common import align_action_to_env, manip_play_family, slug_from_env
+from rollout.env import (
+    apply_snapshot_manip_mocap,
+    configure_mujoco_gl,
+    env_render_rgb_u8,
+    max_episode_steps_from_wrappers,
+    snapshot_manip_mocap,
+    sync_env_state_from_compact_manip_obs,
+)
 from rollout.episode_runner import (
-    make_actor_chunk_fn,
-    make_idm_chunk_fn,
     run_chunked_episode,
 )
-from rollout.plot import write_rgb_array_mp4
+from rollout.plot import compose_state_subgoal_env_frames, write_rgb_array_mp4
 from rollout.value_field import load_critic_for_run
+from main import _idm_action_chunk
 from utils.env_utils import make_env_and_datasets
 from utils.run_io import (
     list_checkpoint_suffixes,
@@ -177,6 +183,100 @@ def _write_rollout_task_summary_csv(out_dir: Path, rows: list[dict[str, Any]]) -
     return path
 
 
+def _render_subgoal_frames(
+    env_name: str,
+    frame_stack: int | None,
+    task_id: int,
+    subgoals: np.ndarray,
+    n_frames: int,
+    mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] | None = None,
+) -> np.ndarray:
+    """Render predicted subgoals in a second ManipSpace env, one frame per executed env step.
+
+    When ``mocap_snapshots`` is provided (one entry per frame, from the main rollout env),
+    mocap poses are pasted after ``sync_env_state_from_compact_manip_obs`` so goal markers
+    match the left panel (fixes independent ``permute_blocks`` RNG on the render env).
+    """
+    if n_frames < 1:
+        return np.zeros((0, 1, 1, 3), dtype=np.uint8)
+    sub_env, _, _ = make_env_and_datasets(env_name, frame_stack=frame_stack, render_mode='rgb_array')
+    sub_env.reset(options=dict(task_id=int(task_id), render_goal=False))
+    frames: list[np.ndarray] = []
+    try:
+        if subgoals.size == 0:
+            raise RuntimeError('No predicted subgoals were recorded for subgoal render composition.')
+        for t in range(int(n_frames)):
+            sg = subgoals[min(t, int(subgoals.shape[0]) - 1)]
+            sync_env_state_from_compact_manip_obs(sub_env, sg)
+            if mocap_snapshots is not None and t < len(mocap_snapshots):
+                mp, mq = mocap_snapshots[t]
+                apply_snapshot_manip_mocap(sub_env, mp, mq)
+            fr = env_render_rgb_u8(sub_env)
+            if fr is None:
+                raise RuntimeError(f'Failed to render subgoal frame at step {t}.')
+            frames.append(fr)
+    finally:
+        try:
+            sub_env.close()
+        except Exception:
+            pass
+    return np.stack(frames, axis=0)
+
+
+def _write_state_subgoal_mp4(
+    *,
+    env_name: str,
+    frame_stack: int | None,
+    task_id: int,
+    state_frames: np.ndarray,
+    subgoals_per_step: list[np.ndarray],
+    path: Path,
+    fps: float,
+    min_mp4_seconds: float,
+    mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] | None = None,
+) -> int:
+    """Write left=actual env, right=predicted-subgoal env MP4 and return frame count."""
+    # ``run_chunked_episode`` records one initial frame plus one frame per executed env step.
+    step_frames = np.asarray(state_frames[1:], dtype=np.uint8)
+    if step_frames.size == 0:
+        step_frames = np.asarray(state_frames, dtype=np.uint8)
+    subgoals = (
+        np.stack(subgoals_per_step, axis=0).astype(np.float32)
+        if subgoals_per_step
+        else np.zeros((0, 0), dtype=np.float32)
+    )
+    n = min(int(step_frames.shape[0]), int(subgoals.shape[0]))
+    if n <= 0:
+        raise RuntimeError('No aligned state/subgoal frames to write.')
+    step_frames = step_frames[:n]
+    mocap_use = None
+    if mocap_snapshots is not None and len(mocap_snapshots) > 0:
+        mocap_use = mocap_snapshots[:n]
+        if len(mocap_use) != n:
+            raise RuntimeError(
+                f'mocap_snapshots length {len(mocap_use)} != aligned subgoal frames {n} '
+                f'(state_frames={int(state_frames.shape[0])}, subgoals={len(subgoals_per_step)})'
+            )
+    subgoal_frames = _render_subgoal_frames(
+        env_name, frame_stack, task_id, subgoals[:n], n, mocap_snapshots=mocap_use
+    )
+    composed = compose_state_subgoal_env_frames(
+        step_frames,
+        subgoal_frames,
+        output_scale=1.1,
+        label_left='state',
+        label_right='predicted subgoal',
+    )
+    frames = _pad_rgb_frames_min_duration(composed, float(fps), float(min_mp4_seconds))
+    write_rgb_array_mp4(
+        frames,
+        path,
+        float(fps),
+        caption_lines=['left: env state', 'right: env @ predicted subgoal'],
+    )
+    return int(frames.shape[0])
+
+
 def _run_one_task(
     run_dir: Path,
     task_id: int,
@@ -254,6 +354,23 @@ def _run_one_task(
     ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=False))
     s0 = np.asarray(ob, dtype=np.float32).reshape(-1)
     s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+    idm_subgoals_per_step: list[np.ndarray] = []
+    idm_mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def _idm_post_step_mocap(e: Any) -> None:
+        snap = snapshot_manip_mocap(e)
+        if snap is not None:
+            idm_mocap_snapshots.append(snap)
+
+    def _idm_chunk_with_subgoal_trace(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        pred = np.asarray(agent.infer_subgoal(jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(goal, dtype=jnp.float32)))
+        pred = pred.reshape(-1).astype(np.float32)
+        if value_subgoal_filter is not None:
+            pred = np.asarray(value_subgoal_filter(obs, pred, goal), dtype=np.float32).reshape(-1)
+        chunk = _idm_action_chunk(agent, np.asarray(obs, dtype=np.float32).reshape(-1), pred, int(idm_h))
+        for _ in range(int(chunk.shape[0])):
+            idm_subgoals_per_step.append(pred.copy())
+        return chunk
 
     idm_outcome = run_chunked_episode(
         env,
@@ -262,7 +379,8 @@ def _run_one_task(
         low=low,
         high=high,
         max_chunks=int(idm_chunks),
-        sample_action_chunk=make_idm_chunk_fn(agent, int(idm_h), subgoal_filter=value_subgoal_filter),
+        sample_action_chunk=_idm_chunk_with_subgoal_trace,
+        post_step_hook=_idm_post_step_mocap,
         record_rgb=True,
     )
     idm_out_tag = 'success' if idm_outcome.ok_env else 'fail'
@@ -270,13 +388,21 @@ def _run_one_task(
     idm_mp4_rel = ''
     idm_mp4_frames = 0
     if idm_outcome.rgb_frames is not None and idm_outcome.rgb_frames.size > 0:
-        frames = _pad_rgb_frames_min_duration(idm_outcome.rgb_frames, float(fps), float(min_mp4_seconds))
-        write_rgb_array_mp4(frames, mp4_idm, float(fps))
+        idm_mp4_frames = _write_state_subgoal_mp4(
+            env_name=env_name,
+            frame_stack=cfg.get('frame_stack'),
+            task_id=int(task_id),
+            state_frames=idm_outcome.rgb_frames,
+            subgoals_per_step=idm_subgoals_per_step,
+            path=mp4_idm,
+            fps=float(fps),
+            min_mp4_seconds=float(min_mp4_seconds),
+            mocap_snapshots=idm_mocap_snapshots if idm_mocap_snapshots else None,
+        )
         idm_mp4_rel = _path_rel_to(out_dir, mp4_idm)
-        idm_mp4_frames = int(frames.shape[0])
         print(
             f'[task {task_id}] wrote {mp4_idm}  raw_frames={idm_outcome.rgb_frames.shape[0]} '
-            f'mp4_frames={frames.shape[0]} chunks={idm_outcome.n_chunks} idm_horizon={idm_h} '
+            f'mp4_frames={idm_mp4_frames} chunks={idm_outcome.n_chunks} idm_horizon={idm_h} '
             f'eval_max_chunks={em} env_info_success={idm_outcome.ok_env}'
         )
     else:
@@ -298,6 +424,32 @@ def _run_one_task(
     ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=False))
     s0 = np.asarray(ob, dtype=np.float32).reshape(-1)
     s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+    actor_subgoals_per_step: list[np.ndarray] = []
+    actor_mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def _actor_post_step_mocap(e: Any) -> None:
+        snap = snapshot_manip_mocap(e)
+        if snap is not None:
+            actor_mocap_snapshots.append(snap)
+
+    def _actor_chunk_with_subgoal_trace(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        pred = np.asarray(agent.infer_subgoal(jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(goal, dtype=jnp.float32)))
+        pred = pred.reshape(-1).astype(np.float32)
+        if value_subgoal_filter is not None:
+            pred = np.asarray(value_subgoal_filter(obs, pred, goal), dtype=np.float32).reshape(-1)
+        chunk = np.asarray(
+            actor_agent.sample_actions(
+                jnp.asarray(obs, dtype=jnp.float32),
+                jnp.asarray(pred, dtype=jnp.float32),
+            ),
+            dtype=np.float32,
+        ).reshape(int(act_h), -1)
+        if not chunk.flags.writeable:
+            chunk = chunk.copy()
+        for i in range(int(chunk.shape[0])):
+            chunk[i] = align_action_to_env(chunk[i], int(act_dim))
+            actor_subgoals_per_step.append(pred.copy())
+        return chunk
 
     actor_outcome = run_chunked_episode(
         env,
@@ -306,13 +458,8 @@ def _run_one_task(
         low=low,
         high=high,
         max_chunks=int(actor_chunks),
-        sample_action_chunk=make_actor_chunk_fn(
-            agent,
-            actor_agent,
-            int(act_h),
-            int(act_dim),
-            subgoal_filter=value_subgoal_filter,
-        ),
+        sample_action_chunk=_actor_chunk_with_subgoal_trace,
+        post_step_hook=_actor_post_step_mocap,
         record_rgb=True,
     )
     ac_out_tag = 'success' if actor_outcome.ok_env else 'fail'
@@ -320,13 +467,21 @@ def _run_one_task(
     actor_mp4_rel = ''
     actor_mp4_frames = 0
     if actor_outcome.rgb_frames is not None and actor_outcome.rgb_frames.size > 0:
-        frames = _pad_rgb_frames_min_duration(actor_outcome.rgb_frames, float(fps), float(min_mp4_seconds))
-        write_rgb_array_mp4(frames, mp4_ac, float(fps))
+        actor_mp4_frames = _write_state_subgoal_mp4(
+            env_name=env_name,
+            frame_stack=cfg.get('frame_stack'),
+            task_id=int(task_id),
+            state_frames=actor_outcome.rgb_frames,
+            subgoals_per_step=actor_subgoals_per_step,
+            path=mp4_ac,
+            fps=float(fps),
+            min_mp4_seconds=float(min_mp4_seconds),
+            mocap_snapshots=actor_mocap_snapshots if actor_mocap_snapshots else None,
+        )
         actor_mp4_rel = _path_rel_to(out_dir, mp4_ac)
-        actor_mp4_frames = int(frames.shape[0])
         print(
             f'[task {task_id}] wrote {mp4_ac}  raw_frames={actor_outcome.rgb_frames.shape[0]} '
-            f'mp4_frames={frames.shape[0]} chunks={actor_outcome.n_chunks} actor_horizon={act_h} '
+            f'mp4_frames={actor_mp4_frames} chunks={actor_outcome.n_chunks} actor_horizon={act_h} '
             f'eval_max_chunks={em} env_info_success={actor_outcome.ok_env}'
         )
     else:

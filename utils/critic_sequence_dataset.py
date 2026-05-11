@@ -12,6 +12,7 @@ from utils.datasets import (
     Dataset,
     augment_batch_images,
     gather_stacked_observations,
+    goal_final_indices,
 )
 
 
@@ -94,8 +95,10 @@ class CriticSequenceDataset:
             int(self.config['frame_stack']),
         )
 
-    def _lookup_finals(self, idxs: np.ndarray) -> np.ndarray:
-        return self.final_state_for_idx[idxs]
+    def _lookup_finals(self, idxs: np.ndarray, *, max_goal_steps: int | None = None) -> np.ndarray:
+        if max_goal_steps is None or int(max_goal_steps) <= 0:
+            return self.final_state_for_idx[idxs]
+        return goal_final_indices(self.terminal_locs, idxs, max_goal_steps)
 
     def _build_full_chunk_indices(self, idxs: np.ndarray) -> np.ndarray:
         return idxs[:, None] + self.full_offsets[None, :]
@@ -138,7 +141,10 @@ class CriticSequenceDataset:
     def sample_goals(self, idxs):
         batch_size = len(idxs)
         random_goal_idxs = self.dataset.get_random_idxs(batch_size)
-        final_state_idxs = self._lookup_finals(idxs)
+        final_state_idxs = self._lookup_finals(
+            idxs,
+            max_goal_steps=self.config.get('max_goal_steps', None),
+        )
         if bool(self.config['value_geom_sample']):
             offsets = np.random.geometric(p=1 - float(self.config['discount']), size=batch_size)
             traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)

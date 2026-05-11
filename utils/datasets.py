@@ -13,6 +13,21 @@ def lookup_final_indices(terminal_locs: np.ndarray, idxs: np.ndarray) -> np.ndar
     return terminal_locs[np.searchsorted(terminal_locs, idxs)]
 
 
+def goal_final_indices(
+    terminal_locs: np.ndarray,
+    idxs: np.ndarray,
+    max_goal_steps: int | None = None,
+) -> np.ndarray:
+    """Return the furthest same-trajectory index allowed for goal sampling."""
+    finals = lookup_final_indices(terminal_locs, idxs)
+    if max_goal_steps is None:
+        return finals
+    max_steps = int(max_goal_steps)
+    if max_steps <= 0:
+        return finals
+    return np.minimum(finals, idxs + max_steps)
+
+
 def gather_stacked_observations(
     observations: Any,
     idxs: np.ndarray,
@@ -196,6 +211,7 @@ class GCDataset:
     - actor_p_trajgoal: Probability of using a future state in the same trajectory as the actor goal.
     - actor_p_randomgoal: Probability of using a random state as the actor goal.
     - actor_geom_sample: Whether to use geometric sampling for future actor goals.
+    - max_goal_steps: Optional cap on same-trajectory future goal distance.
     - gc_negative: Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as the reward.
     - p_aug: Probability of applying image augmentation.
     - frame_stack: Number of frames to stack.
@@ -289,7 +305,11 @@ class GCDataset:
         random_goal_idxs = self.dataset.get_random_idxs(batch_size)
 
         # Goals from the same trajectory (excluding the current state, unless it is the final state).
-        final_state_idxs = lookup_final_indices(self.terminal_locs, idxs)
+        final_state_idxs = goal_final_indices(
+            self.terminal_locs,
+            idxs,
+            self.config.get('max_goal_steps', None),
+        )
         if geom_sample:
             # Geometric sampling.
             offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)  # in [1, inf)
@@ -383,15 +403,23 @@ class HGCDataset(GCDataset):
 
         # Sample high-level actor goals and set prediction targets.
         # High-level future goals.
+        goal_final_state_idxs = goal_final_indices(
+            self.terminal_locs,
+            idxs,
+            self.config.get('max_goal_steps', None),
+        )
         if self.config['actor_geom_sample']:
             # Geometric sampling.
             offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)  # in [1, inf)
-            high_traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
+            high_traj_goal_idxs = np.minimum(idxs + offsets, goal_final_state_idxs)
         else:
             # Uniform sampling.
             distances = np.random.rand(batch_size)  # in [0, 1)
             high_traj_goal_idxs = np.round(
-                (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
+                (
+                    np.minimum(idxs + 1, goal_final_state_idxs) * distances
+                    + goal_final_state_idxs * (1 - distances)
+                )
             ).astype(int)
         high_traj_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], high_traj_goal_idxs)
 

@@ -1,0 +1,29 @@
+# Linear-SDE dynamics + critic + actor offline training.
+# Antmaze giant ablation:
+#   - diag-Gaussian subgoal estimator.
+#   - Gaussian NLL subgoal loss.
+#   - U=4 sampled subgoals.
+#   - subgoal value bonus alpha=0.3.
+#   - exponential value-gap scale=5.0.
+#   - critic/subgoal networks condition on phi(goal) instead of full goal.
+# Eval value-based subgoal filtering is disabled via `--nosubgoal_filter`.
+
+env_name: antmaze-giant-navigate-v0
+run_group: antmaze_giant_gaussian_u4_alpha0p3_gap5_phi_nll_no_vfilter
+train_epochs: 300
+
+dynamics:
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 4
+  subgoal_value_alpha: 0.3
+  subgoal_value_gap_scale: 5.0
+  subgoal_goal_representation: phi
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.995
+  goal_representation: phi
+
+actor:
+  spi_beta: 1.0
