@@ -1215,9 +1215,10 @@ def main(_):
         float(dynamics_config.get('dynamics_beta_max', 0.0)),
     )
     run_logger.info(
-        'subgoal mode=%s stochastic_loss=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_style=%s value_expectile=%.4g value_gap_scale=%.4g use_mean_for_actor_goal=%s',
+        'subgoal mode=%s stochastic_loss=%s target_mode=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_style=%s value_expectile=%.4g value_gap_scale=%.4g value_weight_max=%.4g use_mean_for_actor_goal=%s',
         str(dynamics_config.get('subgoal_distribution', '')),
         str(dynamics_config.get('subgoal_stochastic_loss', 'mse')),
+        str(dynamics_config.get('subgoal_target_mode', 'absolute')),
         int(dynamics_config.get('subgoal_steps', 0)),
         int(dynamics_config.get('subgoal_num_samples', 1)),
         int(FLAGS.plan_candidates),
@@ -1227,6 +1228,7 @@ def main(_):
         str(dynamics_config.get('subgoal_value_style', 'exponential')),
         float(dynamics_config.get('subgoal_value_expectile', 0.7)),
         float(dynamics_config.get('subgoal_value_gap_scale', 1.0)),
+        float(dynamics_config.get('subgoal_value_weight_max', 0.0)),
         bool(dynamics_config.get('subgoal_use_mean_for_actor_goal', True)),
     )
     run_logger.info(

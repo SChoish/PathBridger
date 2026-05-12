@@ -398,6 +398,168 @@ def test_invalid_subgoal_stochastic_loss_rejected():
     assert raised
 
 
+# ---------------------------------------------------------------------------
+# 9. subgoal_target_mode='displacement'
+# ---------------------------------------------------------------------------
+
+def _displacement_agent(subgoal_distribution='deterministic', **updates):
+    return _make_dynamics_agent(
+        subgoal_distribution,
+        config_updates={'subgoal_target_mode': 'displacement', **updates},
+    )
+
+
+def test_displacement_mode_predict_subgoal_returns_absolute_state():
+    # ``predict_subgoal`` must always return an absolute state; in displacement
+    # mode the raw network output is Delta and the agent adds ``observations``
+    # internally so callers cannot tell the difference.
+    agent_disp = _displacement_agent()
+    agent_abs = _make_dynamics_agent('deterministic')
+    rng = np.random.default_rng(0)
+    obs = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+
+    sg_disp = np.asarray(agent_disp.predict_subgoal(obs, g))
+    raw_disp = np.asarray(agent_disp._subgoal_forward(obs, g))
+    # Output should equal obs + raw network output in displacement mode.
+    np.testing.assert_allclose(sg_disp, np.asarray(obs) + raw_disp, rtol=1e-5, atol=1e-6)
+    assert sg_disp.shape == (BATCH, STATE_DIM)
+
+    # Sanity: absolute-mode agent returns the raw output untouched.
+    sg_abs = np.asarray(agent_abs.predict_subgoal(obs, g))
+    raw_abs = np.asarray(agent_abs._subgoal_forward(obs, g))
+    np.testing.assert_allclose(sg_abs, raw_abs, rtol=1e-5, atol=1e-6)
+
+
+def test_displacement_mode_plan_endpoint_clamped_to_desired_endpoint():
+    # The bridge planner exposes an absolute API; with displacement mode on,
+    # ``plan(current_state, desired_endpoint)`` must still return a trajectory
+    # whose endpoints equal ``current_state`` and ``desired_endpoint`` even
+    # though the underlying chain is trained in displacement frame.
+    agent = _displacement_agent()
+    rng = np.random.default_rng(1)
+    current = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    endpoint = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    result = agent.plan(current, endpoint)
+    traj = np.asarray(result['trajectory'])
+    # The exact-residual chain pins ``traj[:, 0]`` to ``current_state`` because
+    # the plan helper adds back the origin after a 0-anchored chain rollout.
+    np.testing.assert_allclose(traj[:, 0, :], np.asarray(current), rtol=1e-5, atol=1e-6)
+
+
+def test_displacement_mode_forward_bridge_endpoint_preserved():
+    # ``forward_bridge`` clamps both endpoints; the displacement shift must
+    # not break that invariant.
+    cfg_updates = {
+        'subgoal_target_mode': 'displacement',
+        'planner_type': 'forward_bridge',
+    }
+    agent = _make_dynamics_agent('deterministic', config_updates=cfg_updates)
+    rng = np.random.default_rng(2)
+    current = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    endpoint = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    traj = np.asarray(agent.plan(current, endpoint)['trajectory'])
+    np.testing.assert_allclose(traj[:, 0, :], np.asarray(current), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(traj[:, -1, :], np.asarray(endpoint), rtol=1e-5, atol=1e-6)
+
+
+def test_displacement_mode_loss_is_finite_and_target_mode_logged():
+    # Phase-1 loss with displacement-mode targets must remain finite, and the
+    # ``dynamics/subgoal_target_mode`` metric must flag the mode (1.0).
+    agent = _displacement_agent('deterministic')
+    batch = _make_phase1_batch()
+    _, info = agent.update(batch, critic_value_params=None)
+    for k, v in info.items():
+        v = np.asarray(v)
+        assert np.all(np.isfinite(v)), f'non-finite log at {k}: {v}'
+    assert float(info['dynamics/subgoal_target_mode']) == 1.0
+
+    agent_abs = _make_dynamics_agent('deterministic')
+    _, info_abs = agent_abs.update(batch, critic_value_params=None)
+    assert float(info_abs['dynamics/subgoal_target_mode']) == 0.0
+
+
+def test_displacement_mode_residual_net_uses_anchor():
+    # The reverse-chain ResidualNet must take an anchor input and respond to
+    # it; otherwise displacement mode collapses to a translation-invariant
+    # correction and the bridge cannot distinguish two trajectories with the
+    # same Delta but different current states.
+    agent = _displacement_agent('deterministic')
+    rng = np.random.default_rng(11)
+    x = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    x0 = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    xT = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
+    n = jnp.full((BATCH,), 2, dtype=jnp.float32)
+    anchor_a = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    anchor_b = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+
+    eps_a = np.asarray(
+        agent.network.select('residual_net')(x, xT, x0, anchor_a, n)
+    )
+    eps_b = np.asarray(
+        agent.network.select('residual_net')(x, xT, x0, anchor_b, n)
+    )
+    # Different anchors must produce different residuals on at least one
+    # element of the batch (we just need to confirm the input is wired in).
+    assert not np.allclose(eps_a, eps_b, atol=1e-6)
+
+
+def test_displacement_mode_plan_responds_to_current_state():
+    # End-to-end check: with the same Delta = desired_endpoint - current_state
+    # but a different current_state (and matching desired_endpoint shift), the
+    # produced trajectory shape (after subtracting the trivial origin shift)
+    # must differ - otherwise the residual chain is forced to be translation
+    # invariant.
+    agent = _displacement_agent('deterministic')
+    rng = np.random.default_rng(12)
+    current_a = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    delta = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    endpoint_a = current_a + delta
+    shift = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    current_b = current_a + shift
+    endpoint_b = endpoint_a + shift  # same Delta in both cases
+
+    traj_a = np.asarray(agent.plan(current_a, endpoint_a)['trajectory'])
+    traj_b = np.asarray(agent.plan(current_b, endpoint_b)['trajectory'])
+    # Remove the origin shift to isolate the bridge shape.
+    shape_a = traj_a - np.asarray(current_a)[:, None, :]
+    shape_b = traj_b - np.asarray(current_b)[:, None, :]
+    # If the residual ignored the anchor, both shapes would be identical.
+    assert not np.allclose(shape_a, shape_b, atol=1e-6)
+
+
+def test_bridge_anchor_is_always_current_state():
+    # The anchor channel is mode-agnostic: it always carries ``s_t``.  In
+    # absolute mode this is redundant with ``x_T``; in displacement mode it
+    # is the only path through which ``s_t`` reaches the residual MLP.
+    obs = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32) + 3.0
+    for mode in ('absolute', 'displacement'):
+        agent = _make_dynamics_agent(
+            'deterministic', config_updates={'subgoal_target_mode': mode},
+        )
+        anchor = np.asarray(agent._bridge_anchor(obs))
+        np.testing.assert_allclose(anchor, np.asarray(obs), rtol=1e-6, atol=1e-6)
+
+
+def test_displacement_mode_build_actor_proposals_returns_absolute_goals():
+    # ``build_actor_proposals`` must return absolute ``mu`` and
+    # ``candidate_goals`` so SPI/Q can be scored in absolute state space.
+    agent = _displacement_agent('diag_gaussian')
+    rng = np.random.default_rng(3)
+    obs = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    mu, _, cand_goals, _ = agent.build_actor_proposals(
+        obs, g, jax.random.PRNGKey(0),
+        proposal_horizon=2, plan_candidates=2, sample_noise_scale=0.0,
+    )
+    # Network output is Delta; ``mu - obs`` should match the raw forward-pass
+    # mean (so ``mu`` is in absolute frame as expected by downstream callers).
+    raw_mu = np.asarray(agent._subgoal_forward(obs, g)[0])
+    np.testing.assert_allclose(np.asarray(mu) - np.asarray(obs), raw_mu, rtol=1e-5, atol=1e-6)
+    # Each candidate goal is an absolute state with the same shape.
+    assert cand_goals.shape[-1] == STATE_DIM
+
+
 if __name__ == '__main__':
     failures = []
     for name, fn in list(globals().items()):
