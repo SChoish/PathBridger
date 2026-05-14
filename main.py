@@ -38,7 +38,7 @@ from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from utils.ogbench_eval_rollout import rollout_chunked_eval_episode
 from utils.run_io import parse_int_list
-from utils.goal_representation import normalize_phi_goal_obs_indices
+from utils.goal_representation import infer_phi_goal_obs_indices, normalize_phi_goal_obs_indices
 
 FLAGS = flags.FLAGS
 _DEFAULT_HORIZON = 25
@@ -1066,6 +1066,12 @@ def main(_):
         dataset_dir=FLAGS.dataset_dir,
         render_mode='rgb_array',
     )
+    obs_dim_env = int(np.prod(env.observation_space.shape))
+    phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
+    if not phi_idxs:
+        phi_idxs = infer_phi_goal_obs_indices(str(FLAGS.env_name), obs_dim_env)
+        critic_config['phi_goal_obs_indices'] = phi_idxs
+        dynamics_config['phi_goal_obs_indices'] = phi_idxs
     resolved_dyn_goal_cap = _resolve_max_goal_steps_from_env(dynamics_config, env)
     resolved_critic_goal_cap = _resolve_max_goal_steps_from_env(critic_config, env)
     action_dim = int(np.asarray(env.action_space.shape).prod())

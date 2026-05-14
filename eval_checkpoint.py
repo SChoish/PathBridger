@@ -38,6 +38,7 @@ from main import (
     _update_config,
 )
 from utils.datasets import Dataset, PathHGCDataset
+from utils.goal_representation import infer_phi_goal_obs_indices, normalize_phi_goal_obs_indices
 from utils.env_utils import make_env_and_datasets
 from utils.run_io import (
     list_checkpoint_suffixes,
@@ -113,6 +114,12 @@ def main() -> None:
         frame_stack=critic_config['frame_stack'],
         dataset_dir=dataset_dir,
     )
+    obs_dim_env = int(np.prod(env.observation_space.shape))
+    phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
+    if not phi_idxs:
+        phi_idxs = infer_phi_goal_obs_indices(str(env_name), obs_dim_env)
+        critic_config['phi_goal_obs_indices'] = phi_idxs
+        dynamics_config['phi_goal_obs_indices'] = phi_idxs
     action_dim = int(np.asarray(env.action_space.shape).prod())
     critic_config['action_dim'] = action_dim
     actor_config['action_dim'] = action_dim

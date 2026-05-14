@@ -15,7 +15,11 @@
   - **antmaze** / **humanoidmaze**: planar goal ``(x, y)`` — indices ``(0, 1)``.
 
 Any other ``env_name`` under ``phi`` raises ``ValueError``. ``phi_goal_obs_indices``
-is ignored (call signature kept for compatibility).
+in YAML is optional: when omitted or empty, training fills it from ``env_name`` and
+the env observation dimension (maze → ``(0, 1)``; ManipSpace puzzle/cube layouts
+from ``obs_dim``). At runtime, ``goal_representation(..., 'phi', ...)`` still
+derives channels from ``env_name`` and goal shape; the stored tuple is mainly for
+config parity.
 """
 
 from __future__ import annotations
@@ -178,6 +182,37 @@ def manip_button_state_indices(obs_dim: int) -> tuple[int, ...]:
         start = _MANIP_HEAD_DIM + i * _MANIP_BUTTON_STRIDE
         idxs.append(start + 1)
     return tuple(idxs)
+
+
+def infer_phi_goal_obs_indices(env_name: str | None, obs_dim: int | None = None) -> tuple[int, ...]:
+    """Default ``phi_goal_obs_indices`` when YAML omits the field.
+
+    ``goal_representation(..., 'phi', ...)`` already picks channels from ``env_name``
+    and the goal tensor; this tuple keeps critic/dynamics configs self-describing.
+
+    Maze envs always return ``(0, 1)`` (planar goal). Puzzle/cube need ``obs_dim`` to
+    validate the compact layout. Scene returns ``()`` (φ is assembled in
+    ``scene_oracle_phi_from_goals``).
+    """
+
+    if env_name is None or not str(env_name).strip():
+        return ()
+    try:
+        kind = _env_goal_phi_kind(env_name)
+    except ValueError:
+        return ()
+    if kind in ('antmaze', 'humanoidmaze'):
+        return _MAZE_GOAL_XY_INDICES
+    if obs_dim is None:
+        return ()
+    dim = int(obs_dim)
+    if kind == 'puzzle':
+        return manip_button_state_indices(dim)
+    if kind == 'cube':
+        return manip_cube_pos_indices(dim)
+    if kind == 'scene':
+        return ()
+    raise AssertionError(f'unreachable phi kind={kind!r}')
 
 
 def normalize_phi_goal_obs_indices(raw: object) -> tuple[int, ...]:

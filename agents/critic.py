@@ -465,8 +465,9 @@ def get_config():
             p_aug=0.0,
             q_agg='mean',
             # Goal input to value/Q nets. 'full' preserves raw goal concat.
-            # 'phi' uses ManipSpace cube channels when inferred, else
-            # critic_agent.phi_goal_obs_indices (required; e.g. [0,1] for maze x,y).
+            # 'phi' uses ManipSpace cube channels when inferred, else maze (x,y).
+            # When omitted, ``main`` / ``eval_checkpoint`` fill indices from ``env_name``
+            # and observation shape after the env is constructed.
             goal_representation='phi',
             phi_goal_obs_indices=(),
             env_name='',
