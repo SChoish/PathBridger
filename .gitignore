@@ -8,5 +8,7 @@ __pycache__/
 runs/
 prev_runs/
 nohup_logs/
+scripts/sweep_generated/
+scripts/sweep_logs/
 .env
 .venv/
