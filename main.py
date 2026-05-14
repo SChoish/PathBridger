@@ -793,6 +793,11 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
     critic_config['phi_goal_obs_indices'] = phi_idxs
     dynamics_config['phi_goal_obs_indices'] = phi_idxs
+    # Propagate env_name so that 'phi' goal representation can dispatch to the
+    # correct ManipSpace oracle layout (cube xyz vs. puzzle binary button state).
+    env_name_for_phi = str(FLAGS.env_name)
+    dynamics_config['env_name'] = env_name_for_phi
+    critic_config['env_name'] = env_name_for_phi
     validate_config(critic_config, actor_config)
     shared_batch = int(FLAGS.batch_size)
     if shared_batch < 1:

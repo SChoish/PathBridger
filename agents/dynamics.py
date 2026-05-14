@@ -127,10 +127,16 @@ class SubgoalEstimatorNet(nn.Module):
     layer_norm: bool = True
     goal_representation: str = 'full'
     phi_goal_obs_indices: tuple[int, ...] = ()
+    env_name: str = ''
 
     @nn.compact
     def __call__(self, observations, high_actor_goals):
-        goal_inp = goal_representation(high_actor_goals, self.goal_representation, self.phi_goal_obs_indices)
+        goal_inp = goal_representation(
+            high_actor_goals,
+            self.goal_representation,
+            self.phi_goal_obs_indices,
+            env_name=self.env_name,
+        )
         inp = jnp.concatenate([observations, goal_inp], axis=-1)
         return MLP(
             hidden_dims=(*self.hidden_dims, self.state_dim),
@@ -158,10 +164,16 @@ class DistributionalSubgoalEstimatorNet(nn.Module):
     log_std_max: float = 1.0
     goal_representation: str = 'full'
     phi_goal_obs_indices: tuple[int, ...] = ()
+    env_name: str = ''
 
     @nn.compact
     def __call__(self, observations, high_actor_goals):
-        goal_inp = goal_representation(high_actor_goals, self.goal_representation, self.phi_goal_obs_indices)
+        goal_inp = goal_representation(
+            high_actor_goals,
+            self.goal_representation,
+            self.phi_goal_obs_indices,
+            env_name=self.env_name,
+        )
         inp = jnp.concatenate([observations, goal_inp], axis=-1)
         trunk = MLP(
             hidden_dims=tuple(self.hidden_dims),
@@ -1011,12 +1023,14 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         state_dim = ex_observations.shape[-1]
         action_dim = int(ex_actions.shape[-1])
         phi_idxs = normalize_phi_goal_obs_indices(config.get('phi_goal_obs_indices', ()))
+        env_name_for_phi = str(config.get('env_name', ''))
         sg_rep = str(config.get('subgoal_goal_representation', config.get('goal_representation', 'full'))).lower()
         assert_phi_goal_obs_indices(
             int(state_dim),
             sg_rep,
             phi_idxs,
             where='DynamicsAgent.create (subgoal_goal_representation)',
+            env_name=env_name_for_phi,
         )
         val_rep = str(config.get('subgoal_value_goal_representation', 'full')).lower()
         assert_phi_goal_obs_indices(
@@ -1024,6 +1038,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             val_rep,
             phi_idxs,
             where='DynamicsAgent.create (subgoal_value_goal_representation)',
+            env_name=env_name_for_phi,
         )
         idm_hidden = config.get('idm_hidden_dims', (512, 512, 512))
         if isinstance(idm_hidden, str):
@@ -1063,6 +1078,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                     config.get('subgoal_goal_representation', config.get('goal_representation', 'full')),
                 ),
                 phi_goal_obs_indices=phi_idxs,
+                env_name=env_name_for_phi,
             )
         elif sub_mode == 'diag_gaussian':
             subgoal_def = DistributionalSubgoalEstimatorNet(
@@ -1075,6 +1091,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                     config.get('subgoal_goal_representation', config.get('goal_representation', 'full')),
                 ),
                 phi_goal_obs_indices=phi_idxs,
+                env_name=env_name_for_phi,
             )
         else:
             raise ValueError(
@@ -1217,6 +1234,7 @@ class DynamicsAgent(_DynamicsAgentCore):
             layer_norm=bool(self.config.get('subgoal_value_layer_norm', True)),
             goal_representation=str(self.config.get('subgoal_value_goal_representation', 'full')),
             phi_goal_obs_indices=normalize_phi_goal_obs_indices(self.config.get('phi_goal_obs_indices', ())),
+            env_name=str(self.config.get('env_name', '')),
         )
         value_logits = value_def.apply({'params': critic_value_params}, states, high_actor_goals)
         return jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
