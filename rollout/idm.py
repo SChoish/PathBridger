@@ -65,7 +65,6 @@ from rollout.plot import (
     write_rgb_array_mp4,
 )
 from utils.inverse_dynamics import InverseDynamicsMLP
-from utils.subgoal_filter import SubgoalFilterFn, make_value_subgoal_filter_from_critic_agent
 from rollout.maze_navigator import MazeNavigatorMap
 
 
@@ -89,7 +88,6 @@ def rollout_dynamics_idm_env(
     record_env_rgb: bool = True,
     planner_noise_scale: float = 0.0,
     planner_seed: int = 0,
-    subgoal_filter: SubgoalFilterFn | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray, np.ndarray]:
     """Chunked dynamics bridge + inverse dynamics in the real environment.
 
@@ -130,9 +128,6 @@ def rollout_dynamics_idm_env(
         g = jnp.asarray(goal, dtype=jnp.float32)
         hat = agent.infer_subgoal(s, g)
         hat_np = np.asarray(jax.device_get(hat), dtype=np.float32).reshape(-1)
-        if subgoal_filter is not None:
-            hat_np = np.asarray(subgoal_filter(obs, hat_np, goal), dtype=np.float32).reshape(-1)
-            hat = jnp.asarray(hat_np, dtype=jnp.float32)
         hat_plot_np = xy_clamper(hat_np.copy())
 
         if use_stoch_plan:
@@ -265,17 +260,6 @@ def main() -> None:
     )
     p.add_argument('--value_grid_n', type=int, default=56, help='Square grid resolution for value heatmap.')
     p.add_argument(
-        '--subgoal_filter',
-        action='store_true',
-        help='If V(predicted_subgoal, goal) <= V(current_state, goal) and V(current_state, predicted_subgoal) > R, replace goal-representation channels.',
-    )
-    p.add_argument(
-        '--subgoal_filter_threshold',
-        type=float,
-        default=0.5,
-        help='Reachability threshold R for value filtering, applied to sigmoid V(current_state, predicted_subgoal).',
-    )
-    p.add_argument(
         '--critic_epoch',
         type=int,
         default=-1,
@@ -394,21 +378,7 @@ def main() -> None:
         train_raw,
         seed=int(args.seed),
     )
-    critic_value_params = critic_agent.network.params.get('modules_value', None)
     print(f'Loaded critic for IDM inference/value heatmap (epoch suffix {ce})')
-    value_subgoal_filter = (
-        make_value_subgoal_filter_from_critic_agent(
-            critic_agent,
-            reachability_threshold=float(args.subgoal_filter_threshold),
-        )
-        if bool(args.subgoal_filter)
-        else None
-    )
-    if value_subgoal_filter is not None:
-        print(
-            'Subgoal filter enabled: replace phi(predicted_subgoal) with phi(goal) when '
-            f'V(subgoal,g) <= V(s,g) and V(s,subgoal) > {float(args.subgoal_filter_threshold):.4f}.'
-        )
 
     roll, hats, n_chunks, reached, env_frames, frame_plan_trajs, hats_per_step = rollout_dynamics_idm_env(
         env,
@@ -424,7 +394,6 @@ def main() -> None:
         action_chunk_horizon=int(args.action_chunk_horizon),
         planner_noise_scale=float(args.planner_noise_scale),
         planner_seed=planner_seed,
-        subgoal_filter=value_subgoal_filter,
     )
     n_trans = max(0, int(roll.shape[0]) - 1)
     action_chunk_horizon = int(args.action_chunk_horizon)

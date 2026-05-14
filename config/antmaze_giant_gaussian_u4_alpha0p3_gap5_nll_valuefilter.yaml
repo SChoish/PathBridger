@@ -5,7 +5,6 @@
 #   - U=4 sampled subgoals.
 #   - subgoal value bonus alpha=0.3.
 #   - exponential value-gap scale=5.0.
-# Env eval uses value filtering by default (main.py --subgoal_filter default).
 
 env_name: antmaze-giant-navigate-v0
 run_group: antmaze_giant_gaussian_u4_alpha0p3_gap5_nll_valuefilter

@@ -1,7 +1,6 @@
 # Cube-single 300-epoch run with env-capped same-trajectory goal sampling.
 # U=4 diagonal-Gaussian NLL, alpha=0.3, stronger value-gap weighting.
 # Critic and subgoal networks condition on phi(goal) instead of the full goal.
-# Eval value-based subgoal filtering is disabled via `--nosubgoal_filter`.
 
 env_name: cube-single-play-v0
 run_group: cube_single_envgoal_u4_nll_alpha03_gap20_phi_no_vfilter

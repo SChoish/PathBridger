@@ -1,17 +1,21 @@
 """Goal representation helpers shared by goal-conditioned networks.
 
-The ``phi`` mode mirrors OGBench's ``compute_oracle_observation`` for ManipSpace:
-  - ManipSpace cube envs: ``(scaled) xyz`` per cube
-    (``ogbench/manipspace/envs/cube_env.py::CubeEnv.compute_oracle_observation``).
-  - ManipSpace puzzle envs: ``binary state`` per button
-    (``ogbench/manipspace/envs/puzzle_env.py::PuzzleEnv.compute_oracle_observation``,
-    returns ``self._cur_button_states.astype(np.float64)``).
+``phi`` / ``auto`` / ``goal_phi`` are defined only for these OGBench families
+(distinguished by ``env_name``):
 
-Because cube-quadruple (``obs_dim=55``) and puzzle-3x3 (``obs_dim=55``) collide
-on observation dimensionality, ``obs_dim`` alone cannot distinguish the two
-layouts. Callers should pass ``env_name`` so we can route to the correct
-oracle layout. For maze-style goals, ``critic_agent.phi_goal_obs_indices`` is
-still required when the observation does not match either ManipSpace layout.
+  - **puzzle**: binary pressed state per button (compact obs one-hot channel).
+  - **cube**: concatenated ``(x, y, z)`` per cube — same layout as
+    ``CubeEnv.compute_oracle_observation`` (scaled center-relative positions).
+  - **scene**: same order as ``SceneEnv.compute_oracle_observation``: all cubes'
+    scaled ``(x,y,z)``, then one scalar **button state** per button (from argmax
+    of the one-hot block in compact obs), then ``drawer_pos * drawer_scaler`` and
+    ``window_pos * window_scaler`` (the first channel of each tail pair in
+    ``compute_observation``). Cube / button counts and one-hot width are inferred
+    from ``obs_dim`` (must factor uniquely).
+  - **antmaze** / **humanoidmaze**: planar goal ``(x, y)`` — indices ``(0, 1)``.
+
+Any other ``env_name`` under ``phi`` raises ``ValueError``. ``phi_goal_obs_indices``
+is ignored (call signature kept for compatibility).
 """
 
 from __future__ import annotations
@@ -23,32 +27,133 @@ import jax.numpy as jnp
 _MANIP_ARM_JOINT_DIM = 6
 _MANIP_HEAD_DIM = 2 * _MANIP_ARM_JOINT_DIM + 3 + 1 + 1 + 1 + 1
 _MANIP_CUBE_STRIDE = 3 + 4 + 1 + 1
-_MANIP_BUTTON_STATE_DIM = 2
-_MANIP_BUTTON_STRIDE = _MANIP_BUTTON_STATE_DIM + 1 + 1
+_MANIP_BUTTON_STRIDE = 2 + 1 + 1
+
+# Scene compact tail: drawer (scaled pos, vel), window (scaled pos, vel).
+_SCENE_TAIL_DIM = 4
+
+# Planar achieved-goal channels in OGBench maze goal observations.
+_MAZE_GOAL_XY_INDICES = (0, 1)
 
 
-def _env_kind_from_name(env_name: str | None) -> str | None:
-    """Return ``'cube'``, ``'puzzle'``, or ``None`` based on the env name."""
+def _env_goal_phi_kind(env_name: str | None) -> str:
+    """Return canonical phi family."""
 
-    if not env_name:
-        return None
+    if env_name is None or not str(env_name).strip():
+        raise ValueError(
+            "goal_representation='phi' requires a non-empty env_name "
+            "(e.g. FLAGS.env_name from yaml env_name)."
+        )
     name = str(env_name).lower()
+    if 'humanoidmaze' in name:
+        return 'humanoidmaze'
+    if 'antmaze' in name:
+        return 'antmaze'
     if 'puzzle' in name:
         return 'puzzle'
-    if 'cube' in name or 'scene' in name:
+    if 'scene' in name:
+        return 'scene'
+    if 'cube' in name:
         return 'cube'
-    return None
+    raise ValueError(
+        f"goal_representation='phi': unsupported env_name={env_name!r}. "
+        "Expected a name containing one of: 'humanoidmaze', 'antmaze', 'puzzle', "
+        "'scene', or 'cube'."
+    )
+
+
+def _parse_scene_compact_layout(obs_dim: int) -> tuple[int, int, int]:
+    """Infer ``(num_cubes, num_buttons, num_button_states)`` from compact ``obs_dim``.
+
+    After the fixed ManipSpace head, ``SceneEnv.compute_observation`` packs
+    ``n_cubes`` blocks of stride 9, then ``n_buttons`` blocks of
+    ``(one_hot[S] + pos + vel)`` with ``S = num_button_states``, then a tail of
+    length ``_SCENE_TAIL_DIM``. OGBench scene defaults use ``S >= 2``.
+    """
+
+    dim = int(obs_dim)
+    if dim < _MANIP_HEAD_DIM + _SCENE_TAIL_DIM:
+        raise ValueError(
+            f'Scene compact obs_dim={dim} is too small '
+            f'(need at least head={_MANIP_HEAD_DIM} + tail={_SCENE_TAIL_DIM}).'
+        )
+    mid = dim - _MANIP_HEAD_DIM - _SCENE_TAIL_DIM
+    if mid < 0:
+        raise ValueError(f'Scene compact obs_dim={dim} has negative mid-body length.')
+
+    solutions: list[tuple[int, int, int]] = []
+    max_cubes = mid // _MANIP_CUBE_STRIDE
+    for nc in range(0, max_cubes + 1):
+        rest = mid - _MANIP_CUBE_STRIDE * nc
+        if rest < 0:
+            continue
+        for S in range(2, 16):
+            bstride = S + 2
+            if rest % bstride != 0:
+                continue
+            nb = rest // bstride
+            if nb < 1:
+                continue
+            solutions.append((nc, nb, S))
+
+    if not solutions:
+        raise ValueError(
+            f'Scene obs_dim={dim}: cannot factor mid={mid} into '
+            f'n_cubes * {_MANIP_CUBE_STRIDE} + n_buttons * (S+2) with S>=2.'
+        )
+    if len(solutions) > 1:
+        raise ValueError(
+            f'Scene obs_dim={dim}: ambiguous layout; mid={mid} matches multiple '
+            f'(n_cubes, n_buttons, S) tuples: {solutions}.'
+        )
+    return solutions[0]
+
+
+def scene_oracle_phi_from_goals(goals: jnp.ndarray, obs_dim: int) -> jnp.ndarray:
+    """``phi`` vector matching ``SceneEnv.compute_oracle_observation`` ordering."""
+
+    nc, nb, S = _parse_scene_compact_layout(obs_dim)
+    dim = int(obs_dim)
+    head = _MANIP_HEAD_DIM
+    parts: list[jnp.ndarray] = []
+
+    cur = head
+    if nc > 0:
+        cube_idx: list[int] = []
+        for _ in range(nc):
+            cube_idx.extend((cur, cur + 1, cur + 2))
+            cur += _MANIP_CUBE_STRIDE
+        parts.append(jnp.take(goals, jnp.asarray(cube_idx, dtype=jnp.int32), axis=-1))
+
+    bstride = S + 2
+    if nb > 0:
+        scalars = []
+        for _ in range(nb):
+            block = goals[..., cur : cur + bstride]
+            oh = block[..., :S]
+            scalars.append(jnp.argmax(oh, axis=-1).astype(jnp.float32))
+            cur += bstride
+        parts.append(jnp.stack(scalars, axis=-1))
+
+    expected_cur = dim - _SCENE_TAIL_DIM
+    if cur != expected_cur:
+        raise ValueError(
+            f'Scene layout parse inconsistency: expected cursor {expected_cur} after '
+            f'cubes/buttons, got {cur} for obs_dim={dim}.'
+        )
+
+    tail_idx = jnp.asarray([dim - 4, dim - 2], dtype=jnp.int32)
+    parts.append(jnp.take(goals, tail_idx, axis=-1))
+
+    if not parts:
+        raise ValueError(f'Scene phi: empty parts for obs_dim={dim}.')
+    if len(parts) == 1:
+        return parts[0]
+    return jnp.concatenate(parts, axis=-1)
 
 
 def manip_cube_pos_indices(obs_dim: int) -> tuple[int, ...]:
-    """Return compact ManipSpace cube-position channels for one observation frame.
-
-    Cube obs layout (see ``ogbench.manipspace.envs.cube_env``):
-    ``head(19) + n_cubes * (pos[3] + quat[4] + cos_yaw + sin_yaw)``. This helper
-    returns the ``pos[3]`` channels for every cube, matching the cube oracle
-    representation up to the ``xyz_center`` / ``xyz_scaler`` affine transform
-    that the dataset's compact obs already bakes in.
-    """
+    """Return compact-obs indices for every cube's ``(x,y,z)`` (oracle-aligned)."""
 
     dim = int(obs_dim)
     rem = dim - _MANIP_HEAD_DIM
@@ -61,14 +166,7 @@ def manip_cube_pos_indices(obs_dim: int) -> tuple[int, ...]:
 
 
 def manip_button_state_indices(obs_dim: int) -> tuple[int, ...]:
-    """Return per-button binary-state channels for ManipSpace puzzle obs.
-
-    Puzzle obs layout (see ``ogbench.manipspace.envs.puzzle_env``):
-    ``head(19) + n_buttons * (one_hot_state[2] + button_pos[1] + button_vel[1])``.
-    The puzzle oracle is ``self._cur_button_states.astype(np.float64)`` (binary
-    scalar per button), which corresponds to the ``state=1`` one-hot channel in
-    the compact obs (i.e. ``obs[start + 1]`` for each button block).
-    """
+    """Return per-button binary-state channels for ManipSpace puzzle obs."""
 
     dim = int(obs_dim)
     rem = dim - _MANIP_HEAD_DIM
@@ -100,7 +198,9 @@ def assert_phi_goal_obs_indices(
     where: str,
     env_name: str | None = None,
 ) -> None:
-    """Validate phi goal channels for ``obs_dim`` when mode uses phi."""
+    """Validate that ``obs_dim`` is compatible with ``phi`` for this ``env_name``."""
+
+    _ = phi_goal_obs_indices  # ignored: phi channels are fixed per env family
 
     mode_l = str(mode).lower()
     if mode_l in ('full', 'raw', 'none', ''):
@@ -108,7 +208,11 @@ def assert_phi_goal_obs_indices(
     if mode_l not in ('phi', 'auto', 'goal_phi'):
         return
     dim = int(obs_dim)
-    kind = _env_kind_from_name(env_name)
+    try:
+        kind = _env_goal_phi_kind(env_name)
+    except ValueError as e:
+        raise ValueError(f'{where}: {e}') from e
+
     if kind == 'puzzle':
         if not manip_button_state_indices(dim):
             raise ValueError(
@@ -121,77 +225,24 @@ def assert_phi_goal_obs_indices(
         if not manip_cube_pos_indices(dim):
             raise ValueError(
                 f'{where}: goal_representation={mode_l!r} for env={env_name!r}: '
-                f'obs_dim={dim} is not compatible with the cube layout '
+                f'obs_dim={dim} is not compatible with the ManipSpace cube compact layout '
                 f'(head={_MANIP_HEAD_DIM}, cube_stride={_MANIP_CUBE_STRIDE}).'
             )
         return
-
-    cube_idxs = manip_cube_pos_indices(dim)
-    button_idxs = manip_button_state_indices(dim)
-    if cube_idxs and button_idxs:
-        raise ValueError(
-            f'{where}: goal_representation={mode_l!r} with obs_dim={dim} matches both '
-            'cube and puzzle compact layouts; set env_name (e.g. puzzle-3x3-play-v0) '
-            'or use critic_agent.phi_goal_obs_indices explicitly.'
-        )
-    if cube_idxs or button_idxs:
+    if kind == 'scene':
+        try:
+            _parse_scene_compact_layout(dim)
+        except ValueError as e:
+            raise ValueError(f'{where}: scene layout: {e}') from e
         return
-    idxs = tuple(int(x) for x in phi_goal_obs_indices)
-    if not idxs:
-        raise ValueError(
-            f'{where}: goal_representation={mode_l!r} with obs_dim={dim} requires '
-            'critic_agent.phi_goal_obs_indices (e.g. [0, 1] for planar x,y in the '
-            'goal observation). Implicit [:2] slicing is disabled.'
-        )
-    for i in idxs:
-        if i < 0 or i >= dim:
+    if kind in ('antmaze', 'humanoidmaze'):
+        if dim < 2:
             raise ValueError(
-                f'{where}: phi_goal_obs_indices={idxs!r} out of range for obs_dim={dim}.'
+                f'{where}: goal_representation={mode_l!r} for env={env_name!r}: '
+                f'obs_dim={dim} must be >= 2 for maze (x, y) goal channels.'
             )
-
-
-def phi_subgoal_filter_replace_indices(
-    obs_dim: int,
-    phi_goal_obs_indices: Sequence[int] | tuple[int, ...],
-    *,
-    env_name: str | None = None,
-) -> tuple[int, ...]:
-    """Observation indices to copy from goal onto subgoal when value-filtering."""
-
-    dim = int(obs_dim)
-    kind = _env_kind_from_name(env_name)
-    if kind == 'puzzle':
-        idxs = manip_button_state_indices(dim)
-        if not idxs:
-            raise ValueError(
-                f'Subgoal filter: puzzle env={env_name!r} but obs_dim={dim} does not match puzzle layout.'
-            )
-        return idxs
-    if kind == 'cube':
-        idxs = manip_cube_pos_indices(dim)
-        if not idxs:
-            raise ValueError(
-                f'Subgoal filter: cube env={env_name!r} but obs_dim={dim} does not match cube layout.'
-            )
-        return idxs
-
-    cube_idxs = manip_cube_pos_indices(dim)
-    button_idxs = manip_button_state_indices(dim)
-    if cube_idxs and button_idxs:
-        raise ValueError(
-            f'Subgoal filter: obs_dim={dim} matches cube and puzzle layouts; set env_name on critic config.'
-        )
-    if cube_idxs:
-        return cube_idxs
-    if button_idxs:
-        return button_idxs
-    idxs = tuple(int(x) for x in phi_goal_obs_indices)
-    if not idxs:
-        raise ValueError(
-            'Subgoal filter replacement needs ManipSpace cube/puzzle layout or '
-            'critic_agent.phi_goal_obs_indices for non-ManipSpace observations.'
-        )
-    return idxs
+        return
+    raise AssertionError(f'unreachable phi kind={kind!r}')
 
 
 def goal_representation(
@@ -201,15 +252,9 @@ def goal_representation(
     *,
     env_name: str | None = None,
 ) -> jnp.ndarray | None:
-    """Map a full goal state to the configured goal representation.
+    """Map a full goal state to the configured goal representation."""
 
-    ``full`` keeps historical behavior. ``phi`` / ``auto`` / ``goal_phi``:
-    When ``env_name`` indicates a ManipSpace puzzle, use per-button binary
-    channels; when it indicates a cube env, use inferred xyz per cube.
-    Otherwise, if ``obs_dim`` matches only one ManipSpace layout, use that;
-    if both match (ambiguous), ``env_name`` is required. For other observations,
-    ``phi_goal_obs_indices`` must list goal indices (e.g. ``(0, 1)`` for maze x,y).
-    """
+    _ = phi_goal_obs_indices  # ignored: phi channels are fixed per env family
 
     if goals is None:
         return None
@@ -222,7 +267,7 @@ def goal_representation(
         )
 
     obs_dim = int(goals.shape[-1])
-    kind = _env_kind_from_name(env_name)
+    kind = _env_goal_phi_kind(env_name)
 
     if kind == 'puzzle':
         idxs = manip_button_state_indices(obs_dim)
@@ -239,33 +284,21 @@ def goal_representation(
         if not idxs:
             raise ValueError(
                 f"goal_representation='phi' for env={env_name!r}: obs_dim={obs_dim} "
-                f"is not compatible with the cube layout "
+                f"is not compatible with the ManipSpace cube layout "
                 f"(head={_MANIP_HEAD_DIM}, cube_stride={_MANIP_CUBE_STRIDE})."
             )
         return jnp.take(goals, jnp.asarray(idxs, dtype=jnp.int32), axis=-1)
 
-    cube_idxs = manip_cube_pos_indices(obs_dim)
-    button_idxs = manip_button_state_indices(obs_dim)
-    if cube_idxs and button_idxs:
-        raise ValueError(
-            f'goal_representation={mode_l!r}: obs_dim={obs_dim} matches both cube and puzzle '
-            'compact layouts; set env_name (e.g. puzzle-3x3-play-v0) or phi_goal_obs_indices.'
-        )
-    if cube_idxs:
-        take = jnp.asarray(cube_idxs, dtype=jnp.int32)
-        return jnp.take(goals, take, axis=-1)
-    if button_idxs:
-        take = jnp.asarray(button_idxs, dtype=jnp.int32)
+    if kind == 'scene':
+        return scene_oracle_phi_from_goals(goals, obs_dim)
+
+    if kind in ('antmaze', 'humanoidmaze'):
+        if obs_dim < 2:
+            raise ValueError(
+                f"goal_representation='phi' for env={env_name!r}: obs_dim={obs_dim} must be >= 2 "
+                'for maze (x, y) goal.'
+            )
+        take = jnp.asarray(_MAZE_GOAL_XY_INDICES, dtype=jnp.int32)
         return jnp.take(goals, take, axis=-1)
 
-    idxs = tuple(int(x) for x in phi_goal_obs_indices)
-    if not idxs:
-        raise ValueError(
-            f'goal_representation={mode_l!r} requires critic_agent.phi_goal_obs_indices for '
-            f'obs_dim={obs_dim} (non-ManipSpace).'
-        )
-    for i in idxs:
-        if i < 0 or i >= obs_dim:
-            raise ValueError(f'phi_goal_obs_indices={idxs!r} out of range for obs_dim={obs_dim}.')
-    take = jnp.asarray(idxs, dtype=jnp.int32)
-    return jnp.take(goals, take, axis=-1)
+    raise AssertionError(f'unreachable phi kind={kind!r}')

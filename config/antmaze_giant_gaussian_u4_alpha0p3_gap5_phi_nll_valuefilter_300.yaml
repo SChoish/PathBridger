@@ -6,7 +6,6 @@
 #   - subgoal value bonus alpha=0.3.
 #   - exponential value-gap scale=5.0.
 #   - critic/subgoal networks condition on phi(goal) instead of full goal.
-# Env eval uses value filtering by default (main.py --subgoal_filter default).
 
 env_name: antmaze-giant-navigate-v0
 run_group: antmaze_giant_gaussian_u4_alpha0p3_gap5_phi_nll_valuefilter

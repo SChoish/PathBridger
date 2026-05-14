@@ -1,6 +1,5 @@
 # Cube-single 300-epoch run with env-capped same-trajectory goal sampling.
 # Diagonal-Gaussian subgoal model with U=4 and NLL training.
-# Eval value-based subgoal filtering is disabled via `--nosubgoal_filter`.
 
 env_name: cube-single-play-v0
 run_group: cube_single_envgoal_u4_nll_no_vfilter

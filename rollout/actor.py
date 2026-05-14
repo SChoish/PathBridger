@@ -58,7 +58,6 @@ from utils.run_io import (
     resolve_actor_checkpoint_dir,
     resolve_dynamics_checkpoint_dir,
 )
-from utils.subgoal_filter import SubgoalFilterFn, make_value_subgoal_filter_from_critic_agent
 
 
 def _load_actor_config_from_flags(flags_path: Path) -> dict:
@@ -87,7 +86,6 @@ def rollout_dynamics_actor_env(
     actor_horizon: int,
     env_action_dim: int,
     record_env_rgb: bool = True,
-    subgoal_filter: SubgoalFilterFn | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray]:
     """Chunked dynamics-subgoal + actor rollout via the shared runner.
 
@@ -111,7 +109,6 @@ def rollout_dynamics_actor_env(
         actor_agent,
         int(actor_horizon),
         int(env_action_dim),
-        subgoal_filter=subgoal_filter,
     )
     hats_per_step: list[np.ndarray] = []
 
@@ -125,8 +122,6 @@ def rollout_dynamics_actor_env(
             ),
             dtype=np.float32,
         ).reshape(-1)
-        if subgoal_filter is not None:
-            pred = np.asarray(subgoal_filter(obs, pred, g), dtype=np.float32).reshape(-1)
         chunk = base_chunk_fn(obs, g)
         for _ in range(int(chunk.shape[0])):
             hats_per_step.append(pred.copy())
@@ -195,17 +190,6 @@ def main() -> None:
         help='Overlay scalar value V(s, goal) on the right XY panel (checkpoints/critic/).',
     )
     p.add_argument('--value_grid_n', type=int, default=56)
-    p.add_argument(
-        '--subgoal_filter',
-        action='store_true',
-        help='If V(predicted_subgoal, goal) <= V(current_state, goal) and V(current_state, predicted_subgoal) > R, replace goal-representation channels.',
-    )
-    p.add_argument(
-        '--subgoal_filter_threshold',
-        type=float,
-        default=0.5,
-        help='Reachability threshold R for value filtering, applied to sigmoid V(current_state, predicted_subgoal).',
-    )
     p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = dynamics epoch used.')
     args = p.parse_args()
 
@@ -285,21 +269,7 @@ def main() -> None:
         train_raw,
         seed=int(args.seed),
     )
-    critic_value_params = critic_agent.network.params.get('modules_value', None)
     print(f'Loaded critic for actor inference/value heatmap (epoch suffix {ce})')
-    value_subgoal_filter = (
-        make_value_subgoal_filter_from_critic_agent(
-            critic_agent,
-            reachability_threshold=float(args.subgoal_filter_threshold),
-        )
-        if bool(args.subgoal_filter)
-        else None
-    )
-    if value_subgoal_filter is not None:
-        print(
-            'Subgoal filter enabled: replace phi(predicted_subgoal) with phi(goal) when '
-            f'V(subgoal,g) <= V(s,g) and V(s,subgoal) > {float(args.subgoal_filter_threshold):.4f}.'
-        )
 
     low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
@@ -333,7 +303,6 @@ def main() -> None:
         actor_horizon=actor_horizon,
         env_action_dim=env_action_dim,
         record_env_rgb=True,
-        subgoal_filter=value_subgoal_filter,
     )
     n_trans = max(0, int(roll.shape[0]) - 1)
     print(

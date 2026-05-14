@@ -38,7 +38,6 @@ from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from utils.ogbench_eval_rollout import rollout_chunked_eval_episode
 from utils.run_io import parse_int_list
-from utils.subgoal_filter import make_value_subgoal_filter_from_params
 from utils.goal_representation import normalize_phi_goal_obs_indices
 
 FLAGS = flags.FLAGS
@@ -134,16 +133,6 @@ flags.DEFINE_integer(
     'Save env.render() every N env steps during video episodes (plus last frame when done).',
 )
 flags.DEFINE_integer('eval_video_fps', 15, 'FPS for W&B eval videos built from eval_video_episodes_per_task.')
-flags.DEFINE_boolean(
-    'subgoal_filter',
-    True,
-    'Inference/eval only: if V(predicted_subgoal, goal) <= V(current_state, goal) and V(current_state, predicted_subgoal) > subgoal_filter_threshold, replace goal-representation channels. Use --nosubgoal_filter to disable.',
-)
-flags.DEFINE_float(
-    'subgoal_filter_threshold',
-    0.5,
-    'Reachability threshold R for value filtering, applied to sigmoid V(current_state, predicted_subgoal).',
-)
 flags.DEFINE_boolean(
     'subgoal_override_goal',
     False,
@@ -856,7 +845,6 @@ def _evaluate_env_tasks(
     actor_agent: Any,
     actor_config: Any,
     critic_config: Any,
-    critic_value_params: Any | None = None,
     *,
     task_ids: tuple[int, ...],
     episodes_per_task: int,
@@ -865,8 +853,6 @@ def _evaluate_env_tasks(
     video_frame_skip: int = 4,
     video_fps: int = 15,
     wandb_enabled: bool = False,
-    subgoal_filter: bool = True,
-    subgoal_filter_threshold: float = 0.5,
     subgoal_override_goal: bool = False,
 ) -> dict[str, Any]:
     """OGBench-style eval: success is decided **only** by ``info['success']`` (any step). No tolerance diagnostic."""
@@ -892,37 +878,12 @@ def _evaluate_env_tasks(
 
     actor_video_by_task: dict[int, np.ndarray] = {}
     idm_video_by_task: dict[int, np.ndarray] = {}
-    value_subgoal_filter = (
-        make_value_subgoal_filter_from_params(
-            critic_config,
-            critic_value_params,
-            reachability_threshold=float(subgoal_filter_threshold),
-        )
-        if bool(subgoal_filter)
-        else None
-    )
-    actor_filter_count = 0
-    actor_filter_total = 0
-    idm_filter_count = 0
-    idm_filter_total = 0
-
-    def _reset_subgoal_filter_stats() -> None:
-        if value_subgoal_filter is not None and hasattr(value_subgoal_filter, 'reset_stats'):
-            value_subgoal_filter.reset_stats()
-
-    def _read_subgoal_filter_stats() -> tuple[int, int]:
-        if value_subgoal_filter is None or not hasattr(value_subgoal_filter, 'get_stats'):
-            return 0, 0
-        st = value_subgoal_filter.get_stats()
-        return int(st.get('filtered', 0)), int(st.get('total', 0))
 
     def _actor_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
             pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-        if (not bool(subgoal_override_goal)) and value_subgoal_filter is not None:
-            pred = np.asarray(value_subgoal_filter(obs, pred, goal), dtype=np.float32).reshape(-1)
         return np.asarray(actor_agent.sample_actions(obs, pred), dtype=np.float32).reshape(actor_horizon, -1)
 
     def _idm_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
@@ -930,8 +891,6 @@ def _evaluate_env_tasks(
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
             pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-        if (not bool(subgoal_override_goal)) and value_subgoal_filter is not None:
-            pred = np.asarray(value_subgoal_filter(obs, pred, goal), dtype=np.float32).reshape(-1)
         return _idm_action_chunk(dynamics_agent, obs, pred, idm_horizon)
 
     for task_id in task_ids:
@@ -954,7 +913,6 @@ def _evaluate_env_tasks(
             record_wb = bool(wandb_enabled and should_render and num_video > 0 and ep_ix == num_eval)
             actor_buf: list[np.ndarray] = [] if record_wb else []
 
-            _reset_subgoal_filter_stats()
             ok_env = rollout_chunked_eval_episode(
                 env,
                 obs,
@@ -970,9 +928,6 @@ def _evaluate_env_tasks(
             )
             if count_stats:
                 actor_episode_successes.append(1.0 if ok_env else 0.0)
-                filtered, total = _read_subgoal_filter_stats()
-                actor_filter_count += filtered
-                actor_filter_total += total
             if record_wb and actor_buf:
                 actor_video_by_task[int(task_id)] = np.stack(actor_buf, axis=0)
 
@@ -986,7 +941,6 @@ def _evaluate_env_tasks(
                 goal_frame = np.asarray(goal_frame, dtype=np.uint8)
 
             idm_buf: list[np.ndarray] = [] if record_wb else []
-            _reset_subgoal_filter_stats()
             ok_env_i = rollout_chunked_eval_episode(
                 env,
                 obs,
@@ -1002,9 +956,6 @@ def _evaluate_env_tasks(
             )
             if count_stats:
                 idm_episode_successes.append(1.0 if ok_env_i else 0.0)
-                filtered, total = _read_subgoal_filter_stats()
-                idm_filter_count += filtered
-                idm_filter_total += total
             if record_wb and idm_buf:
                 idm_video_by_task[int(task_id)] = np.stack(idm_buf, axis=0)
 
@@ -1026,23 +977,6 @@ def _evaluate_env_tasks(
     metrics['eval/episodes_per_task'] = float(num_eval)
     metrics['eval/video_episodes_per_task'] = float(num_video)
     metrics['eval/total_episodes_per_task'] = float(total_eps)
-    total_filter_count = actor_filter_count + idm_filter_count
-    total_filter_estimates = actor_filter_total + idm_filter_total
-    metrics['eval/subgoal_filter/actor_filtered_count'] = float(actor_filter_count)
-    metrics['eval/subgoal_filter/actor_total_count'] = float(actor_filter_total)
-    metrics['eval/subgoal_filter/actor_ratio'] = (
-        float(actor_filter_count / actor_filter_total) if actor_filter_total > 0 else 0.0
-    )
-    metrics['eval/subgoal_filter/idm_filtered_count'] = float(idm_filter_count)
-    metrics['eval/subgoal_filter/idm_total_count'] = float(idm_filter_total)
-    metrics['eval/subgoal_filter/idm_ratio'] = (
-        float(idm_filter_count / idm_filter_total) if idm_filter_total > 0 else 0.0
-    )
-    metrics['eval/subgoal_filter/filtered_count'] = float(total_filter_count)
-    metrics['eval/subgoal_filter/total_count'] = float(total_filter_estimates)
-    metrics['eval/subgoal_filter/ratio'] = (
-        float(total_filter_count / total_filter_estimates) if total_filter_estimates > 0 else 0.0
-    )
 
     if wandb_enabled and num_video > 0 and len(actor_video_by_task) == len(task_ids) == len(idm_video_by_task):
         n_cols = max(1, len(task_ids))
@@ -1426,7 +1360,6 @@ def main(_):
                         actor_agent,
                         actor_config,
                         critic_config,
-                        critic_value_params=_extract_critic_value_params(critic_agent),
                         task_ids=eval_task_ids,
                         episodes_per_task=eval_episode_count,
                         max_chunks=eval_max_chunks,
@@ -1434,8 +1367,6 @@ def main(_):
                         video_frame_skip=int(FLAGS.eval_video_frame_skip),
                         video_fps=int(FLAGS.eval_video_fps),
                         wandb_enabled=bool(FLAGS.use_wandb),
-                        subgoal_filter=bool(FLAGS.subgoal_filter),
-                        subgoal_filter_threshold=float(FLAGS.subgoal_filter_threshold),
                         subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
                     )
                 )
