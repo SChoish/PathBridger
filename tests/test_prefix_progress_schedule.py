@@ -230,8 +230,6 @@ def test_agent_logs_theta_schedule_metadata():
         )
 
     combos = [
-        ('exact_residual_chain', 'exact_residual'),
-        ('forward_bridge', 'exact_residual'),
         ('forward_bridge_residual', 'exact_residual'),
     ]
     for planner, model_type in combos:

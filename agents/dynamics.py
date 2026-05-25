@@ -20,12 +20,8 @@ import optax
 from agents.critic import ScalarValueNet
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.dynamics import (
-    bridge_sample,
-    exact_residual_model_mean,
     forward_bridge_coefficients,
     make_dynamics_schedule,
-    posterior_mean,
-    sample_from_reverse_mean,
 )
 from utils.goal_representation import assert_phi_goal_obs_indices, goal_representation, normalize_phi_goal_obs_indices
 
@@ -88,8 +84,13 @@ class SinusoidalEmbedding(nn.Module):
         return jnp.concatenate([jnp.sin(args), jnp.cos(args)], axis=-1)
 
 
-class ResidualNet(nn.Module):
-    """Residual network conditioned on ``(s_1, z_K, i/K)`` (+ sinusoidal time embedding)."""
+class PathResidualNet(nn.Module):
+    """Per-step path residual network for ``forward_bridge_residual`` planner.
+
+    Conditioned on ``(s_1, z_K, t_norm)`` with ``s_1`` the absolute current state,
+    ``z_K`` the bridge endpoint in the residual frame (``s_K`` or ``Delta``), and
+    ``t_norm = i / K`` (shape ``(B, T)``).  Returns ``(B, T, state_dim)``.
+    """
 
     hidden_dims: Sequence[int]
     state_dim: int
@@ -98,8 +99,11 @@ class ResidualNet(nn.Module):
 
     @nn.compact
     def __call__(self, s1, zK, t_norm):
+        # s1, zK: (B, D);  t_norm: (B, T) in [0, 1].
         t_emb = SinusoidalEmbedding(self.time_embed_dim)(t_norm)
-        inp = jnp.concatenate([s1, zK, t_emb], axis=-1)
+        s1_b = jnp.broadcast_to(s1[:, None, :], (s1.shape[0], t_norm.shape[1], s1.shape[1]))
+        zK_b = jnp.broadcast_to(zK[:, None, :], (zK.shape[0], t_norm.shape[1], zK.shape[1]))
+        inp = jnp.concatenate([s1_b, zK_b, t_emb], axis=-1)
         return MLP(
             hidden_dims=(*self.hidden_dims, self.state_dim),
             activate_final=False,
@@ -256,16 +260,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         return jnp.zeros_like(jnp.asarray(current_state, dtype=jnp.float32))
 
     def _bridge_anchor(self, current_state_abs: jnp.ndarray) -> jnp.ndarray:
-        """Anchor input passed to the residual nets - always the absolute ``s_t``.
-
-        Displacement mode shifts the bridge inputs to ``x_T = 0`` and
-        ``x_0 = Delta``, which would otherwise hide ``s_t`` from the residual
-        net.  Feeding ``s_t`` as a dedicated ``anchor`` channel restores that
-        information.  In absolute mode the anchor is redundant with ``x_T``
-        (both equal ``s_t``) but keeping the input always defined keeps the
-        network shape stable across modes and removes a mode-specific code
-        path.
-        """
+        """Absolute ``s_t`` passed to :class:`PathResidualNet` as ``s_1``."""
         return jnp.asarray(current_state_abs, dtype=jnp.float32)
 
     def _subgoal_abs_from_raw(self, observations: jnp.ndarray, raw: jnp.ndarray) -> jnp.ndarray:
@@ -285,42 +280,6 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         if self._is_displacement_mode():
             return jnp.asarray(target_abs, dtype=jnp.float32) - jnp.asarray(observations, dtype=jnp.float32)
         return jnp.asarray(target_abs, dtype=jnp.float32)
-
-    def _learned_reverse_mean(
-        self, x_n, x_T, x_0, n, schedule, goal=None, params=None, anchor=None,
-    ):
-        t_norm = n.astype(jnp.float32) / jnp.asarray(float(self.config['dynamics_N']), dtype=jnp.float32)
-        eps = self.network.select('residual_net')(x_T, x_0, t_norm, params=params)
-        # Exact bridge posterior mean as base transition + learned residual.
-        # Valid for all n in {1, ..., N}; no boundary override needed because
-        # posterior_moments(...) already handles the terminal step.
-        mu, _, _ = exact_residual_model_mean(
-            x_n,
-            x_0,
-            x_T,
-            eps,
-            n,
-            schedule,
-            residual_scale=float(self.config.get('exact_residual_scale', 1.0)),
-        )
-        return mu, eps
-
-    def _reverse_step(
-        self, x_n, x_T, x_0, n, rng, stochastic, noise_scale, params=None, goal=None, anchor=None,
-    ):
-        mu, eps = self._learned_reverse_mean(
-            x_n, x_T, x_0, n, self.schedule, goal=goal, params=params, anchor=anchor,
-        )
-        ns = jnp.asarray(noise_scale, dtype=jnp.float32)
-
-        def take_sample(_):
-            return sample_from_reverse_mean(mu, n, self.schedule, rng, noise_scale=ns)
-
-        def take_mean(_):
-            return mu
-
-        x_new = jax.lax.cond(jnp.asarray(stochastic, dtype=jnp.bool_), take_sample, take_mean, operand=None)
-        return x_new, eps
 
     def _idm_loss_term(self, batch, grad_params):
         idm_w = float(self.config.get('idm_loss_weight', 1.0))
@@ -360,36 +319,6 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     # (``traj[:, 0] = current_state`` and ``traj[:, -1]`` ~ predicted subgoal),
     # so downstream consumers (IDM action decoding, rollout/subgoal.py, etc.)
     # can be re-used without changes.
-
-    def _eval_forward_bridge_path_residual(
-        self,
-        mu: jnp.ndarray,
-        anchor: jnp.ndarray,
-        zK: jnp.ndarray,
-        n_idx: jnp.ndarray,
-        *,
-        params=None,
-    ) -> jnp.ndarray:
-        """Evaluate ``residual_net`` at each ``(batch, time)`` bridge mean state.
-
-        ``mu`` is ``[B, T, D]``; ``anchor`` and ``zK`` are ``[B, D]``; ``n_idx`` is
-        ``[B, T]`` integer step indices.
-        """
-
-        def _per_step(mu_t, anchor_b, zK_b, n_t):
-            return self.network.select('residual_net')(
-                mu_t,
-                anchor_b,
-                zK_b,
-                anchor_b,
-                n_t.astype(jnp.float32),
-                params=params,
-            )
-
-        def _per_batch(mu_b, anchor_b, zK_b, n_b):
-            return jax.vmap(_per_step, in_axes=(0, None, None, 0))(mu_b, anchor_b, zK_b, n_b)
-
-        return jax.vmap(_per_batch, in_axes=(0, 0, 0, 0))(mu, anchor, zK, n_idx)
 
     def forward_bridge_coefficients(self, K, *, bridge_gamma_inv: float | None = None):
         """Return ``(a, b, std)`` of shape ``(K + 1,)`` for the linear-SDE forward bridge.
@@ -481,9 +410,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     ) -> jnp.ndarray:
         """Forward bridge mean + endpoint-preserving learned residual.
 
-        ``z_hat_i = mu_i + w_i * r_theta(z_0, z_K, anchor, i)`` where
+        ``z_hat_i = mu_i + w_i * r_theta(s_1, z_K, i/K)`` where
         ``mu_i = a_i z_0 + b_i z_K`` is the closed-form bridge mean,
-        ``r_theta`` is :class:`ResidualNet`, and the quadratic schedule
+        ``r_theta`` is :class:`PathResidualNet`, and the quadratic schedule
         ``w_i = i*(K - i)/K^2`` zeros out at the endpoints so ``z_hat_0 = z_0``
         and ``z_hat_K = z_K`` are preserved exactly (modulo the explicit
         endpoint clamp at the end).  ``anchor`` is the absolute current state
@@ -511,15 +440,10 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             # Absolute mode: ``z0`` already equals the current state ``s_t``,
             # so it is the natural anchor fallback.
             anchor = z0
-        # Reuse the shared residual_net with inputs R(s_1, z_K, i/K):
-        # z_K is Delta in displacement mode and absolute s_K in absolute mode.
         t_norm = jnp.broadcast_to(idx[None, :] / float(K), (z0.shape[0], K + 1))
-        residual = jax.vmap(
-            lambda anchor_b, zK_b, t_b: self.network.select('residual_net')(
-                anchor_b, zK_b, t_b, params=params,
-            ),
-            in_axes=(0, 0, 0),
-        )(anchor, zK, t_norm)
+        residual = self.network.select('path_residual_net')(
+            anchor, zK, t_norm, params=params,
+        )
         path = mu + w[None, :, None] * residual
 
         if sample and float(noise_scale) > 0.0:
@@ -557,71 +481,14 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 )
             anchor = z0
         t_norm = jnp.broadcast_to(idx_f[None, :] / float(N), (z0.shape[0], idx.shape[0]))
-        residual = jax.vmap(
-            lambda anchor_b, zK_b, t_b: self.network.select('residual_net')(
-                anchor_b, zK_b, t_b, params=params,
-            ),
-            in_axes=(0, 0, 0),
-        )(anchor, zK, t_norm)
+        residual = self.network.select('path_residual_net')(
+            anchor, zK, t_norm, params=params,
+        )
         w = idx_f * (float(N) - idx_f) / float(N * N)
         path = mu + w[None, :, None] * residual
         path = jnp.where((idx == 0)[None, :, None], z0[:, None, :], path)
         path = jnp.where((idx == N)[None, :, None], zK[:, None, :], path)
         return path
-
-    def _exact_residual_chain_plan(
-        self, current_state, desired_endpoint, num_steps: int | None = None, *, goal=None, anchor=None,
-    ):
-        x_T = current_state
-        x_0_goal = desired_endpoint
-        n_total = int(self.config['dynamics_N'])
-        steps_to_roll = n_total if num_steps is None else int(num_steps)
-        if steps_to_roll < 1 or steps_to_roll > n_total:
-            raise ValueError(f'num_steps must be in [1, {n_total}], got {steps_to_roll}.')
-        batch_size = x_T.shape[0]
-        if anchor is None:
-            anchor = jnp.zeros_like(x_T)
-
-        def scan_body(x, step_n):
-            n = jnp.full((batch_size,), step_n, dtype=jnp.int32)
-            x_new, _ = self._learned_reverse_mean(
-                x, x_T, x_0_goal, n, self.schedule, goal=goal, anchor=anchor,
-            )
-            return x_new, x_new
-
-        steps = jnp.arange(n_total, n_total - steps_to_roll, -1)
-        _, traj_body = jax.lax.scan(scan_body, x_T, steps)
-        traj = jnp.concatenate([x_T[None], traj_body], axis=0)
-        return jnp.swapaxes(traj, 0, 1)
-
-    def _exact_residual_chain_sample_plan(
-        self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None,
-        *, goal=None, anchor=None,
-    ):
-        x_T = current_state
-        x_0_goal = desired_endpoint
-        n_total = int(self.config['dynamics_N'])
-        steps_to_roll = n_total if num_steps is None else int(num_steps)
-        if steps_to_roll < 1 or steps_to_roll > n_total:
-            raise ValueError(f'num_steps must be in [1, {n_total}], got {steps_to_roll}.')
-        batch_size = x_T.shape[0]
-        step_rngs = jax.random.split(rng, steps_to_roll)
-        if anchor is None:
-            anchor = jnp.zeros_like(x_T)
-
-        def scan_body(x, inputs):
-            step_n, step_rng = inputs
-            n = jnp.full((batch_size,), step_n, dtype=jnp.int32)
-            x_new, _ = self._reverse_step(
-                x, x_T, x_0_goal, n, step_rng, True, noise_scale,
-                params=None, goal=goal, anchor=anchor,
-            )
-            return x_new, x_new
-
-        steps = jnp.arange(n_total, n_total - steps_to_roll, -1)
-        _, traj_body = jax.lax.scan(scan_body, x_T, (steps, step_rngs))
-        traj = jnp.concatenate([x_T[None], traj_body], axis=0)
-        return jnp.swapaxes(traj, 0, 1)
 
     def _shift_to_displacement_frame(
         self, current_state: jnp.ndarray, desired_endpoint: jnp.ndarray,
@@ -1061,12 +928,6 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             progress_alpha=float(config.get('progress_alpha', 0.8)),
         )
 
-        residual_net_def = ResidualNet(
-            hidden_dims=tuple(config['residual_model_hidden_dims']),
-            state_dim=state_dim,
-            time_embed_dim=config['time_embed_dim'],
-            layer_norm=config['layer_norm'],
-        )
         sub_mode = _subgoal_mode(config)
         stochastic_loss = _subgoal_stochastic_loss(config)
         if stochastic_loss not in ('mse', 'nll'):
@@ -1110,11 +971,27 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         batch_size = ex_observations.shape[0]
         dummy_x = ex_observations
         dummy_g = ex_observations
-        dummy_n = jnp.ones((batch_size,), dtype=jnp.float32)
         dummy_next = jnp.zeros_like(ex_observations)
 
+        residual_hidden = config.get(
+            'path_residual_hidden_dims',
+            config.get('residual_model_hidden_dims', (512, 512, 512)),
+        )
+        if isinstance(residual_hidden, str):
+            residual_hidden = parse_hidden_dims(residual_hidden)
+        else:
+            residual_hidden = tuple(int(x) for x in residual_hidden)
+        path_residual_def = PathResidualNet(
+            hidden_dims=residual_hidden,
+            state_dim=state_dim,
+            time_embed_dim=int(config['time_embed_dim']),
+            layer_norm=bool(config['layer_norm']),
+        )
+        horizon = int(config['dynamics_N']) + 1
+        dummy_t = jnp.zeros((batch_size, horizon), dtype=jnp.float32)
+
         network_info = dict(
-            residual_net=(residual_net_def, (dummy_x, dummy_x, dummy_n)),
+            path_residual_net=(path_residual_def, (dummy_x, dummy_x, dummy_t)),
             subgoal_net=(subgoal_def, (dummy_x, dummy_g)),
             idm_net=(idm_def, (dummy_x, dummy_next)),
         )
@@ -1239,9 +1116,7 @@ class DynamicsAgent(_DynamicsAgentCore):
     def _compute_subgoal_loss(self, batch, grad_params, rng_fr, critic_value_params):
         """Compute the subgoal-net training loss + companion logging tensors.
 
-        Shared by ``exact_residual_chain`` and the ``forward_bridge`` /
-        ``forward_bridge_residual`` paths so the subgoal estimator is trained
-        identically across planners.
+        Shared by the forward-bridge-residual training path.
 
         Note on the PDF: the deterministic subgoal objective matches the
         value-guided regression form, while stochastic subgoals intentionally
@@ -1391,193 +1266,6 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'and dynamics_N.'
             )
 
-    def _exact_residual_reverse_loss_block(self, batch, grad_params, rng1, rng2):
-        """Reverse-chain dynamics + path + rollout losses (shared exact-residual math).
-
-        Used only by ``_total_loss_exact_residual_chain``.
-        """
-        x_T_abs = batch['observations']
-        x_0_abs = batch['high_actor_targets']
-        segment_abs = jnp.asarray(batch['trajectory_segment'], dtype=jnp.float32)
-        disp_origin = self._displacement_origin(x_T_abs)
-        anchor = self._bridge_anchor(x_T_abs)
-        x_T = x_T_abs - disp_origin
-        x_0 = x_0_abs - disp_origin
-        segment = segment_abs - disp_origin[:, None, :]
-        B = x_T.shape[0]
-        N = int(self.config['dynamics_N'])
-        K = int(segment.shape[1]) - 1
-        self._check_segment_horizon(K, N, '_exact_residual_reverse_loss_block')
-
-        n = jax.random.randint(rng1, (B,), 1, N + 1)
-        is_boundary = n == N
-        n_safe = jnp.minimum(n, N - 1)
-
-        x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
-        x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
-        mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
-        mu_pred, eps_pred = self._learned_reverse_mean(
-            x_n, x_T, x_0, n, self.schedule, params=grad_params, anchor=anchor,
-        )
-        g2_n = self.schedule['g2'][n - 1]
-        weight = 1.0 / (2.0 * jnp.maximum(g2_n, 1e-12))
-        loss_bridge_mean_match = (weight * jnp.abs(mu_true - mu_pred).sum(axis=-1)).mean()
-
-        loss_residual_reg = jnp.mean(jnp.sum(eps_pred ** 2, axis=-1))
-        loss_dynamics = (
-            float(self.config.get('exact_residual_bridge_match_weight', 0.0)) * loss_bridge_mean_match
-            + float(self.config.get('exact_residual_reg_weight', 1.0e-4)) * loss_residual_reg
-        )
-
-        row = jnp.arange(B, dtype=jnp.int32)
-        x_n_real = segment[row, K - n, :]
-        x_prev_real = segment[row, K - n + 1, :]
-        mu_pred_path, _ = self._learned_reverse_mean(
-            x_n_real, x_T, x_0, n, self.schedule, params=grad_params, anchor=anchor,
-        )
-        diff_p = mu_pred_path - x_prev_real
-        loss_path = jnp.abs(diff_p).sum(axis=-1).mean()
-
-        H_cfg = int(self.config.get('rollout_horizon', 5))
-        H_eff = max(1, min(H_cfg, N))
-        hs = jnp.arange(1, H_eff + 1, dtype=jnp.int32)
-
-        def roll_body(x, h):
-            step_n = N - h + 1
-            n_b = jnp.full((B,), step_n, dtype=jnp.int32)
-            mu_r, _ = self._learned_reverse_mean(
-                x, x_T, x_0, n_b, self.schedule, params=grad_params, anchor=anchor,
-            )
-            tgt = segment[row, h, :]
-            err = jnp.abs(mu_r - tgt).sum(axis=-1)
-            return mu_r, err
-
-        _, errs = jax.lax.scan(roll_body, segment[:, 0, :], hs)
-        loss_roll = jnp.mean(errs)
-
-        n_N = jnp.full((B,), N, dtype=jnp.int32)
-        xNm1, _ = self._learned_reverse_mean(
-            x_T, x_T, x_0, n_N, self.schedule, params=grad_params, anchor=anchor,
-        )
-        xNm1_norm = jnp.linalg.norm(xNm1, axis=-1).mean()
-        s1 = segment[:, 1, :]
-        first_step_l1 = jnp.abs(xNm1 - s1).sum(axis=-1).mean()
-        idx_xy = jnp.asarray(self._path_eval_slice(), dtype=jnp.int32)
-        d_xy = xNm1[:, idx_xy] - s1[:, idx_xy]
-        first_step_xy_l2 = jnp.sqrt(jnp.mean(d_xy**2))
-
-        return {
-            'segment': segment,
-            'anchor': anchor,
-            'x_T': x_T,
-            'x_0': x_0,
-            'B': B,
-            'N': N,
-            'K': K,
-            'loss_dynamics': loss_dynamics,
-            'loss_path': loss_path,
-            'loss_roll': loss_roll,
-            'loss_bridge_mean_match': loss_bridge_mean_match,
-            'loss_residual_reg': loss_residual_reg,
-            'eps_pred': eps_pred,
-            'mu_true': mu_true,
-            'mu_pred': mu_pred,
-            'n': n,
-            'xNm1': xNm1,
-            'xNm1_norm': xNm1_norm,
-            'first_step_l1': first_step_l1,
-            'first_step_xy_l2': first_step_xy_l2,
-        }
-
-    def _total_loss_exact_residual_chain(self, batch, grad_params, rng, critic_value_params):
-        """Mean-matching + path-aligned reverse + short rollout + subgoal MSE."""
-        sg_w = float(self.config.get('subgoal_loss_weight', 1.0))
-        w_g = float(self.config.get('dynamics_loss_weight', 1.0))
-        w_p = float(self.config.get('path_loss_weight', 1.0))
-        w_r = float(self.config.get('rollout_loss_weight', 1.0))
-
-        rng1, rng2, rng_fr = jax.random.split(rng, 3)
-        rev = self._exact_residual_reverse_loss_block(batch, grad_params, rng1, rng2)
-        loss_dynamics = rev['loss_dynamics']
-        loss_path = rev['loss_path']
-        loss_roll = rev['loss_roll']
-        loss_bridge_mean_match = rev['loss_bridge_mean_match']
-        loss_residual_reg = rev['loss_residual_reg']
-        eps_pred = rev['eps_pred']
-        mu_true = rev['mu_true']
-        mu_pred = rev['mu_pred']
-        n = rev['n']
-        xNm1 = rev['xNm1']
-        xNm1_norm = rev['xNm1_norm']
-        first_step_l1 = rev['first_step_l1']
-        first_step_xy_l2 = rev['first_step_xy_l2']
-        B = rev['B']
-
-        (loss_sub, subgoal_mse, subgoal_value, subgoal_value_bonus,
-         pred_sg_out, subgoal_extra_info) = self._compute_subgoal_loss(
-            batch, grad_params, rng_fr, critic_value_params,
-        )
-
-        loss = w_g * loss_dynamics + w_p * loss_path + w_r * loss_roll + sg_w * loss_sub
-
-        idm_term, loss_idm_unw = self._idm_loss_term(batch, grad_params)
-        loss = loss + idm_term
-
-        info = {
-            'phase1/loss': loss,
-            'phase1/loss_dynamics': loss_dynamics,
-            'phase1/loss_bridge_mean_match': loss_bridge_mean_match,
-            'phase1/loss_residual_reg': loss_residual_reg,
-            'phase1/loss_path_step': loss_path,
-            'phase1/loss_roll': loss_roll,
-            'phase1/loss_subgoal': loss_sub,
-            'phase1/loss_subgoal_mse': subgoal_mse.mean(),
-            'phase1/subgoal_value_mean': subgoal_value.mean(),
-            'phase1/subgoal_value_bonus_mean': subgoal_value_bonus.mean(),
-            'phase1/loss_idm': loss_idm_unw,
-            'phase1/first_step_l1': first_step_l1,
-            'phase1/first_step_xy_l2': first_step_xy_l2,
-            'phase1/eps_norm': jnp.linalg.norm(eps_pred, axis=-1).mean(),
-            'phase1/mu_true_norm': jnp.linalg.norm(mu_true, axis=-1).mean(),
-            'phase1/mu_pred_norm': jnp.linalg.norm(mu_pred, axis=-1).mean(),
-            'phase1/xN_minus_1_norm': xNm1_norm,
-            'phase1/bridge_step_mean': n.astype(jnp.float32).mean(),
-            'phase1/planner_type': jnp.asarray(0.0, dtype=jnp.float32),
-            'dynamics/model_type': jnp.asarray(
-                _dynamics_model_type_metric(self.config), dtype=jnp.float32,
-            ),
-        }
-        # ``pred_sg_out`` lives in the subgoal-net output frame (Delta in
-        # displacement mode, absolute state in absolute mode); ``raw`` keys
-        # track that frame, ``abs`` keys track the absolute state space so the
-        # two are comparable on a per-mode basis.
-        target_raw = self._subgoal_target_for_loss(
-            batch['observations'], batch['high_actor_targets'],
-        )
-        pred_abs = self._subgoal_abs_from_raw(batch['observations'], pred_sg_out)
-        info['phase1/subgoal_pred_raw_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
-        info['phase1/subgoal_target_raw_norm'] = jnp.linalg.norm(target_raw, axis=-1).mean()
-        info['phase1/subgoal_pred_abs_norm'] = jnp.linalg.norm(pred_abs, axis=-1).mean()
-        info['phase1/subgoal_target_abs_norm'] = jnp.linalg.norm(
-            batch['high_actor_targets'], axis=-1
-        ).mean()
-        # Backward-compatible aliases - both raw-frame so old dashboards
-        # stay coherent across modes (in displacement mode the raw frame is
-        # the displacement frame; legacy plots that paired pred vs target
-        # would otherwise mix coordinate systems).
-        info['phase1/subgoal_pred_norm'] = info['phase1/subgoal_pred_raw_norm']
-        info['phase1/subgoal_target_norm'] = info['phase1/subgoal_target_raw_norm']
-        info.update(subgoal_extra_info)
-        info['dynamics/bridge_gamma_inv'] = jnp.asarray(
-            float(self.config.get('bridge_gamma_inv', 0.0)), dtype=jnp.float32
-        )
-        info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
-        info['dynamics/subgoal_target_mode'] = jnp.asarray(
-            _subgoal_target_mode_id(self.config), dtype=jnp.float32
-        )
-        info.update(self._theta_schedule_info())
-        return loss, info
-
     def _total_loss_forward_bridge(self, batch, grad_params, rng, critic_value_params, planner: str):
         """Forward-bridge-residual path-supervised loss.
 
@@ -1713,8 +1401,7 @@ class DynamicsAgent(_DynamicsAgentCore):
             ),
             **fb_diag,
         }
-        # Split prediction / target norms by frame (see exact_residual_chain
-        # branch for the rationale).
+        # Split prediction / target norms by frame (raw vs absolute).
         target_raw = self._subgoal_target_for_loss(
             batch['observations'], batch['high_actor_targets'],
         )

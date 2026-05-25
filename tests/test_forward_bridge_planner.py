@@ -6,14 +6,10 @@ Covers:
    ``a[K]=0, b[K]=1, std[K]=0``).
 2. ``forward_bridge_plan`` returns ``[B, K+1, D]`` paths with
    ``path[:, 0] == z0`` and ``path[:, -1] == zK``.
-3. ``planner_type='exact_residual_chain'`` (default) still runs and produces
-   trajectories with the same shape as before this change.
-4. ``planner_type='forward_bridge'`` and
-   ``planner_type='forward_bridge_residual'`` go through ``plan()`` /
+3. ``planner_type='forward_bridge_residual'`` goes through ``plan()`` /
    ``sample_plan()`` without raising and produce endpoint-respecting
    paths.
-5. ``DynamicsAgent.update`` runs one step in each planner mode
-   without NaNs.
+4. ``DynamicsAgent.update`` runs one step without NaNs.
 """
 
 import os
@@ -35,7 +31,7 @@ ACTION_DIM = 2
 BATCH = 8
 
 
-def _make_agent(planner_type: str = 'exact_residual_chain'):
+def _make_agent(planner_type: str = 'forward_bridge_residual'):
     cfg = get_dynamics_config()
     cfg.dynamics_N = 4
     cfg.subgoal_steps = 4
@@ -45,6 +41,7 @@ def _make_agent(planner_type: str = 'exact_residual_chain'):
     cfg.subgoal_value_hidden_dims = (32, 32)
     cfg.idm_hidden_dims = (32, 32)
     cfg.path_residual_hidden_dims = (32, 32)
+    cfg.subgoal_goal_representation = 'full'
     cfg.planner_type = planner_type
     ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
     ex_act = np.zeros((BATCH, ACTION_DIM), dtype=np.float32)
@@ -136,7 +133,7 @@ def test_forward_bridge_coefficients_use_bridge_gamma_inv():
 
 
 def test_forward_bridge_plan_shapes_and_endpoints():
-    agent = _make_agent('forward_bridge')
+    agent = _make_agent('forward_bridge_residual')
     K = int(agent.config['dynamics_N'])
     z0 = jnp.asarray(np.random.RandomState(1).randn(BATCH, STATE_DIM).astype(np.float32))
     zK = jnp.asarray(np.random.RandomState(2).randn(BATCH, STATE_DIM).astype(np.float32))
@@ -162,6 +159,7 @@ def test_agent_forward_bridge_uses_configured_bridge_gamma_inv():
     cfg_hard.bridge_gamma_inv = 0.0
     cfg_hard.theta_schedule = 'prefix_progress'
     cfg_hard.theta_total = 1.0
+    cfg_hard.subgoal_goal_representation = 'full'
     agent_hard = DynamicsAgent.create(
         seed=0,
         ex_observations=np.zeros((BATCH, STATE_DIM), dtype=np.float32),
@@ -175,6 +173,7 @@ def test_agent_forward_bridge_uses_configured_bridge_gamma_inv():
     cfg_soft.bridge_gamma_inv = 0.5
     cfg_soft.theta_schedule = 'prefix_progress'
     cfg_soft.theta_total = 1.0
+    cfg_soft.subgoal_goal_representation = 'full'
     agent_soft = DynamicsAgent.create(
         seed=0,
         ex_observations=np.zeros((BATCH, STATE_DIM), dtype=np.float32),
@@ -188,51 +187,31 @@ def test_agent_forward_bridge_uses_configured_bridge_gamma_inv():
     assert not np.allclose(np.asarray(std_hard[1:-1]), np.asarray(std_soft[1:-1]))
 
 
-def test_exact_residual_chain_plan_unchanged():
-    agent = _make_agent('exact_residual_chain')
+def test_forward_bridge_planner_dispatch():
+    agent = _make_agent('forward_bridge_residual')
     K = int(agent.config['dynamics_N'])
-    obs = jnp.asarray(np.random.RandomState(3).randn(BATCH, STATE_DIM).astype(np.float32))
-    goal = jnp.asarray(np.random.RandomState(4).randn(BATCH, STATE_DIM).astype(np.float32))
+    obs = jnp.asarray(np.random.RandomState(5).randn(BATCH, STATE_DIM).astype(np.float32))
+    goal = jnp.asarray(np.random.RandomState(6).randn(BATCH, STATE_DIM).astype(np.float32))
 
     out_det = agent.plan(obs, goal)
     traj = np.asarray(out_det['trajectory'])
     assert traj.shape == (BATCH, K + 1, STATE_DIM)
     np.testing.assert_allclose(traj[:, 0], np.asarray(obs), atol=1e-5)
+    np.testing.assert_allclose(traj[:, -1], np.asarray(goal), atol=1e-5)
 
-    out_stoch = agent.sample_plan(obs, goal, jax.random.PRNGKey(11), noise_scale=0.5)
-    traj_s = np.asarray(out_stoch['trajectory'])
-    assert traj_s.shape == (BATCH, K + 1, STATE_DIM)
-
-
-def test_forward_bridge_planner_dispatch():
-    for planner in ('forward_bridge', 'forward_bridge_residual'):
-        agent = _make_agent(planner)
-        K = int(agent.config['dynamics_N'])
-        obs = jnp.asarray(np.random.RandomState(5).randn(BATCH, STATE_DIM).astype(np.float32))
-        goal = jnp.asarray(np.random.RandomState(6).randn(BATCH, STATE_DIM).astype(np.float32))
-
-        out_det = agent.plan(obs, goal)
-        traj = np.asarray(out_det['trajectory'])
-        assert traj.shape == (BATCH, K + 1, STATE_DIM)
-        np.testing.assert_allclose(traj[:, 0], np.asarray(obs), atol=1e-5)
-        np.testing.assert_allclose(traj[:, -1], np.asarray(goal), atol=1e-5)
-
-        next_step_np = np.asarray(out_det['next_step'])
-        assert next_step_np.shape == (BATCH, STATE_DIM)
-        np.testing.assert_allclose(next_step_np, traj[:, 1], atol=1e-5)
+    next_step_np = np.asarray(out_det['next_step'])
+    assert next_step_np.shape == (BATCH, STATE_DIM)
+    np.testing.assert_allclose(next_step_np, traj[:, 1], atol=1e-5)
 
 
 def test_forward_bridge_total_loss_finite():
-    for planner in ('exact_residual_chain', 'forward_bridge', 'forward_bridge_residual'):
-        agent = _make_agent(planner)
-        batch = _make_batch(int(agent.config['dynamics_N']))
-        agent2, info = agent.update(batch)
-        loss_val = float(info['phase1/loss'])
-        assert np.isfinite(loss_val), f'planner={planner} produced non-finite loss {loss_val}'
-        # Endpoint MSE should be exactly 0 for forward-bridge (clamped).
-        if planner in ('forward_bridge', 'forward_bridge_residual'):
-            assert float(info['forward_bridge/endpoint_start_mse']) < 1e-10
-            assert float(info['forward_bridge/endpoint_end_mse']) < 1e-10
+    agent = _make_agent('forward_bridge_residual')
+    batch = _make_batch(int(agent.config['dynamics_N']))
+    agent2, info = agent.update(batch)
+    loss_val = float(info['phase1/loss'])
+    assert np.isfinite(loss_val), f'planner produced non-finite loss {loss_val}'
+    assert float(info['forward_bridge/endpoint_start_mse']) < 1e-10
+    assert float(info['forward_bridge/endpoint_end_mse']) < 1e-10
 
 
 if __name__ == '__main__':
@@ -240,7 +219,6 @@ if __name__ == '__main__':
     test_forward_bridge_coefficients_use_bridge_gamma_inv()
     test_forward_bridge_plan_shapes_and_endpoints()
     test_agent_forward_bridge_uses_configured_bridge_gamma_inv()
-    test_exact_residual_chain_plan_unchanged()
     test_forward_bridge_planner_dispatch()
     test_forward_bridge_total_loss_finite()
     print('OK: all forward_bridge planner smoke tests passed.')

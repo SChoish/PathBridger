@@ -480,24 +480,22 @@ def test_displacement_mode_loss_is_finite_and_target_mode_logged():
 
 
 def test_displacement_mode_residual_net_uses_anchor():
-    # The reverse-chain ResidualNet must take an anchor input and respond to
-    # it; otherwise displacement mode collapses to a translation-invariant
-    # correction and the bridge cannot distinguish two trajectories with the
-    # same Delta but different current states.
+    # PathResidualNet must take an anchor input and respond to it; otherwise
+    # displacement mode collapses to a translation-invariant correction and the
+    # bridge cannot distinguish two trajectories with the same Delta but
+    # different current states.
     agent = _displacement_agent('deterministic')
     rng = np.random.default_rng(11)
-    x = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    x0 = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    xT = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
-    n = jnp.full((BATCH,), 2, dtype=jnp.float32)
-    anchor_a = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    anchor_b = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    zK = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    t_norm = jnp.full((BATCH, 1), 0.5, dtype=jnp.float32)
+    s1_a = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    s1_b = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
 
     eps_a = np.asarray(
-        agent.network.select('residual_net')(x, xT, x0, anchor_a, n)
+        agent.network.select('path_residual_net')(s1_a, zK, t_norm)
     )
     eps_b = np.asarray(
-        agent.network.select('residual_net')(x, xT, x0, anchor_b, n)
+        agent.network.select('path_residual_net')(s1_b, zK, t_norm)
     )
     # Different anchors must produce different residuals on at least one
     # element of the batch (we just need to confirm the input is wired in).
