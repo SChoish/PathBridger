@@ -841,7 +841,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                     origin, z0, zK, anchor = self._shift_to_displacement_frame(obs, mu)
                     indices = jnp.arange(0, proposal_horizon + 1, dtype=jnp.int32)
                     traj_local = self._forward_bridge_path_at_indices(
-                        z0, zK, indices, planner=planner, anchor=anchor,
+                        z0, zK, indices, planner=_planner_type(self.config), anchor=anchor,
                     )
                     sampled = {'trajectory': traj_local + origin[:, None, :]}
                 else:
