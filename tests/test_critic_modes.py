@@ -81,6 +81,12 @@ def _build_critic(cfg, ex_batch):
     )
 
 
+def _assert_finite_info(info, keys, prefix=''):
+    for k in keys:
+        v = float(info[k])
+        assert np.isfinite(v), f'{prefix}{k!r} not finite: {v}'
+
+
 def test_dataset_emits_action_chunk_fields_in_all_modes():
     for critic_type in ('dqc', 'iql', 'trl'):
         cfg = _make_critic_config(critic_type)
@@ -237,7 +243,7 @@ def test_trl_skips_dqc_chunk_critics_and_runs_direct_chunk_update_step():
         assert k in params, f'TRL missing {k!r}'
     new_critic, info = critic.update(ex_batch)
     assert float(info['chunk_critic/critic_loss']) == 0.0
-    for k in (
+    _assert_finite_info(info, (
         'loss/total',
         'loss/q_base',
         'loss/q_tri',
@@ -253,9 +259,7 @@ def test_trl_skips_dqc_chunk_critics_and_runs_direct_chunk_update_step():
         'action_critic/value_loss',
         'action_critic/q_part_mean',
         'action_critic/target_v_mean',
-    ):
-        v = float(info[k])
-        assert np.isfinite(v), f'TRL {k!r} not finite: {v}'
+    ), prefix='TRL ')
 
 
 def test_direct_chunk_trl_head_shapes_and_target_gradients():
@@ -268,11 +272,17 @@ def test_direct_chunk_trl_head_shapes_and_target_gradients():
         jnp.asarray(ex_batch['value_goals']),
         jnp.asarray(ex_batch['action_chunk_actions']),
     )
+    q_logits_3d = critic.network.select('action_critic')(
+        jnp.asarray(ex_batch['observations']),
+        jnp.asarray(ex_batch['value_goals']),
+        jnp.asarray(ex_batch['action_chunk_actions']).reshape(BATCH, cfg.action_chunk_horizon, ACTION_DIM),
+    )
     v_logits = critic.network.select('value')(
         jnp.asarray(ex_batch['observations']),
         jnp.asarray(ex_batch['value_goals']),
     )
     assert q_logits.shape == (int(cfg.num_qs), BATCH)
+    assert q_logits_3d.shape == q_logits.shape
     assert v_logits.shape == (BATCH,)
 
     def loss_fn(params):
@@ -289,6 +299,40 @@ def test_direct_chunk_trl_head_shapes_and_target_gradients():
     assert _tree_abs_sum(grads['modules_value']) > 0.0
     assert _tree_abs_sum(grads['modules_target_action_critic']) == 0.0
     assert _tree_abs_sum(grads['modules_target_value']) == 0.0
+
+
+def test_direct_chunk_trl_create_normalizes_algorithm_config():
+    cfg = _make_critic_config('dqc')
+    cfg.algorithm = 'direct_chunk_trl'
+    cfg.use_chunk_critic = True
+    ds = _critic_dataset_for(cfg)
+    ex_batch = ds.sample(BATCH)
+    critic = CriticAgent.create(
+        seed=0,
+        ex_observations=ex_batch['observations'],
+        ex_full_chunk_actions=ex_batch['full_chunk_actions'],
+        ex_action_chunk_actions=ex_batch['action_chunk_actions'],
+        config=cfg,
+        ex_goals=ex_batch['value_goals'],
+    )
+    assert critic.config['critic_type'] == 'direct_chunk_trl'
+    assert critic.config['algorithm'] == 'direct_chunk_trl'
+    assert bool(critic.config['use_chunk_critic']) is False
+    assert 'modules_chunk_critic' not in critic.network.params
+    assert 'modules_target_chunk_critic' not in critic.network.params
+
+
+def test_direct_chunk_trl_zero_valid_mask_has_zero_tri_loss():
+    cfg = _make_critic_config('trl')
+    ds = _critic_dataset_for(cfg)
+    ex_batch = ds.sample(BATCH)
+    ex_batch = dict(ex_batch)
+    ex_batch['trl_valid_mask'] = np.zeros_like(ex_batch['trl_valid_mask'])
+    critic = _build_critic(cfg, ex_batch)
+    _, info = critic.update(ex_batch)
+    assert float(info['loss/q_tri']) == 0.0
+    assert float(info['sampler/valid_tri_fraction']) == 0.0
+    _assert_finite_info(info, ('loss/total', 'loss/q_base', 'loss/v'), prefix='TRL zero-mask ')
 
 
 def test_score_action_chunks_works_in_all_modes():
@@ -340,6 +384,8 @@ if __name__ == '__main__':
     test_iql_skips_chunk_critic_and_runs_one_update_step()
     test_trl_skips_dqc_chunk_critics_and_runs_direct_chunk_update_step()
     test_direct_chunk_trl_head_shapes_and_target_gradients()
+    test_direct_chunk_trl_create_normalizes_algorithm_config()
+    test_direct_chunk_trl_zero_valid_mask_has_zero_tri_loss()
     test_score_action_chunks_works_in_all_modes()
     test_validate_config_iql_and_trl_force_use_chunk_critic_off()
     test_validate_config_rejects_unknown_critic_type()
