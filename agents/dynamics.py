@@ -24,6 +24,8 @@ from utils.dynamics import (
     make_dynamics_schedule,
 )
 from utils.goal_representation import assert_phi_goal_obs_indices, goal_representation, normalize_phi_goal_obs_indices
+from utils.inverse_dynamics import InverseDynamicsMLP, parse_hidden_dims
+from utils.networks import MLP
 
 
 _VALID_PLANNER_TYPES = ('forward_bridge_residual',)
@@ -67,10 +69,6 @@ def _dynamics_model_type(config) -> str:
 def _dynamics_model_type_metric(config) -> float:
     _dynamics_model_type(config)
     return 1.0
-
-
-from utils.inverse_dynamics import InverseDynamicsMLP, parse_hidden_dims
-from utils.networks import MLP
 
 
 class SinusoidalEmbedding(nn.Module):
@@ -1703,12 +1701,12 @@ def _get_common_config():
             subgoal_value_goal_representation='full',
             subgoal_hidden_dims=(512, 512, 512),
             # Distributional subgoal controls (default: deterministic point).
-            subgoal_distribution='diag_gaussian',
+            subgoal_distribution='deterministic',
             # Stochastic subgoals intentionally support either the PDF-style
             # reparameterized sample-MSE objective or a weighted Gaussian NLL
             # objective used by selected experiment configs.
-            subgoal_stochastic_loss='nll',
-            subgoal_num_samples=4,
+            subgoal_stochastic_loss='mse',
+            subgoal_num_samples=1,
             subgoal_log_std_min=-5.0,
             subgoal_log_std_max=1.0,
             subgoal_temperature=1.0,

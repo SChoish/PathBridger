@@ -21,6 +21,33 @@ from utils.goal_representation import assert_phi_goal_obs_indices, goal_represen
 from utils.networks import MLP
 
 
+_VALID_CRITIC_TYPES = ('dqc', 'iql', 'trl', 'chunk_trl', 'direct_chunk_trl')
+_DIRECT_CHUNK_TRL_ALGORITHMS = ('chunk_trl', 'direct_chunk_trl', 'transitivechunkrl')
+
+
+def _canonicalize_critic_config(config: dict) -> tuple[str, str, bool]:
+    """Normalize critic mode aliases in-place and return mode flags."""
+    critic_type = str(config.get('critic_type', 'dqc')).lower()
+    algorithm = str(config.get('algorithm', '')).lower()
+    if algorithm in _DIRECT_CHUNK_TRL_ALGORITHMS:
+        critic_type = 'direct_chunk_trl'
+    if critic_type not in _VALID_CRITIC_TYPES:
+        raise ValueError(
+            f"critic_type must be one of {', '.join(repr(x) for x in _VALID_CRITIC_TYPES)}, got {critic_type!r}"
+        )
+    is_trl = (
+        critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl')
+        or algorithm in _DIRECT_CHUNK_TRL_ALGORITHMS
+    )
+    config['critic_type'] = 'direct_chunk_trl' if is_trl else critic_type
+    if is_trl:
+        config['algorithm'] = 'direct_chunk_trl'
+        config['use_chunk_critic'] = False
+    elif critic_type == 'iql' and bool(config.get('use_chunk_critic', False)):
+        config['use_chunk_critic'] = False
+    return str(config['critic_type']), str(config.get('algorithm', algorithm)), is_trl
+
+
 def _safe_logit(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     x = jnp.clip(x, eps, 1.0 - eps)
     return jnp.log(x) - jnp.log1p(-x)
@@ -34,11 +61,7 @@ def _expectile_loss(diff: jnp.ndarray, tau: float) -> jnp.ndarray:
 def _is_direct_chunk_trl_type(critic_type: str, algorithm: str = '') -> bool:
     critic_type = str(critic_type).lower()
     algorithm = str(algorithm).lower()
-    return critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl') or algorithm in (
-        'chunk_trl',
-        'direct_chunk_trl',
-        'transitivechunkrl',
-    )
+    return critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl') or algorithm in _DIRECT_CHUNK_TRL_ALGORITHMS
 
 
 class ScalarValueNet(nn.Module):
@@ -529,20 +552,7 @@ class CriticAgent(flax.struct.PyTreeNode):
             where='CriticAgent.create (critic goal_representation)',
             env_name=env_name,
         )
-        critic_type = str(config.get('critic_type', 'dqc')).lower()
-        algorithm = str(config.get('algorithm', '')).lower()
-        if _is_direct_chunk_trl_type(critic_type, algorithm):
-            config['algorithm'] = 'direct_chunk_trl'
-            config['critic_type'] = 'direct_chunk_trl'
-            config['use_chunk_critic'] = False
-            critic_type = 'direct_chunk_trl'
-            algorithm = 'direct_chunk_trl'
-        if critic_type not in ('dqc', 'iql', 'trl', 'chunk_trl', 'direct_chunk_trl'):
-            raise ValueError(
-                f"critic_type must be one of 'dqc', 'iql', 'trl', 'chunk_trl', or "
-                f"'direct_chunk_trl', got {critic_type!r}"
-            )
-        is_trl = _is_direct_chunk_trl_type(critic_type, algorithm)
+        critic_type, _algorithm, is_trl = _canonicalize_critic_config(config)
 
         value_def = ScalarValueNet(
             hdims,
@@ -606,18 +616,7 @@ class CriticAgent(flax.struct.PyTreeNode):
 
 
 def validate_config(critic_config, actor_config=None) -> None:
-    critic_type = str(critic_config.get('critic_type', 'dqc')).lower()
-    algorithm = str(critic_config.get('algorithm', '')).lower()
-    if algorithm in ('chunk_trl', 'direct_chunk_trl', 'transitivechunkrl'):
-        critic_type = 'direct_chunk_trl'
-    if critic_type not in ('dqc', 'iql', 'trl', 'chunk_trl', 'direct_chunk_trl'):
-        raise ValueError(
-            f"critic_type must be one of 'dqc', 'iql', 'trl', 'chunk_trl', or "
-            f"'direct_chunk_trl', got {critic_type!r}"
-        )
-    critic_config['critic_type'] = critic_type
-    if _is_direct_chunk_trl_type(critic_type, algorithm):
-        critic_config['algorithm'] = 'direct_chunk_trl'
+    _canonicalize_critic_config(critic_config)
 
     action_chunk_horizon = int(critic_config.get('action_chunk_horizon', 0))
     full_chunk_horizon = int(critic_config.get('full_chunk_horizon', 0))
@@ -628,11 +627,6 @@ def validate_config(critic_config, actor_config=None) -> None:
             f'full_chunk_horizon must be >= action_chunk_horizon, '
             f'got full_chunk_horizon={full_chunk_horizon}, action_chunk_horizon={action_chunk_horizon}.'
         )
-    if (critic_type == 'iql' or _is_direct_chunk_trl_type(critic_type, algorithm)) and bool(
-        critic_config.get('use_chunk_critic', False)
-    ):
-        # IQL/direct chunk TRL never train DQC chunk_critic; force the flag off.
-        critic_config['use_chunk_critic'] = False
     if actor_config is None:
         return
     if int(actor_config.get('actor_chunk_horizon', 0)) < 1:

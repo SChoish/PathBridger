@@ -31,10 +31,8 @@ import argparse
 import pickle
 from pathlib import Path
 
-import flax
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
 
 from agents.dynamics import DynamicsAgent
