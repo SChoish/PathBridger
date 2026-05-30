@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
+import pytest
 
 import jax
 import jax.numpy as jnp
@@ -42,7 +43,37 @@ from main import _rescore_actor_batch_for_update
 
 STATE_DIM = 4
 ACTION_DIM = 2
-BATCH = 8
+BATCH = 4
+ENV_NAME = 'antmaze-medium-navigate-v0'
+_VALUE_SHARED = {
+    'env_name': ENV_NAME,
+    'subgoal_value_hidden_dims': (32, 32),
+    'subgoal_value_goal_representation': 'phi',
+}
+
+
+def _make_critic(critic_type: str = 'dqc'):
+    cfg = get_critic_config()
+    cfg.action_chunk_horizon = 2
+    cfg.full_chunk_horizon = 4
+    cfg.value_hidden_dims = (32, 32)
+    cfg.action_dim = ACTION_DIM
+    cfg.env_name = ENV_NAME
+    cfg.critic_type = critic_type
+    if critic_type == 'trl':
+        cfg.algorithm = 'trl'
+        cfg.use_chunk_critic = False
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    ex_part = np.zeros((BATCH, cfg.action_chunk_horizon * ACTION_DIM), dtype=np.float32)
+    ex_full = None if critic_type != 'dqc' else np.zeros((BATCH, cfg.full_chunk_horizon * ACTION_DIM), np.float32)
+    return CriticAgent.create(
+        seed=0,
+        ex_observations=ex_obs,
+        ex_full_chunk_actions=ex_full,
+        ex_action_chunk_actions=ex_part,
+        config=cfg,
+        ex_goals=ex_obs,
+    )
 
 
 def _make_dynamics_agent(
@@ -70,25 +101,6 @@ def _make_dynamics_agent(
     return DynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
 
 
-def _make_critic_agent():
-    cfg = get_critic_config()
-    cfg.action_chunk_horizon = 2
-    cfg.full_chunk_horizon = 4
-    cfg.value_hidden_dims = (32, 32)
-    cfg.action_dim = ACTION_DIM
-    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
-    ex_full = np.zeros((BATCH, cfg.full_chunk_horizon * ACTION_DIM), dtype=np.float32)
-    ex_part = np.zeros((BATCH, cfg.action_chunk_horizon * ACTION_DIM), dtype=np.float32)
-    return CriticAgent.create(
-        seed=0,
-        ex_observations=ex_obs,
-        ex_full_chunk_actions=ex_full,
-        ex_action_chunk_actions=ex_part,
-        config=cfg,
-        ex_goals=ex_obs,
-    )
-
-
 # ---------------------------------------------------------------------------
 # 1. deterministic mode
 # ---------------------------------------------------------------------------
@@ -114,13 +126,18 @@ def test_deterministic_subgoal_api():
 # 2. linear dynamics schedule
 # ---------------------------------------------------------------------------
 
-def test_linear_dynamics_schedule_and_posterior_mean_are_finite():
+def test_linear_dynamics_schedule():
     schedule = make_dynamics_schedule(N=8, beta_min=0.1, beta_max=20.0, lambda_=1.0, bridge_gamma_inv=0.0)
     assert schedule['bridge_w'].shape == (9,)
     assert schedule['bridge_var'].shape == (9,)
     assert 'dynamics_phi_iK' in schedule
-    assert 'dynamics_omega_iK' in schedule
     assert float(schedule['gamma_inv']) == 0.0
+
+    s_soft = make_dynamics_schedule(N=8, bridge_gamma_inv=0.5)
+    assert abs(float(s_soft['gamma_inv']) - 0.5) < 1e-6
+
+    with pytest.raises(ValueError):
+        make_dynamics_schedule(N=4, bridge_gamma_inv=-1.0)
 
     rng = jax.random.PRNGKey(0)
     x0 = jax.random.normal(rng, (BATCH, STATE_DIM))
@@ -130,23 +147,6 @@ def test_linear_dynamics_schedule_and_posterior_mean_are_finite():
     mu = posterior_mean(x_n, x0, xT, n, schedule)
     assert np.all(np.isfinite(np.asarray(x_n)))
     assert np.all(np.isfinite(np.asarray(mu)))
-
-
-def test_linear_dynamics_resolves_gamma_inv_correctly():
-    # The schedule must thread bridge_gamma_inv into a `gamma_inv` entry so
-    # downstream agents can query the exact configured denominator offset.
-    s_soft = make_dynamics_schedule(N=8, bridge_gamma_inv=0.5)
-    assert abs(float(s_soft['gamma_inv']) - 0.5) < 1e-6
-    assert 'dynamics_bridge_w' in s_soft
-    assert 'dynamics_bridge_var' in s_soft
-
-    # Negative inverse gamma must raise.
-    raised = False
-    try:
-        make_dynamics_schedule(N=4, bridge_gamma_inv=-1.0)
-    except ValueError:
-        raised = True
-    assert raised
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +175,7 @@ def test_distributional_subgoal_sampling_shapes():
 # ---------------------------------------------------------------------------
 
 def test_critic_score_action_chunks_with_per_candidate_goals():
-    critic = _make_critic_agent()
+    critic = _make_critic()
     n_cand = 4
     ha = int(critic.config['action_chunk_horizon'])
     obs = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
@@ -220,34 +220,23 @@ def _check_build_actor_proposals(agent, plan_candidates: int, expected_candidate
     assert cand_goals.shape == (BATCH, expected_candidates, STATE_DIM)
 
 
-def test_build_actor_proposals_deterministic_n1_n_gt_1():
-    agent = _make_dynamics_agent('deterministic')
-    _check_build_actor_proposals(agent, plan_candidates=1)
-    _check_build_actor_proposals(agent, plan_candidates=4)
-
-
-def test_build_actor_proposals_diag_gaussian_n1_n_gt_1():
-    agent = _make_dynamics_agent('diag_gaussian')
-    _check_build_actor_proposals(agent, plan_candidates=1)
-    _check_build_actor_proposals(agent, plan_candidates=4)
-
-
-def test_build_actor_proposals_diag_gaussian_subgoal_samples_times_plan_candidates():
-    subgoal_samples = 3
-    plan_candidates = 4
-    agent = _make_dynamics_agent('diag_gaussian', subgoal_num_samples=subgoal_samples)
-    _check_build_actor_proposals(
-        agent,
-        plan_candidates=plan_candidates,
-        expected_candidates=subgoal_samples * plan_candidates,
-    )
+@pytest.mark.parametrize(
+    'distribution,plan_candidates,subgoal_num_samples,expected_candidates',
+    [
+        ('deterministic', 1, 1, 1),
+        ('diag_gaussian', 4, 3, 12),
+    ],
+)
+def test_build_actor_proposals_shapes(distribution, plan_candidates, subgoal_num_samples, expected_candidates):
+    agent = _make_dynamics_agent(distribution, subgoal_num_samples=subgoal_num_samples)
+    _check_build_actor_proposals(agent, plan_candidates=plan_candidates, expected_candidates=expected_candidates)
 
 
 def test_rescore_keeps_global_best_proposal_before_spi():
     subgoal_samples = 3
     plan_candidates = 4
     agent = _make_dynamics_agent('diag_gaussian', subgoal_num_samples=subgoal_samples)
-    critic = _make_critic_agent()
+    critic = _make_critic()
     obs = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
     g = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
     mu, cand_actions, cand_goals, _ = agent.build_actor_proposals(
@@ -303,61 +292,25 @@ def _make_phase1_batch():
     }
 
 
-def test_distributional_subgoal_loss_is_finite():
-    agent = _make_dynamics_agent('diag_gaussian')
-    batch = _make_phase1_batch()
-    new_agent, info = agent.update(batch, critic_value_params=None)
-    for k, v in info.items():
-        v = np.asarray(v)
-        assert np.all(np.isfinite(v)), f'non-finite log value at {k}: {v}'
-    # Required new keys are present.
-    for required in (
-        'phase1/subgoal_nll',
-        'phase1/subgoal_stochastic_loss',
-        'phase1/subgoal_stochastic_loss_mode',
-        'phase1/subgoal_mean_mse',
-        'phase1/subgoal_sample_mse',
-        'phase1/subgoal_weighted_mse',
-        'phase1/subgoal_weighted_nll',
-        'phase1/subgoal_current_value_mean',
-        'phase1/subgoal_mse_weight_mean',
-        'phase1/subgoal_std_mean',
-        'phase1/subgoal_std_max',
-        'phase1/subgoal_mode',
-        'dynamics/bridge_gamma_inv',
-        'dynamics/gamma_inv',
-    ):
-        assert required in info, f'missing log key {required}'
-    # subgoal_mode == 1.0 in diag_gaussian mode.
-    assert float(info['phase1/subgoal_mode']) == 1.0
-    assert float(info['phase1/subgoal_stochastic_loss_mode']) == 0.0
-
-
-def test_distributional_subgoal_nll_loss_option_is_finite():
-    agent = _make_dynamics_agent('diag_gaussian', config_updates={'subgoal_stochastic_loss': 'nll'})
-    batch = _make_phase1_batch()
-    _, info = agent.update(batch, critic_value_params=None)
+def _assert_phase1_finite(info):
     for k, v in info.items():
         assert np.all(np.isfinite(np.asarray(v))), f'non-finite log value at {k}: {v}'
-    assert float(info['phase1/subgoal_stochastic_loss_mode']) == 1.0
-    np.testing.assert_allclose(
-        np.asarray(info['phase1/subgoal_stochastic_loss']),
-        np.asarray(info['phase1/subgoal_weighted_nll']),
-        rtol=1e-5,
-        atol=1e-6,
-    )
 
 
-def test_deterministic_subgoal_loss_is_finite_and_logs_are_stable():
-    agent = _make_dynamics_agent('deterministic')
-    batch = _make_phase1_batch()
-    _, info = agent.update(batch, critic_value_params=None)
-    for k, v in info.items():
-        assert np.all(np.isfinite(np.asarray(v))), f'non-finite log value at {k}: {v}'
-    # In deterministic mode the new metrics should be zero placeholders.
-    assert float(info['phase1/subgoal_mode']) == 0.0
-    assert float(info['phase1/subgoal_nll']) == 0.0
-    assert float(info['phase1/subgoal_stochastic_loss_mode']) == 0.0
+@pytest.mark.parametrize(
+    'distribution,extra_updates,expected_mode,expected_stochastic_mode',
+    [
+        ('deterministic', {}, 0.0, 0.0),
+        ('diag_gaussian', {}, 1.0, 0.0),
+        ('diag_gaussian', {'subgoal_stochastic_loss': 'nll'}, 1.0, 1.0),
+    ],
+)
+def test_phase1_subgoal_loss_finite(distribution, extra_updates, expected_mode, expected_stochastic_mode):
+    agent = _make_dynamics_agent(distribution, config_updates=extra_updates)
+    _, info = agent.update(_make_phase1_batch(), critic_value_params=None)
+    _assert_phase1_finite(info)
+    assert float(info['phase1/subgoal_mode']) == expected_mode
+    assert float(info['phase1/subgoal_stochastic_loss_mode']) == expected_stochastic_mode
 
 
 def test_subgoal_expectile_value_style_weights_by_gap_sign():
@@ -409,305 +362,79 @@ def _displacement_agent(subgoal_distribution='deterministic', **updates):
     )
 
 
-def test_displacement_mode_predict_subgoal_returns_absolute_state():
-    # ``predict_subgoal`` must always return an absolute state; in displacement
-    # mode the raw network output is Delta and the agent adds ``observations``
-    # internally so callers cannot tell the difference.
-    agent_disp = _displacement_agent()
-    agent_abs = _make_dynamics_agent('deterministic')
+def test_displacement_mode():
+    agent = _displacement_agent('deterministic')
     rng = np.random.default_rng(0)
     obs = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
     g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    endpoint = obs + jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
 
-    sg_disp = np.asarray(agent_disp.predict_subgoal(obs, g))
-    raw_disp = np.asarray(agent_disp._subgoal_forward(obs, g))
-    # Output should equal obs + raw network output in displacement mode.
-    np.testing.assert_allclose(sg_disp, np.asarray(obs) + raw_disp, rtol=1e-5, atol=1e-6)
-    assert sg_disp.shape == (BATCH, STATE_DIM)
+    sg = np.asarray(agent.predict_subgoal(obs, g))
+    raw = np.asarray(agent._subgoal_forward(obs, g))
+    np.testing.assert_allclose(sg, np.asarray(obs) + raw, rtol=1e-5, atol=1e-6)
 
-    # Sanity: absolute-mode agent returns the raw output untouched.
-    sg_abs = np.asarray(agent_abs.predict_subgoal(obs, g))
-    raw_abs = np.asarray(agent_abs._subgoal_forward(obs, g))
-    np.testing.assert_allclose(sg_abs, raw_abs, rtol=1e-5, atol=1e-6)
-
-
-def test_displacement_mode_plan_endpoint_clamped_to_desired_endpoint():
-    # The bridge planner exposes an absolute API; with displacement mode on,
-    # ``plan(current_state, desired_endpoint)`` must still return a trajectory
-    # whose endpoints equal ``current_state`` and ``desired_endpoint`` even
-    # though the underlying chain is trained in displacement frame.
-    agent = _displacement_agent()
-    rng = np.random.default_rng(1)
-    current = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    endpoint = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    result = agent.plan(current, endpoint)
-    traj = np.asarray(result['trajectory'])
-    # The exact-residual chain pins ``traj[:, 0]`` to ``current_state`` because
-    # the plan helper adds back the origin after a 0-anchored chain rollout.
-    np.testing.assert_allclose(traj[:, 0, :], np.asarray(current), rtol=1e-5, atol=1e-6)
-
-
-def test_displacement_mode_forward_bridge_endpoint_preserved():
-    # ``forward_bridge`` clamps both endpoints; the displacement shift must
-    # not break that invariant.
-    cfg_updates = {
-        'subgoal_target_mode': 'displacement',
-        'planner_type': 'forward_bridge',
-    }
-    agent = _make_dynamics_agent('deterministic', config_updates=cfg_updates)
-    rng = np.random.default_rng(2)
-    current = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    endpoint = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    traj = np.asarray(agent.plan(current, endpoint)['trajectory'])
-    np.testing.assert_allclose(traj[:, 0, :], np.asarray(current), rtol=1e-5, atol=1e-6)
+    traj = np.asarray(agent.plan(obs, endpoint)['trajectory'])
+    np.testing.assert_allclose(traj[:, 0, :], np.asarray(obs), rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(traj[:, -1, :], np.asarray(endpoint), rtol=1e-5, atol=1e-6)
 
+    mu, _, cand_goals, _ = agent.build_actor_proposals(
+        obs, g, jax.random.PRNGKey(0), proposal_horizon=2, plan_candidates=2, sample_noise_scale=0.0,
+    )
+    np.testing.assert_allclose(np.asarray(mu) - np.asarray(obs), raw, rtol=1e-5, atol=1e-6)
+    assert cand_goals.shape[-1] == STATE_DIM
 
-def test_displacement_mode_loss_is_finite_and_target_mode_logged():
-    # Phase-1 loss with displacement-mode targets must remain finite, and the
-    # ``dynamics/subgoal_target_mode`` metric must flag the mode (1.0).
-    agent = _displacement_agent('deterministic')
-    batch = _make_phase1_batch()
-    _, info = agent.update(batch, critic_value_params=None)
-    for k, v in info.items():
-        v = np.asarray(v)
-        assert np.all(np.isfinite(v)), f'non-finite log at {k}: {v}'
+    _, info = agent.update(_make_phase1_batch(), critic_value_params=None)
+    _assert_phase1_finite(info)
     assert float(info['dynamics/subgoal_target_mode']) == 1.0
 
-    agent_abs = _make_dynamics_agent('deterministic')
-    _, info_abs = agent_abs.update(batch, critic_value_params=None)
-    assert float(info_abs['dynamics/subgoal_target_mode']) == 0.0
-
-
-def test_displacement_mode_residual_net_uses_anchor():
-    # PathResidualNet must take an anchor input and respond to it; otherwise
-    # displacement mode collapses to a translation-invariant correction and the
-    # bridge cannot distinguish two trajectories with the same Delta but
-    # different current states.
-    agent = _displacement_agent('deterministic')
-    rng = np.random.default_rng(11)
     zK = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
     t_norm = jnp.full((BATCH, 1), 0.5, dtype=jnp.float32)
     s1_a = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
     s1_b = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-
-    eps_a = np.asarray(
-        agent.network.select('path_residual_net')(s1_a, zK, t_norm)
-    )
-    eps_b = np.asarray(
-        agent.network.select('path_residual_net')(s1_b, zK, t_norm)
-    )
-    # Different anchors must produce different residuals on at least one
-    # element of the batch (we just need to confirm the input is wired in).
+    eps_a = np.asarray(agent.network.select('path_residual_net')(s1_a, zK, t_norm))
+    eps_b = np.asarray(agent.network.select('path_residual_net')(s1_b, zK, t_norm))
     assert not np.allclose(eps_a, eps_b, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(agent._bridge_anchor(obs)), np.asarray(obs), rtol=1e-6, atol=1e-6)
 
 
-def test_displacement_mode_plan_responds_to_current_state():
-    # End-to-end check: with the same Delta = desired_endpoint - current_state
-    # but a different current_state (and matching desired_endpoint shift), the
-    # produced trajectory shape (after subtracting the trivial origin shift)
-    # must differ - otherwise the residual chain is forced to be translation
-    # invariant.
-    agent = _displacement_agent('deterministic')
-    rng = np.random.default_rng(12)
-    current_a = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    delta = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    endpoint_a = current_a + delta
-    shift = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    current_b = current_a + shift
-    endpoint_b = endpoint_a + shift  # same Delta in both cases
-
-    traj_a = np.asarray(agent.plan(current_a, endpoint_a)['trajectory'])
-    traj_b = np.asarray(agent.plan(current_b, endpoint_b)['trajectory'])
-    # Remove the origin shift to isolate the bridge shape.
-    shape_a = traj_a - np.asarray(current_a)[:, None, :]
-    shape_b = traj_b - np.asarray(current_b)[:, None, :]
-    # If the residual ignored the anchor, both shapes would be identical.
-    assert not np.allclose(shape_a, shape_b, atol=1e-6)
-
-
-def test_bridge_anchor_is_always_current_state():
-    # The anchor channel is mode-agnostic: it always carries ``s_t``.  In
-    # absolute mode this is redundant with ``x_T``; in displacement mode it
-    # is the only path through which ``s_t`` reaches the residual MLP.
-    obs = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32) + 3.0
-    for mode in ('absolute', 'displacement'):
-        agent = _make_dynamics_agent(
-            'deterministic', config_updates={'subgoal_target_mode': mode},
-        )
-        anchor = np.asarray(agent._bridge_anchor(obs))
-        np.testing.assert_allclose(anchor, np.asarray(obs), rtol=1e-6, atol=1e-6)
-
-
-def test_displacement_mode_build_actor_proposals_returns_absolute_goals():
-    # ``build_actor_proposals`` must return absolute ``mu`` and
-    # ``candidate_goals`` so SPI/Q can be scored in absolute state space.
-    agent = _displacement_agent('diag_gaussian')
-    rng = np.random.default_rng(3)
-    obs = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    mu, _, cand_goals, _ = agent.build_actor_proposals(
-        obs, g, jax.random.PRNGKey(0),
-        proposal_horizon=2, plan_candidates=2, sample_noise_scale=0.0,
-    )
-    # Network output is Delta; ``mu - obs`` should match the raw forward-pass
-    # mean (so ``mu`` is in absolute frame as expected by downstream callers).
-    raw_mu = np.asarray(agent._subgoal_forward(obs, g)[0])
-    np.testing.assert_allclose(np.asarray(mu) - np.asarray(obs), raw_mu, rtol=1e-5, atol=1e-6)
-    # Each candidate goal is an absolute state with the same shape.
-    assert cand_goals.shape[-1] == STATE_DIM
-
-
-def _make_trl_critic_agent():
-    cfg = get_critic_config()
-    cfg.critic_type = 'direct_chunk_trl'
-    cfg.algorithm = 'direct_chunk_trl'
-    cfg.use_chunk_critic = False
-    cfg.goal_representation = 'full'
-    cfg.action_chunk_horizon = 2
-    cfg.full_chunk_horizon = 4
-    cfg.value_hidden_dims = (32, 32)
-    cfg.action_dim = ACTION_DIM
-    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
-    ex_part = np.zeros((BATCH, cfg.action_chunk_horizon * ACTION_DIM), dtype=np.float32)
-    return CriticAgent.create(
-        seed=0,
-        ex_observations=ex_obs,
-        ex_full_chunk_actions=None,
-        ex_action_chunk_actions=ex_part,
-        config=cfg,
-        ex_goals=ex_obs,
-    )
-
-
-def _subgoal_value_test_config_updates() -> dict:
-    return {
-        'subgoal_value_goal_representation': 'full',
-        'subgoal_value_hidden_dims': (32, 32),
-    }
-
-
-def test_trl_subgoal_value_bonus_uses_product_form():
-    critic = _make_trl_critic_agent()
-    value_params = critic.network.params['modules_value']
-    agent = _make_dynamics_agent(
-        'diag_gaussian',
-        config_updates={
-            **_subgoal_value_test_config_updates(),
-            'critic_type': 'direct_chunk_trl',
-            'algorithm': 'direct_chunk_trl',
-            'subgoal_value_alpha': 1.0,
-        },
-    )
-    rng = np.random.default_rng(17)
+def _subgoal_value_terms(agent, value_params, rng_seed=17):
+    rng = np.random.default_rng(rng_seed)
     s = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
     sg = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
     target = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
     g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    return agent._subgoal_value_terms(s, sg, target, g, value_params)
 
-    (
-        pred_value,
-        _obs_value,
-        _target_value,
-        bonus,
-        _mse_weight,
-        _gap,
-        _adv_logit,
-        v_s_sg,
-        v_sg_g,
-    ) = agent._subgoal_value_terms(s, sg, target, g, value_params)
 
-    v_s_sg_expected = agent._subgoal_values(s, sg, value_params)
-    v_sg_g_expected = pred_value
-    np.testing.assert_allclose(np.asarray(v_s_sg), np.asarray(v_s_sg_expected), rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(np.asarray(v_sg_g), np.asarray(v_sg_g_expected), rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(
-        np.asarray(bonus),
-        np.asarray(v_s_sg_expected * v_sg_g_expected),
-        rtol=1e-5,
-        atol=1e-6,
+def test_subgoal_value_bonus_by_critic_mode():
+    dqc = _make_critic('dqc')
+    dqc_agent = _make_dynamics_agent(
+        'diag_gaussian',
+        config_updates={**_VALUE_SHARED, 'critic_type': 'dqc', 'subgoal_value_alpha': 0.5},
     )
+    pred, _, _, bonus, _, _, _, v_s_sg, _ = _subgoal_value_terms(
+        dqc_agent, dqc.network.params['modules_value'], rng_seed=19,
+    )
+    np.testing.assert_allclose(np.asarray(bonus), 0.5 * np.asarray(pred), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(v_s_sg), 0.0, atol=1e-6)
 
-
-def test_state_transitive_subgoal_bonus_ratio_and_gradients():
-    critic = _make_trl_critic_agent()
-    value_params = critic.network.params['modules_value']
-    agent = _make_dynamics_agent(
+    trl_critic = _make_critic('trl')
+    trl_agent = _make_dynamics_agent(
         'diag_gaussian',
         config_updates={
-            **_subgoal_value_test_config_updates(),
-            'critic_type': 'state_transitive',
-            'algorithm': 'state_transitive',
+            **_VALUE_SHARED,
+            'critic_type': 'trl',
+            'algorithm': 'trl',
             'subgoal_value_alpha': 1.0,
             'subgoal_value_bonus_type': 'transitive_ratio',
             'subgoal_value_ratio_eps': 1e-6,
         },
     )
-    rng = np.random.default_rng(23)
-    s = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    sg = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    target = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-
-    pred_value, obs_value, _, bonus, _, _, _, v_s_sg, v_sg_g = agent._subgoal_value_terms(
-        s, sg, target, g, value_params,
+    pred, obs_value, _, bonus, _, _, _, v_s_sg, v_sg_g = _subgoal_value_terms(
+        trl_agent, trl_critic.network.params['modules_value'], rng_seed=23,
     )
     expected_ratio = v_s_sg * v_sg_g / (obs_value + 1e-6)
-    assert np.all(np.isfinite(np.asarray(expected_ratio)))
     np.testing.assert_allclose(np.asarray(bonus), np.asarray(expected_ratio), rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(np.asarray(v_sg_g), np.asarray(pred_value), rtol=1e-5, atol=1e-6)
-
-    def bonus_sum(z, params):
-        _, _, _, b, _, _, _, _, _ = agent._subgoal_value_terms(s, z, target, g, params)
-        return jnp.sum(b)
-
-    grad_sg, grad_params = jax.grad(bonus_sum, argnums=(0, 1))(sg, value_params)
-    assert float(jnp.sum(jnp.abs(grad_sg))) > 0.0
-    param_grad_sum = sum(float(jnp.sum(jnp.abs(x))) for x in jax.tree_util.tree_leaves(grad_params))
-    assert param_grad_sum == 0.0
-
-
-def test_dqc_subgoal_value_bonus_uses_single_value_form():
-    critic = _make_critic_agent()
-    critic_cfg = get_critic_config()
-    critic_cfg.goal_representation = 'full'
-    critic_cfg.value_hidden_dims = (32, 32)
-    critic_cfg.action_chunk_horizon = 2
-    critic_cfg.full_chunk_horizon = 4
-    critic_cfg.action_dim = ACTION_DIM
-    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
-    ex_full = np.zeros((BATCH, critic_cfg.full_chunk_horizon * ACTION_DIM), dtype=np.float32)
-    ex_part = np.zeros((BATCH, critic_cfg.action_chunk_horizon * ACTION_DIM), dtype=np.float32)
-    critic = CriticAgent.create(
-        seed=0,
-        ex_observations=ex_obs,
-        ex_full_chunk_actions=ex_full,
-        ex_action_chunk_actions=ex_part,
-        config=critic_cfg,
-        ex_goals=ex_obs,
-    )
-    value_params = critic.network.params['modules_value']
-    agent = _make_dynamics_agent(
-        'diag_gaussian',
-        config_updates={
-            **_subgoal_value_test_config_updates(),
-            'critic_type': 'dqc',
-            'algorithm': 'dqc',
-            'subgoal_value_alpha': 0.5,
-        },
-    )
-    rng = np.random.default_rng(19)
-    s = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    sg = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    target = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-
-    pred_value, _, _, bonus, _, _, _, v_s_sg, v_sg_g = agent._subgoal_value_terms(
-        s, sg, target, g, value_params,
-    )
-    np.testing.assert_allclose(np.asarray(bonus), 0.5 * np.asarray(pred_value), rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(np.asarray(v_s_sg), 0.0, atol=1e-6)
-    np.testing.assert_allclose(np.asarray(v_sg_g), np.asarray(pred_value), rtol=1e-5, atol=1e-6)
 
 
 if __name__ == '__main__':

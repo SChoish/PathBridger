@@ -1148,20 +1148,21 @@ class DynamicsAgent(_DynamicsAgentCore):
                 )
         return super().create(seed, ex_observations, config, ex_actions=ex_actions)
 
-    def _is_direct_chunk_trl_mode(self) -> bool:
+    def _is_trl_mode(self) -> bool:
         critic_type = str(self.config.get('critic_type', 'dqc')).lower()
         algorithm = str(self.config.get('algorithm', '')).lower()
-        return (
-            critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl')
-            or algorithm in ('chunk_trl', 'direct_chunk_trl', 'transitivechunkrl')
-        )
-
-    def _is_state_transitive_mode(self) -> bool:
-        critic_type = str(self.config.get('critic_type', 'dqc')).lower()
-        algorithm = str(self.config.get('algorithm', '')).lower()
-        return (
-            critic_type in ('state_transitive', 'transitive_v_local_q')
-            or algorithm in ('state_transitive', 'transitive_v_local_q')
+        return critic_type == 'trl' or algorithm == 'trl' or critic_type in (
+            'chunk_trl',
+            'direct_chunk_trl',
+            'state_transitive',
+            'transitive_v_local_q',
+            'transitivechunkrl',
+        ) or algorithm in (
+            'chunk_trl',
+            'direct_chunk_trl',
+            'state_transitive',
+            'transitive_v_local_q',
+            'transitivechunkrl',
         )
 
     def _subgoal_mse_weight_from_gap(self, gap: jnp.ndarray) -> jnp.ndarray:
@@ -1202,15 +1203,8 @@ class DynamicsAgent(_DynamicsAgentCore):
     def _subgoal_bonus_type_id(self) -> jnp.ndarray:
         bonus_type = self.config.get('subgoal_value_bonus_type', None)
         if bonus_type is None:
-            if self._is_state_transitive_mode():
-                bonus_type = 'transitive_ratio'
-            elif self._is_direct_chunk_trl_mode():
-                bonus_type = 'transitive_product'
-            else:
-                bonus_type = 'single_value'
+            bonus_type = 'transitive_ratio' if self._is_trl_mode() else 'single_value'
         bonus_type = str(bonus_type).lower()
-        if self._is_direct_chunk_trl_mode() and not self._is_state_transitive_mode() and bonus_type == 'single_value':
-            bonus_type = 'transitive_product'
         ids = {
             'none': 0.0,
             'single_value': 1.0,
@@ -1274,19 +1268,10 @@ class DynamicsAgent(_DynamicsAgentCore):
         alpha = jnp.asarray(float(self.config.get('subgoal_value_alpha', 0.0)), dtype=jnp.float32)
         bonus_type = self.config.get('subgoal_value_bonus_type', None)
         if bonus_type is None:
-            if self._is_state_transitive_mode():
-                bonus_type = 'transitive_ratio'
-            elif self._is_direct_chunk_trl_mode():
-                bonus_type = 'transitive_product'
-            else:
-                bonus_type = 'single_value'
+            bonus_type = 'transitive_ratio' if self._is_trl_mode() else 'single_value'
         bonus_type = str(bonus_type).lower()
-        if self._is_direct_chunk_trl_mode() and not self._is_state_transitive_mode() and bonus_type == 'single_value':
-            # Preserve the historical direct_chunk_trl default despite the shared
-            # dynamics config defaulting non-TRL modes to single_value.
-            bonus_type = 'transitive_product'
 
-        if (self._is_direct_chunk_trl_mode() or self._is_state_transitive_mode()) and critic_value_params is not None:
+        if self._is_trl_mode() and critic_value_params is not None:
             v_s_sg = self._subgoal_values(observations, pred_subgoals, critic_value_params)
             v_sg_g = pred_value
             transitive_product = v_s_sg * v_sg_g
@@ -1435,7 +1420,7 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_adv_logit_min': jnp.min(subgoal_adv_logit),
                 'phase1/subgoal_adv_logit_max': jnp.max(subgoal_adv_logit),
                 'phase1/subgoal_value_bonus_style': jnp.asarray(
-                    1.0 if self._is_direct_chunk_trl_mode() else 0.0, dtype=jnp.float32,
+                    1.0 if self._is_trl_mode() else 0.0, dtype=jnp.float32,
                 ),
                 'phase1/subgoal_trl_v_s_sg_mean': jnp.mean(subgoal_trl_v_s_sg),
                 'phase1/subgoal_trl_v_sg_g_mean': jnp.mean(subgoal_trl_v_sg_g),
@@ -1494,7 +1479,7 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_adv_logit_min': jnp.min(subgoal_adv_logit),
                 'phase1/subgoal_adv_logit_max': jnp.max(subgoal_adv_logit),
                 'phase1/subgoal_value_bonus_style': jnp.asarray(
-                    1.0 if self._is_direct_chunk_trl_mode() else 0.0, dtype=jnp.float32,
+                    1.0 if self._is_trl_mode() else 0.0, dtype=jnp.float32,
                 ),
                 'phase1/subgoal_trl_v_s_sg_mean': jnp.mean(subgoal_trl_v_s_sg),
                 'phase1/subgoal_trl_v_sg_g_mean': jnp.mean(subgoal_trl_v_sg_g),

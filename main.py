@@ -28,6 +28,7 @@ from agents.critic import (
     extract_critic_primary_score,
     get_config as get_critic_config,
     validate_config,
+    _is_trl_type,
 )
 from agents.actor import ActorAgent, get_actor_config
 from agents.dynamics import DynamicsAgent, get_dynamics_config
@@ -796,11 +797,7 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
         critic_goals = jnp.asarray(cand_goals_in, dtype=jnp.float32)  # [B, N, D]
     else:
         critic_goals = goals  # [B, D] - shared
-    force_rescore_single = False
-    if hasattr(critic_agent, '_is_direct_chunk_trl'):
-        force_rescore_single = bool(critic_agent._is_direct_chunk_trl())
-    if hasattr(critic_agent, '_is_state_transitive'):
-        force_rescore_single = force_rescore_single or bool(critic_agent._is_state_transitive())
+    force_rescore_single = bool(getattr(critic_agent, '_is_trl', lambda: False)())
     force_rescore_single = force_rescore_single or bool(
         critic_agent.config.get('rescore_single_candidate', False)
     )
@@ -893,9 +890,7 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     )
     dynamics_config['critic_type'] = str(critic_config.get('critic_type', 'dqc'))
     dynamics_config['algorithm'] = str(critic_config.get('algorithm', 'dqc'))
-    if str(critic_config.get('critic_type', 'dqc')).lower() in ('state_transitive', 'transitive_v_local_q') or str(
-        critic_config.get('algorithm', 'dqc')
-    ).lower() in ('state_transitive', 'transitive_v_local_q'):
+    if _is_trl_type(str(critic_config.get('critic_type', 'dqc')), str(critic_config.get('algorithm', ''))):
         bonus_type = str(critic_config.get('subgoal_value_bonus_type', 'transitive_ratio')).lower()
         dynamics_config['subgoal_value_bonus_type'] = (
             'transitive_ratio' if bonus_type == 'single_value' else bonus_type
@@ -945,7 +940,7 @@ def _create_actor_agent(seed: int, ex_dynamics: dict, actor_config):
 def _extract_critic_value_params(critic_agent: Any) -> Any | None:
     if critic_agent is None:
         return None
-    if hasattr(critic_agent, '_is_state_transitive') and bool(critic_agent._is_state_transitive()):
+    if hasattr(critic_agent, '_is_trl') and bool(critic_agent._is_trl()):
         return critic_agent.network.params.get('modules_target_value', None)
     return critic_agent.network.params.get('modules_value', None)
 

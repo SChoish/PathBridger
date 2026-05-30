@@ -3,7 +3,7 @@
 OGBench 기반 오프라인 제어 실험 코드입니다. 메인 경로는 **linear-SDE dynamics + critic + SPI actor**의 동시 학습입니다.
 
 - Dynamics 부분은 GOUB[^goub] 계열의 bridge 아이디어에서 시작했지만, 현재 메인 경로는 `forward_bridge_residual`입니다. Closed-form forward bridge mean 위에 endpoint-preserving `PathResidualNet` residual을 얹고, `bridge_gamma_inv: 0.0`이면 hard endpoint bridge입니다. Subgoal은 `diag_gaussian` + `subgoal_stochastic_loss: nll`, `subgoal_target_mode`, `residual_target_mode`, state normalization 등의 ablation을 지원합니다.
-- Critic 부분은 DQC[^dqc]의 chunk/action critic 구조와 SPI actor rescoring 경로를 유지합니다. 추가로 `direct_chunk_trl` critic mode는 action chunk goal-conditioned critic `Q_H(s, A_H, g)`를 직접 학습하고, value는 해당 chunk critic의 expectile readout으로만 학습합니다.
+- Critic 부분은 DQC[^dqc]의 chunk/action critic 구조와 SPI actor rescoring 경로를 유지합니다. `trl` critic mode는 primary state-pair transitive value `V(s,g)`를 직접 학습하고, local action chunk critic `Q(s,A_h,z)`는 target V에서 bootstrap합니다.
 
 [^goub]: Generalized Ornstein-Uhlenbeck Bridge.
 [^dqc]: Decoupled Q Chunking.
@@ -18,7 +18,7 @@ OGBench 기반 오프라인 제어 실험 코드입니다. 메인 경로는 **li
 | `agents/dynamics.py` | linear-SDE dynamics agent (`forward_bridge_residual`, subgoal/IDM/path 손실, planner API) |
 | `utils/dynamics.py` | bridge 스케줄, sampling, posterior/model mean, exact-residual 헬퍼 |
 | `utils/theta_schedules.py` | linear-SDE θ 스케줄 (`linear_beta`, `prefix_progress`) |
-| `agents/critic.py` | DQC/IQL/direct chunk TRL critic |
+| `agents/critic.py` | DQC/IQL/TRL critic |
 | `agents/actor.py` | SPI actor |
 | `eval_checkpoint.py` | 체크포인트에서 환경 평가만 재실행 |
 | `rollout/run.py` | checkpoint rollout 통합 엔트리포인트 (`subgoal`/`idm`/`actor`, maze/manip 자동 분기) |
@@ -99,7 +99,7 @@ dynamics:
 | `subgoal_stochastic_loss` | `mse` | `diag_gaussian` 학습 loss. `mse`는 PDF Eq. (51)에 가까운 reparameterized sample-MSE, `nll`은 일부 실험에서 의도적으로 쓰는 value-gap-weighted Gaussian NLL |
 | `subgoal_target_mode` | `absolute` | `absolute`: raw subgoal output/teacher가 $s_{t+K}$. `displacement`: raw output/teacher가 $\Delta=s_{t+K}-s_t$이고 bridge는 local frame에서 학습/계획 |
 | `subgoal_loss_weight` | `1.0` | subgoal regression/value loss 가중치 |
-| `subgoal_value_alpha` | `0.5` | subgoal loss의 critic value bonus 계수. DQC/IQL에서는 `alpha * V(\hat s_{t+K}, g)`. `direct_chunk_trl`에서는 `alpha * V(s_t, \hat s_{t+K}) * V(\hat s_{t+K}, g)`. `0`이면 비활성화 |
+| `subgoal_value_alpha` | `0.5` | subgoal loss의 critic value bonus 계수. DQC/IQL에서는 `alpha * V(\hat s_{t+K}, g)`. `trl`에서는 기본 `alpha * V(s,z) * V(z,g) / (V(s,g)+eps)`. `0`이면 비활성화 |
 | `subgoal_value_style` | `exponential` | subgoal regression/NLL value-gap weight 방식. `exponential`은 $\exp(c\Delta V)$, `expectile`은 $\Delta V>0$이면 `subgoal_value_expectile`, 아니면 `1-subgoal_value_expectile` |
 | `subgoal_value_expectile` | `0.7` | `subgoal_value_style=expectile`일 때 양의 value gap에 주는 weight |
 | `subgoal_value_gap_scale` | `1.0` | $\Delta V=V(s_{t+K}^{D}, g)-V(s_t, g)$에 곱하는 scale $c$ |
@@ -160,36 +160,32 @@ actor:
 |---------------|------|
 | `dqc` | 기본값. full chunk critic + action chunk critic + value를 함께 학습 |
 | `iql` | DQC chunk critic 없이 action chunk critic + value만 사용 |
-| `direct_chunk_trl` / `chunk_trl` / `trl` | direct chunk-level Transitive RL. primary head는 `Q_H(s, A_H, g)`이며, `V(s,g)`는 in-sample expectile readout |
+| `trl` | state-pair transitive value `V(s,g)` + local subgoal-conditioned `Q(s,A_h,z)`. `V`는 Q에서 파생되지 않음 |
 
-Direct chunk TRL semantics (current implementation):
+TRL semantics (current implementation):
 
-- `Q_H(s, A_H, g)` is learned directly on `action_critic`.
-- `V(s, g)` is an expectile readout of target `Q_H`, not an independent Bellman TD value.
-- Default transitive target is `Q_H(s_i, A_i, s_k) * Q_H(s_k, A_k, s_j)` (`use_v_in_q_target=false`).
-- Valid split `k` must be after the committed chunk: `k >= i + H`, `k < j`, `k + H <= T`.
-- `use_v_in_q_target` exists only as an ablation and defaults to `false`.
-- Distance/offset reweighting (`trl_distance_reweight`) is enabled by default for `direct_chunk_trl`.
+- `V(s,g)` is the primary state-space critic trained with base + transitive targets.
+- `Q(s, A_h, z)` is a local action-chunk critic bootstrapped from `target_V(s+H, z)`.
+- Subgoal bonus defaults to `V(s,z) * V(z,g) / (V(s,g)+eps)`.
+- Proposal scoring can combine local Q and global transitive V (`proposal_score_mode: q_plus_v`).
 
-Example config: `config/antmaze_large_direct_chunk_trl.yaml`.
+Example config: `config/antmaze_large_trl.yaml`.
 
 ```yaml
 critic_agent:
-  critic_type: direct_chunk_trl
-  algorithm: direct_chunk_trl
+  critic_type: trl
+  algorithm: trl
   use_chunk_critic: false
-  tau_q: 0.7
   tau_v: 0.9
-  lambda_q_base: 1.0
-  lambda_q_tri: 1.0
-  lambda_v: 1.0
-  use_v_in_q_target: false   # ablation only
-  trl_distance_reweight: true
-  target_tau: 0.005
-  q_value_eps: 1.0e-6
+  lambda_v_base: 1.0
+  lambda_v_tri: 1.0
+  value_base_horizon: 5
+  lambda_q_local: 1.0
+  proposal_score_mode: q_plus_v
+  subgoal_value_bonus_type: transitive_ratio
 ```
 
-Sampler는 같은 trajectory에서만 `i, j, k`를 뽑습니다. valid split이 없으면 `trl_valid_mask=0`으로 tri-Q loss에서 제외합니다.
+Sampler는 같은 trajectory에서만 `i, j, k`를 뽑습니다. valid split이 없으면 `trans_v_valid_mask=0`으로 transitive V loss에서 제외합니다.
 
 ## 학습 실행
 
@@ -221,8 +217,8 @@ Resume 로그는 `run_resume_from<E>_<timestamp>.log`로 따로 저장됩니다.
 | `antmaze_medium_navigate_table_full_disp.yaml` | medium table ablation | full goal + displacement target |
 | `antmaze_medium_navigate_table_phi_abs.yaml` | medium table ablation | phi goal + absolute target |
 | `antmaze_medium_navigate_table_phi_disp.yaml` | medium table ablation | phi goal + displacement target |
-| `antmaze_large_direct_chunk_trl.yaml` | `antmaze-large-navigate-v0` direct-chunk TRL | large 환경용 `direct_chunk_trl` 예시 config |
-| `antmaze_large_direct_chunk_trl_gap0_alpha1.yaml` | large direct-chunk TRL ablation | gap/alpha ablation config |
+| `antmaze_large_trl.yaml` | `antmaze-large-navigate-v0` TRL | large 환경용 `trl` 예시 config |
+| `antmaze_large_trl_gap0_alpha1.yaml` | large TRL ablation | gap/alpha ablation config |
 
 ## Run Directory
 
@@ -248,7 +244,7 @@ Dynamics agent는 다음 손실을 함께 학습합니다.
 - `phase1/loss_dynamics`: reverse mean matching (또는 `forward_bridge*` 모드의 forward bridge mean matching)
 - `phase1/loss_path_step`: dataset segment와 step-aligned path loss
 - `phase1/loss_roll`: short rollout consistency
-- `phase1/loss_subgoal`: deterministic은 target-value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 `subgoal_stochastic_loss=mse`이면 reparameterized sample에 대해 `stopgrad(w(Delta V)) * MSE(sample, target) - alpha * bonus`를 쓰고, `subgoal_stochastic_loss=nll`이면 `stopgrad(w(Delta V)) * NLL(target | mu, log_std) - alpha * bonus`를 씁니다. 기본 bonus는 `V(sample_abs, g)`이며, `direct_chunk_trl`일 때는 `V(s, sample_abs) * V(sample_abs, g)`입니다. `nll`은 PDF의 stochastic subgoal 식과 다른 의도적 구현 옵션입니다. `subgoal_value_style=exponential`이면 `w(Delta V)=exp(c * (V(target_abs, g) - V(s, g)))`, `expectile`이면 gap이 양수일 때 `subgoal_value_expectile`, 그 외에는 `1-subgoal_value_expectile`
+- `phase1/loss_subgoal`: deterministic은 target-value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 `subgoal_stochastic_loss=mse`이면 reparameterized sample에 대해 `stopgrad(w(Delta V)) * MSE(sample, target) - alpha * bonus`를 쓰고, `subgoal_stochastic_loss=nll`이면 `stopgrad(w(Delta V)) * NLL(target | mu, log_std) - alpha * bonus`를 씁니다. 기본 bonus는 `V(sample_abs, g)`이며, `trl`일 때는 `V(s, sample_abs) * V(sample_abs, g) / (V(s,g)+eps)`입니다.
 - `phase1/loss_idm`: embedded inverse dynamics MSE
 
 Critic + SPI actor:

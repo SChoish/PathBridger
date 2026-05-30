@@ -111,9 +111,10 @@ def build_config(
     dyn['state_normalization'] = bool(state_normalization)
     cri = root.setdefault('critic_agent', {})
     cri['critic_type'] = ct_short
-    if ct_short in ('trl', 'chunk_trl', 'direct_chunk_trl'):
-        cri['algorithm'] = 'direct_chunk_trl'
-    if ct_short in ('iql', 'trl', 'chunk_trl', 'direct_chunk_trl'):
+    if ct_short in ('trl', 'chunk_trl', 'direct_chunk_trl', 'state_transitive'):
+        cri['algorithm'] = 'trl'
+        cri['critic_type'] = 'trl'
+    if ct_short in ('iql', 'trl', 'chunk_trl', 'direct_chunk_trl', 'state_transitive'):
         cri['use_chunk_critic'] = False
 
     sweep_meta = {
@@ -149,7 +150,7 @@ def main() -> None:
     p.add_argument('--subgoal', choices=('absolute', 'displacement'), required=True)
     p.add_argument('--time-embedding', type=_on_off, default=True)
     p.add_argument('--state-normalization', type=_on_off, default=False)
-    p.add_argument('--critic-type', choices=('dqc', 'iql', 'trl', 'chunk_trl', 'direct_chunk_trl'), default='dqc')
+    p.add_argument('--critic-type', choices=('dqc', 'iql', 'trl'), default='dqc')
     p.add_argument('--train_epochs', type=int, default=600)
     p.add_argument('--out', type=Path, required=True)
     args = p.parse_args()
