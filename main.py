@@ -49,7 +49,7 @@ def _impl_dir():
 
 
 def _default_yaml_path():
-    return os.path.join(_impl_dir(), 'config', 'antmaze_large_navigate.yaml')
+    return os.path.join(_impl_dir(), 'config', 'antmaze_medium_navigate.yaml')
 
 
 def _sanitize_token(s: str) -> str:
@@ -92,7 +92,7 @@ def _require_gpu_jax(logger: logging.Logger) -> None:
     logger.info('GPU-only check passed: default_backend=%s device_count=%d', backend, len(devs))
 
 
-flags.DEFINE_string('run_config', '', 'YAML config; empty uses config/antmaze_large_navigate.yaml.')
+flags.DEFINE_string('run_config', '', 'YAML config; empty uses config/antmaze_medium_navigate.yaml.')
 flags.DEFINE_string('runs_root', '', 'Run root; default <repo>/runs.')
 flags.DEFINE_string(
     'dataset_dir',
