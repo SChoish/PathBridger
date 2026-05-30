@@ -144,10 +144,10 @@ def build_config(
     cri['discount'] = 0.99
     ct_short = str(critic_type).lower()
     cri['critic_type'] = ct_short
-    if ct_short in ('trl', 'chunk_trl', 'direct_chunk_trl', 'state_transitive'):
+    if ct_short in ('trl', 'state_transitive', 'transitive_v_local_q'):
         cri['algorithm'] = 'trl'
         cri['critic_type'] = 'trl'
-    if ct_short in ('iql', 'trl', 'chunk_trl', 'direct_chunk_trl', 'state_transitive'):
+    if ct_short in ('iql', 'trl', 'state_transitive', 'transitive_v_local_q'):
         cri['use_chunk_critic'] = False
     root['critic_agent'] = cri
 

@@ -24,11 +24,8 @@ from utils.networks import MLP
 _VALID_CRITIC_TYPES = ('dqc', 'iql', 'trl')
 _TRL_ALIASES = (
     'trl',
-    'chunk_trl',
-    'direct_chunk_trl',
     'state_transitive',
     'transitive_v_local_q',
-    'transitivechunkrl',
 )
 
 
@@ -48,7 +45,11 @@ def _canonicalize_critic_config(config: dict) -> tuple[str, str, bool]:
         config['algorithm'] = 'trl'
         config['use_chunk_critic'] = False
         config['proposal_score_mode'] = 'q_plus_v'
+        config['proposal_v_weight'] = float(config.get('proposal_v_weight', 0.1))
+        config['proposal_v_score_clip'] = float(config.get('proposal_v_score_clip', 5.0))
         config['subgoal_value_bonus_type'] = 'transitive_ratio'
+        config['subgoal_value_ratio_eps'] = float(config.get('subgoal_value_ratio_eps', 1e-3))
+        config['subgoal_value_ratio_clip'] = float(config.get('subgoal_value_ratio_clip', 5.0))
     elif critic_type == 'iql' and bool(config.get('use_chunk_critic', False)):
         config['use_chunk_critic'] = False
     else:
@@ -61,9 +62,10 @@ def _safe_logit(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     return jnp.log(x) - jnp.log1p(-x)
 
 
-def _expectile_loss(diff: jnp.ndarray, tau: float) -> jnp.ndarray:
-    weight = jnp.where(diff > 0.0, float(tau), 1.0 - float(tau))
-    return weight * jnp.square(diff)
+def _bce_expectile_loss(logits: jnp.ndarray, targets: jnp.ndarray, tau: float) -> jnp.ndarray:
+    probs = jax.nn.sigmoid(logits)
+    weight = jnp.where(targets >= probs, float(tau), 1.0 - float(tau))
+    return weight * optax.sigmoid_binary_cross_entropy(logits, targets)
 
 
 def _is_trl_type(critic_type: str, algorithm: str = '') -> bool:
@@ -301,6 +303,7 @@ class CriticAgent(flax.struct.PyTreeNode):
         eps = float(self.config.get('q_value_eps', 1e-6))
         discount = float(self.config['discount'])
         tau_v = float(self.config.get('tau_v', 0.9))
+        lambda_v_self = float(self.config.get('lambda_v_self', 1.0))
         lambda_v_base = float(self.config.get('lambda_v_base', 1.0))
         lambda_v_tri = float(self.config.get('lambda_v_tri', 1.0))
         lambda_q_local = float(self.config.get('lambda_q_local', 1.0))
@@ -309,23 +312,35 @@ class CriticAgent(flax.struct.PyTreeNode):
         goals = batch['value_goals']
         split_obs = batch['trans_v_split_observations']
 
+        v_self_logits = self.network.select('value')(
+            observations, observations, params=grad_params,
+        )
+        self_target = jnp.ones((observations.shape[0],), dtype=jnp.float32)
+        loss_v_self_per = optax.sigmoid_binary_cross_entropy(v_self_logits, self_target)
+        loss_v_self = self._weighted_mean(loss_v_self_per, valid_mask)
+        v_self = jax.nn.sigmoid(v_self_logits)
+
         v_base_logits = self.network.select('value')(
             observations, batch['value_base_goals'], params=grad_params,
         )
-        v_base = jnp.clip(jax.nn.sigmoid(v_base_logits), eps, 1.0)
-        base_target = jnp.power(discount, jnp.asarray(batch['value_base_offsets'], dtype=jnp.float32))
-        loss_v_base_per = jnp.square(v_base - base_target)
+        v_base = jax.nn.sigmoid(v_base_logits)
+        base_target = jnp.clip(
+            jnp.power(discount, jnp.asarray(batch['value_base_offsets'], dtype=jnp.float32)),
+            eps,
+            1.0,
+        )
+        loss_v_base_per = optax.sigmoid_binary_cross_entropy(v_base_logits, base_target)
         loss_v_base = self._weighted_mean(loss_v_base_per, valid_mask)
 
         v_tri_logits = self.network.select('value')(observations, goals, params=grad_params)
-        v_tri = jnp.clip(jax.nn.sigmoid(v_tri_logits), eps, 1.0)
+        v_tri = jax.nn.sigmoid(v_tri_logits)
         target_left_logits = self.network.select('target_value')(observations, batch['trans_v_left_goals'])
         target_right_logits = self.network.select('target_value')(split_obs, batch['trans_v_right_goals'])
         target_v_left = jnp.clip(jax.nn.sigmoid(target_left_logits), eps, 1.0)
         target_v_right = jnp.clip(jax.nn.sigmoid(target_right_logits), eps, 1.0)
         target_v_tri = jax.lax.stop_gradient(jnp.clip(target_v_left * target_v_right, eps, 1.0))
         tri_valid = jnp.asarray(batch['trans_v_valid_mask'], dtype=jnp.float32) * valid_mask
-        loss_v_tri_per = _expectile_loss(target_v_tri - v_tri, tau_v)
+        loss_v_tri_per = _bce_expectile_loss(v_tri_logits, target_v_tri, tau_v)
 
         if bool(self.config.get('value_transitive_reweight', True)):
             value_offsets = jnp.asarray(batch.get('value_offsets', jnp.ones_like(tri_valid)), dtype=jnp.float32)
@@ -335,10 +350,17 @@ class CriticAgent(flax.struct.PyTreeNode):
             )
             horizon = jnp.asarray(float(self.config['action_chunk_horizon']), dtype=jnp.float32)
             dist = jnp.maximum(value_offsets, 1.0)
-            balance = 4.0 * jnp.maximum(split_offsets, 1.0) * jnp.maximum(value_offsets - split_offsets, 1.0)
-            balance = balance / jnp.maximum(dist * dist, 1.0)
             power = float(self.config.get('value_distance_weight_power', 1.0))
-            dist_w = jnp.power(horizon / dist, power) * balance
+            dist_w = jnp.power(horizon / dist, power)
+            weight_mode = str(self.config.get('value_transitive_weight_mode', 'inverse_value_offset')).lower()
+            if weight_mode in ('inverse_value_offset_balance', 'inverse_value_offset_with_split_balance'):
+                balance = 4.0 * jnp.maximum(split_offsets, 1.0) * jnp.maximum(value_offsets - split_offsets, 1.0)
+                dist_w = dist_w * balance / jnp.maximum(dist * dist, 1.0)
+            elif weight_mode != 'inverse_value_offset':
+                raise ValueError(
+                    "value_transitive_weight_mode must be 'inverse_value_offset' or "
+                    f"'inverse_value_offset_balance', got {weight_mode!r}."
+                )
             dist_w = jnp.clip(
                 dist_w,
                 float(self.config.get('value_distance_weight_clip_min', 0.05)),
@@ -369,13 +391,20 @@ class CriticAgent(flax.struct.PyTreeNode):
         loss_q_per = jnp.mean(optax.sigmoid_binary_cross_entropy(q_logits, target_q[None, :]), axis=0)
         loss_q = self._weighted_mean(loss_q_per, valid_mask)
 
-        total = lambda_v_base * loss_v_base + lambda_v_tri * loss_v_tri + lambda_q_local * loss_q
+        total = (
+            lambda_v_self * loss_v_self
+            + lambda_v_base * loss_v_base
+            + lambda_v_tri * loss_v_tri
+            + lambda_q_local * loss_q
+        )
         q_agg = self.aggregate_ensemble_q(q_pred)
         return total, {
             'loss/total': total,
-            'value/loss': lambda_v_base * loss_v_base + lambda_v_tri * loss_v_tri,
+            'value/loss': lambda_v_self * loss_v_self + lambda_v_base * loss_v_base + lambda_v_tri * loss_v_tri,
+            'value/self_loss': loss_v_self,
             'value/base_loss': loss_v_base,
             'value/tri_loss': loss_v_tri,
+            'value/self_pred_mean': v_self.mean(),
             'value/base_pred_mean': v_base.mean(),
             'value/base_target_mean': base_target.mean(),
             'value/tri_pred_mean': v_tri.mean(),
@@ -395,7 +424,7 @@ class CriticAgent(flax.struct.PyTreeNode):
             # Compatibility with existing logging/extraction paths.
             'action_critic/trl_loss': total,
             'action_critic/distill_loss': loss_q,
-            'action_critic/value_loss': lambda_v_base * loss_v_base + lambda_v_tri * loss_v_tri,
+            'action_critic/value_loss': lambda_v_self * loss_v_self + lambda_v_base * loss_v_base + lambda_v_tri * loss_v_tri,
             'action_critic/q_part_mean': q_agg.mean(),
             'action_critic/target_v_mean': target_q.mean(),
             'action_critic/adv': (target_q - q_agg).mean(),
@@ -477,7 +506,8 @@ class CriticAgent(flax.struct.PyTreeNode):
         goals: jnp.ndarray,
         network_params: dict | None = None,
     ) -> jnp.ndarray:
-        eps = jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-6)), dtype=jnp.float32)
+        eps = jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-3)), dtype=jnp.float32)
+        clip_max = jnp.asarray(float(self.config.get('proposal_v_score_clip', 5.0)), dtype=jnp.float32)
         obs = jnp.asarray(observations, dtype=jnp.float32)
         z = jnp.asarray(subgoals, dtype=jnp.float32)
         g = jnp.asarray(goals, dtype=jnp.float32)
@@ -496,7 +526,7 @@ class CriticAgent(flax.struct.PyTreeNode):
         v_z_g = jax.nn.sigmoid(self.network.select('value')(z_flat, g_flat, params=network_params))
         v_s_g = jax.nn.sigmoid(self.network.select('value')(obs_rep, g_flat, params=network_params))
         ratio = (v_s_z * v_z_g) / (v_s_g + eps)
-        return ratio.reshape(obs.shape[0], num_candidates)
+        return jnp.clip(ratio, 0.0, clip_max).reshape(obs.shape[0], num_candidates)
 
     @jax.jit
     def total_loss(self, batch: dict, grad_params: dict, rng=None):
@@ -739,8 +769,10 @@ def get_config():
             tau_v=0.9,
             lambda_v_base=1.0,
             lambda_v_tri=1.0,
+            lambda_v_self=1.0,
             value_base_horizon=5,
             value_transitive_reweight=True,
+            value_transitive_weight_mode='inverse_value_offset',
             value_distance_weight_power=1.0,
             value_distance_weight_clip_min=0.05,
             value_distance_weight_clip_max=1.0,
@@ -748,9 +780,11 @@ def get_config():
             q_target_from_value=True,
             subgoal_value_bonus_type='single_value',
             subgoal_value_ratio_eps=1e-6,
+            subgoal_value_ratio_clip=5.0,
             proposal_score_mode='q_only',
             proposal_q_weight=1.0,
             proposal_v_weight=1.0,
+            proposal_v_score_clip=5.0,
             rescore_single_candidate=False,
             q_value_eps=1e-6,
             distill_method='expectile',

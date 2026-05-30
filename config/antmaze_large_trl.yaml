@@ -36,19 +36,25 @@ critic_agent:
   full_chunk_horizon: 25
   discount: 0.995
   tau_v: 0.9
+  lambda_v_self: 1.0
   lambda_v_base: 1.0
   lambda_v_tri: 1.0
   value_base_horizon: 5
   value_transitive_reweight: true
+  value_transitive_weight_mode: inverse_value_offset
   lambda_q_local: 1.0
   q_target_from_value: true
-  goal_representation: phi
+  goal_representation: full
   kappa_b: 0.9
   kappa_d: 0.9
   max_goal_steps_from_env: true
   clip_chunk_to_goal: true
   proposal_score_mode: q_plus_v
+  proposal_v_weight: 0.1
+  proposal_v_score_clip: 5.0
   subgoal_value_bonus_type: transitive_ratio
+  subgoal_value_ratio_eps: 1.0e-3
+  subgoal_value_ratio_clip: 5.0
 
 actor:
   spi_beta: 1.0

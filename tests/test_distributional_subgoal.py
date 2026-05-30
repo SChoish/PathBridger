@@ -427,13 +427,14 @@ def test_subgoal_value_bonus_by_critic_mode():
             'algorithm': 'trl',
             'subgoal_value_alpha': 1.0,
             'subgoal_value_bonus_type': 'transitive_ratio',
-            'subgoal_value_ratio_eps': 1e-6,
+            'subgoal_value_ratio_eps': 1e-3,
+            'subgoal_value_ratio_clip': 5.0,
         },
     )
     pred, obs_value, _, bonus, _, _, _, v_s_sg, v_sg_g = _subgoal_value_terms(
         trl_agent, trl_critic.network.params['modules_value'], rng_seed=23,
     )
-    expected_ratio = v_s_sg * v_sg_g / (obs_value + 1e-6)
+    expected_ratio = np.clip(np.asarray(v_s_sg * v_sg_g / (obs_value + 1e-3)), 0.0, 5.0)
     np.testing.assert_allclose(np.asarray(bonus), np.asarray(expected_ratio), rtol=1e-5, atol=1e-6)
 
 

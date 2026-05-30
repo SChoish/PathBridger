@@ -1152,17 +1152,11 @@ class DynamicsAgent(_DynamicsAgentCore):
         critic_type = str(self.config.get('critic_type', 'dqc')).lower()
         algorithm = str(self.config.get('algorithm', '')).lower()
         return critic_type == 'trl' or algorithm == 'trl' or critic_type in (
-            'chunk_trl',
-            'direct_chunk_trl',
             'state_transitive',
             'transitive_v_local_q',
-            'transitivechunkrl',
         ) or algorithm in (
-            'chunk_trl',
-            'direct_chunk_trl',
             'state_transitive',
             'transitive_v_local_q',
-            'transitivechunkrl',
         )
 
     def _subgoal_mse_weight_from_gap(self, gap: jnp.ndarray) -> jnp.ndarray:
@@ -1276,7 +1270,12 @@ class DynamicsAgent(_DynamicsAgentCore):
             v_sg_g = pred_value
             transitive_product = v_s_sg * v_sg_g
             transitive_ratio = transitive_product / (
-                obs_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-6)), dtype=jnp.float32)
+                obs_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-3)), dtype=jnp.float32)
+            )
+            transitive_ratio = jnp.clip(
+                transitive_ratio,
+                0.0,
+                jnp.asarray(float(self.config.get('subgoal_value_ratio_clip', 5.0)), dtype=jnp.float32),
             )
             if bonus_type == 'none':
                 raw_bonus = jnp.zeros_like(pred_value)
@@ -1397,7 +1396,12 @@ class DynamicsAgent(_DynamicsAgentCore):
             pred_sg_out = pred_sample
             subgoal_transitive_product = subgoal_trl_v_s_sg * subgoal_trl_v_sg_g
             subgoal_transitive_ratio = subgoal_transitive_product / (
-                current_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-6)), dtype=jnp.float32)
+                current_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-3)), dtype=jnp.float32)
+            )
+            subgoal_transitive_ratio = jnp.clip(
+                subgoal_transitive_ratio,
+                0.0,
+                jnp.asarray(float(self.config.get('subgoal_value_ratio_clip', 5.0)), dtype=jnp.float32),
             )
             subgoal_extra_info = {
                 'phase1/subgoal_nll': jnp.mean(nll_per_sample),
@@ -1458,7 +1462,12 @@ class DynamicsAgent(_DynamicsAgentCore):
             zero = jnp.asarray(0.0, dtype=jnp.float32)
             subgoal_transitive_product = subgoal_trl_v_s_sg * subgoal_trl_v_sg_g
             subgoal_transitive_ratio = subgoal_transitive_product / (
-                current_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-6)), dtype=jnp.float32)
+                current_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-3)), dtype=jnp.float32)
+            )
+            subgoal_transitive_ratio = jnp.clip(
+                subgoal_transitive_ratio,
+                0.0,
+                jnp.asarray(float(self.config.get('subgoal_value_ratio_clip', 5.0)), dtype=jnp.float32),
             )
             subgoal_extra_info = {
                 'phase1/subgoal_nll': zero,
@@ -1802,6 +1811,7 @@ def _get_common_config():
             subgoal_value_weight_max=0.0,
             subgoal_value_bonus_type='single_value',
             subgoal_value_ratio_eps=1e-6,
+            subgoal_value_ratio_clip=5.0,
             # Goal input to the subgoal estimator. 'full' preserves historical
             # behavior; 'phi' uses task goal-representation channels
             # (ManipSpace cube positions, else maze xy).

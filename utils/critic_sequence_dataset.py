@@ -261,17 +261,11 @@ class CriticSequenceDataset:
         critic_type = str(self.config.get('critic_type', 'dqc')).lower()
         algorithm = str(self.config.get('algorithm', '')).lower()
         is_trl = critic_type == 'trl' or algorithm == 'trl' or critic_type in (
-            'chunk_trl',
-            'direct_chunk_trl',
             'state_transitive',
             'transitive_v_local_q',
-            'transitivechunkrl',
         ) or algorithm in (
-            'chunk_trl',
-            'direct_chunk_trl',
             'state_transitive',
             'transitive_v_local_q',
-            'transitivechunkrl',
         )
         value_goal_idxs = self.sample_trl_goals(idxs) if is_trl else self.sample_goals(idxs)
         value_goals = np.asarray(self.get_observations(value_goal_idxs), dtype=np.float32)

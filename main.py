@@ -656,6 +656,11 @@ def _rescore_top1_proposal_with_stats_jit(
         )
     else:
         v_scores = jnp.zeros_like(q_scores)
+    v_scores = jnp.clip(
+        v_scores,
+        0.0,
+        float(critic_agent.config.get('proposal_v_score_clip', 5.0)),
+    )
     mode = str(critic_agent.config.get('proposal_score_mode', 'q_only')).lower()
     if mode == 'q_only':
         scores = q_scores
@@ -895,7 +900,8 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
         dynamics_config['subgoal_value_bonus_type'] = (
             'transitive_ratio' if bonus_type == 'single_value' else bonus_type
         )
-        dynamics_config['subgoal_value_ratio_eps'] = float(critic_config.get('subgoal_value_ratio_eps', 1e-6))
+        dynamics_config['subgoal_value_ratio_eps'] = float(critic_config.get('subgoal_value_ratio_eps', 1e-3))
+        dynamics_config['subgoal_value_ratio_clip'] = float(critic_config.get('subgoal_value_ratio_clip', 5.0))
     phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
     critic_config['phi_goal_obs_indices'] = phi_idxs
     dynamics_config['phi_goal_obs_indices'] = phi_idxs
@@ -905,6 +911,16 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     dynamics_config['env_name'] = env_name_for_phi
     critic_config['env_name'] = env_name_for_phi
     validate_config(critic_config, actor_config)
+    # validate_config canonicalizes TRL defaults; mirror any changed values back
+    # into dynamics before agent construction.
+    dynamics_config['critic_type'] = str(critic_config.get('critic_type', 'dqc'))
+    dynamics_config['algorithm'] = str(critic_config.get('algorithm', 'dqc'))
+    if _is_trl_type(str(critic_config.get('critic_type', 'dqc')), str(critic_config.get('algorithm', ''))):
+        dynamics_config['subgoal_value_bonus_type'] = str(
+            critic_config.get('subgoal_value_bonus_type', 'transitive_ratio')
+        )
+        dynamics_config['subgoal_value_ratio_eps'] = float(critic_config.get('subgoal_value_ratio_eps', 1e-3))
+        dynamics_config['subgoal_value_ratio_clip'] = float(critic_config.get('subgoal_value_ratio_clip', 5.0))
     shared_batch = int(FLAGS.batch_size)
     if shared_batch < 1:
         raise ValueError(f'batch_size must be >= 1, got {shared_batch}.')

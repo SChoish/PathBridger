@@ -98,6 +98,8 @@ def test_trl_transitive_contract():
     ex_batch['trans_v_valid_mask'] = np.zeros_like(batch['trans_v_valid_mask'])
     _, info = critic.update(ex_batch)
     assert float(info['value/tri_loss']) == 0.0
+    assert float(info['value/self_loss']) > 0.0
+    assert float(info['value/base_loss']) > 0.0
 
     def loss_fn(params):
         return critic.total_loss(batch, params)[0]
@@ -117,8 +119,8 @@ def test_validate_config():
 
     cfg = _cfg('dqc')
     cfg.critic_type = 'direct_chunk_trl'
-    validate_config(cfg)
-    assert cfg['critic_type'] == 'trl'
+    with pytest.raises(ValueError, match='critic_type'):
+        validate_config(cfg)
 
     cfg = _cfg('dqc')
     cfg.critic_type = 'foo'
