@@ -377,6 +377,7 @@ def _format_epoch_log(metrics: dict[str, float]) -> str:
         ('dyn_path', 'train/dynamics/phase1/loss_path_step_epoch_mean'),
         ('dyn_roll', 'train/dynamics/phase1/loss_roll_epoch_mean'),
         ('dyn_sub', 'train/dynamics/phase1/loss_subgoal_epoch_mean'),
+        ('sg_logprod', 'train/dynamics/phase1/subgoal_transitive_log_product_mean_epoch_mean'),
         ('dyn_idm', 'train/dynamics/phase1/loss_idm_epoch_mean'),
         ('fb_path', 'train/dynamics/forward_bridge/loss_path_interior_epoch_mean'),
         ('fb_next', 'train/dynamics/forward_bridge/loss_path_next_epoch_mean'),
@@ -618,7 +619,6 @@ def _rescore_top1_proposal_with_stats_jit(
     critic_agent: Any,
     obs: jnp.ndarray,
     spi_goals: jnp.ndarray,
-    high_goals: jnp.ndarray,
     critic_goals: jnp.ndarray,
     candidates: jnp.ndarray,
     valids: jnp.ndarray,
@@ -626,13 +626,11 @@ def _rescore_top1_proposal_with_stats_jit(
     *,
     use_partial_critic: bool,
 ) -> tuple[dict, dict]:
-    """Score ``[B, K, ...]`` candidates and keep the global best proposal.
+    """Score ``[B, K, ...]`` candidates with Q, pick ``spi_goals``, keep all for SPI.
 
     Dynamics may generate ``K = U*N`` action proposals from ``U`` sampled
-    subgoal endpoints and ``N`` bridge/action samples per endpoint.  The SPI
-    actor should condition on the subgoal associated with the winning proposal,
-    so this keeps one global best candidate and forwards its goal as
-    ``spi_goals``.
+    subgoal endpoints and ``N`` bridge/action samples per endpoint.  Both
+    proposal selection and the SPI actor target distribution use local Q only.
     """
     q_scores = jnp.asarray(
         critic_agent.score_action_chunks(
@@ -644,57 +642,20 @@ def _rescore_top1_proposal_with_stats_jit(
         ),
         dtype=jnp.float32,
     )
-    mode = str(critic_agent.config.get('proposal_score_mode', 'q_only')).lower()
-    is_trl_proposal = _is_trl_type(
-        str(critic_agent.config.get('critic_type', 'dqc')),
-        str(critic_agent.config.get('algorithm', '')),
-    )
-    proposal_v_weight = float(critic_agent.config.get('proposal_v_weight', 1.0))
-    needs_v_scores = mode == 'v_only' or (mode == 'q_plus_v' and proposal_v_weight != 0.0)
-    if is_trl_proposal and needs_v_scores and hasattr(critic_agent, 'score_transitive_subgoals'):
-        v_scores = jnp.asarray(
-            critic_agent.score_transitive_subgoals(
-                obs,
-                critic_goals,
-                high_goals,
-                network_params=network_params,
-            ),
-            dtype=jnp.float32,
-        )
-    else:
-        v_scores = jnp.zeros_like(q_scores)
-    v_scores = jnp.clip(
-        v_scores,
-        0.0,
-        float(critic_agent.config.get('proposal_v_score_clip', 5.0)),
-    )
-    if mode == 'q_only':
-        scores = q_scores
-    elif mode == 'v_only':
-        scores = v_scores
-    elif mode == 'q_plus_v':
-        scores = (
-            float(critic_agent.config.get('proposal_q_weight', 1.0)) * q_scores
-            + proposal_v_weight * v_scores
-        )
-    else:
-        raise ValueError(
-            "proposal_score_mode must be one of 'q_only', 'v_only', or 'q_plus_v', "
-            f"got {mode!r}."
-        )
-    best_idx = jnp.argmax(scores, axis=1)
-    best_chunks = jnp.take_along_axis(candidates, best_idx[:, None, None, None], axis=1)
-    best_scores = jnp.take_along_axis(scores, best_idx[:, None], axis=1)
+    best_idx = jnp.argmax(q_scores, axis=1)
+    best_scores = jnp.take_along_axis(q_scores, best_idx[:, None], axis=1)
     if critic_goals is not None and critic_goals.ndim == 3:
         best_goals = jnp.take_along_axis(critic_goals, best_idx[:, None, None], axis=1)[:, 0, :]
+        proposal_goals = critic_goals
     else:
         best_goals = spi_goals
+        proposal_goals = None
 
     score_mean = best_scores.mean()
     score_max = best_scores.max()
     score_min = best_scores.min()
-    if scores.shape[1] >= 2:
-        sorted_scores = jnp.sort(scores, axis=1)[:, ::-1]
+    if q_scores.shape[1] >= 2:
+        sorted_scores = jnp.sort(q_scores, axis=1)[:, ::-1]
         gap = (sorted_scores[:, 0] - sorted_scores[:, 1]).mean()
     else:
         gap = jnp.zeros((), dtype=jnp.float32)
@@ -702,20 +663,21 @@ def _rescore_top1_proposal_with_stats_jit(
     out_batch = {
         'observations': obs,
         'spi_goals': jnp.asarray(best_goals, dtype=jnp.float32),
-        'proposal_partial_chunks': jnp.asarray(best_chunks, dtype=jnp.float32),
-        'proposal_scores': jnp.asarray(best_scores, dtype=jnp.float32),
+        'proposal_partial_chunks': jnp.asarray(candidates, dtype=jnp.float32),
+        'proposal_scores': jnp.asarray(q_scores, dtype=jnp.float32),
         'valids': valids,
     }
+    if proposal_goals is not None:
+        out_batch['proposal_goals'] = jnp.asarray(proposal_goals, dtype=jnp.float32)
     coupling_stats = {
         'critic_score_mean': score_mean,
         'critic_score_max': score_max,
         'critic_score_min': score_min,
         'critic_score_gap_top1_top2': gap,
-        'critic_score_pre_best_mean': scores.mean(),
-        'critic_score_pre_best_max': scores.max(),
+        'critic_score_pre_best_mean': q_scores.mean(),
+        'critic_score_pre_best_max': q_scores.max(),
         'coupling/proposal_q_score_mean': q_scores.mean(),
-        'coupling/proposal_v_score_mean': v_scores.mean(),
-        'coupling/proposal_combined_score_mean': scores.mean(),
+        'coupling/proposal_spi_candidate_count': jnp.asarray(float(candidates.shape[1]), dtype=jnp.float32),
     }
     return out_batch, coupling_stats
 
@@ -799,7 +761,6 @@ def _build_actor_batch_from_dynamics(
 def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_config: Any) -> tuple[dict, dict]:
     obs = jnp.asarray(actor_batch['observations'], dtype=jnp.float32)
     goals = jnp.asarray(actor_batch['spi_goals'], dtype=jnp.float32)
-    high_goals = jnp.asarray(actor_batch.get('high_actor_goals', goals), dtype=jnp.float32)
     candidates = jnp.asarray(actor_batch['candidate_partial_chunks'], dtype=jnp.float32)  # [B, N, ha, A]
     valids = jnp.asarray(actor_batch['valids'], dtype=jnp.float32)
     # Optional per-candidate sub-goal endpoints (distributional subgoal mode).
@@ -808,8 +769,7 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
         critic_goals = jnp.asarray(cand_goals_in, dtype=jnp.float32)  # [B, N, D]
     else:
         critic_goals = goals  # [B, D] - shared
-    force_rescore_single = bool(getattr(critic_agent, '_is_trl', lambda: False)())
-    force_rescore_single = force_rescore_single or bool(
+    force_rescore_single = bool(
         critic_agent.config.get('rescore_single_candidate', False)
     )
     # Fast path: single candidate -> skip critic call entirely (unless forced).
@@ -819,14 +779,16 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
             selected_goals = critic_goals[:, 0, :] if critic_goals.ndim == 3 else critic_goals
         else:
             selected_goals = goals
+        fast_batch = {
+            'observations': obs,
+            'spi_goals': selected_goals,
+            'proposal_partial_chunks': candidates,
+            'valids': valids,
+        }
+        if cand_goals_in is not None:
+            fast_batch['proposal_goals'] = critic_goals
         return (
-            {
-                'observations': obs,
-                'spi_goals': selected_goals,
-                'proposal_partial_chunks': candidates,
-                'proposal_scores': jnp.zeros((obs.shape[0], 1), dtype=jnp.float32),
-                'valids': valids,
-            },
+            fast_batch,
             {
                 'critic_score_mean': zero,
                 'critic_score_max': zero,
@@ -839,16 +801,13 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
                 'proposal_post_best_count': jnp.asarray(1.0, dtype=jnp.float32),
                 'proposal_count': jnp.asarray(1.0, dtype=jnp.float32),
                 'coupling/proposal_q_score_mean': zero,
-                'coupling/proposal_v_score_mean': zero,
-                'coupling/proposal_combined_score_mean': zero,
             },
         )
-    # Multi-candidate path: score all U*N proposals and keep one global best.
+    # Multi-candidate path: score all U*N proposals with Q and pick the best subgoal.
     out_batch, stats = _rescore_top1_proposal_with_stats_jit(
         critic_agent,
         obs,
         goals,
-        high_goals,
         critic_goals,
         candidates,
         valids,
@@ -858,7 +817,7 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
     stats = dict(stats)
     stats['proposal_best_of_n'] = jnp.asarray(float(candidates.shape[1]), dtype=jnp.float32)
     stats['proposal_pre_best_count'] = jnp.asarray(float(candidates.shape[1]), dtype=jnp.float32)
-    stats['proposal_post_best_count'] = jnp.asarray(1.0, dtype=jnp.float32)
+    stats['proposal_post_best_count'] = jnp.asarray(float(candidates.shape[1]), dtype=jnp.float32)
     stats['proposal_count'] = stats['proposal_post_best_count']
     return out_batch, stats
 
@@ -902,10 +861,12 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     dynamics_config['critic_type'] = str(critic_config.get('critic_type', 'dqc'))
     dynamics_config['algorithm'] = str(critic_config.get('algorithm', 'dqc'))
     if _is_trl_type(str(critic_config.get('critic_type', 'dqc')), str(critic_config.get('algorithm', ''))):
-        bonus_type = str(critic_config.get('subgoal_value_bonus_type', 'transitive_ratio')).lower()
+        bonus_type = critic_config.get('subgoal_value_bonus_type', None)
+        bonus_type = 'transitive_log_product' if bonus_type in (None, '') else str(bonus_type).lower()
         dynamics_config['subgoal_value_bonus_type'] = (
-            'transitive_ratio' if bonus_type == 'single_value' else bonus_type
+            'transitive_log_product' if bonus_type == 'single_value' else bonus_type
         )
+        dynamics_config['subgoal_value_log_eps'] = float(critic_config.get('subgoal_value_log_eps', 1e-6))
         dynamics_config['subgoal_value_ratio_eps'] = float(critic_config.get('subgoal_value_ratio_eps', 1e-3))
         dynamics_config['subgoal_value_ratio_clip'] = float(critic_config.get('subgoal_value_ratio_clip', 5.0))
     phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
@@ -923,8 +884,9 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     dynamics_config['algorithm'] = str(critic_config.get('algorithm', 'dqc'))
     if _is_trl_type(str(critic_config.get('critic_type', 'dqc')), str(critic_config.get('algorithm', ''))):
         dynamics_config['subgoal_value_bonus_type'] = str(
-            critic_config.get('subgoal_value_bonus_type', 'transitive_ratio')
+            critic_config.get('subgoal_value_bonus_type', 'transitive_log_product')
         )
+        dynamics_config['subgoal_value_log_eps'] = float(critic_config.get('subgoal_value_log_eps', 1e-6))
         dynamics_config['subgoal_value_ratio_eps'] = float(critic_config.get('subgoal_value_ratio_eps', 1e-3))
         dynamics_config['subgoal_value_ratio_clip'] = float(critic_config.get('subgoal_value_ratio_clip', 5.0))
     shared_batch = int(FLAGS.batch_size)

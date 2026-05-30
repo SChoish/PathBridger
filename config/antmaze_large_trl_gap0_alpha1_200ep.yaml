@@ -48,10 +48,8 @@ critic_agent:
   kappa_d: 0.9
   max_goal_steps_from_env: true
   clip_chunk_to_goal: true
-  proposal_score_mode: q_plus_v
-  proposal_v_weight: 0.1
-  proposal_v_score_clip: 5.0
-  subgoal_value_bonus_type: transitive_ratio
+  subgoal_value_bonus_type: transitive_log_product
+  subgoal_value_log_eps: 1.0e-6
   subgoal_value_ratio_eps: 1.0e-3
   subgoal_value_ratio_clip: 5.0
 

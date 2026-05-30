@@ -167,8 +167,8 @@ TRL semantics (current implementation):
 - `V(s,g)` is the primary state-space critic trained with BCE self/base + BCE-expectile transitive targets.
 - `Q(s, A_h, z)` is a local action-chunk critic bootstrapped from `target_V(s+H, z)`.
 - `direct_chunk_trl` is not an alias for this mode; it should be treated as a separate legacy ablation if restored.
-- Subgoal bonus defaults to clipped `V(s,z) * V(z,g) / (V(s,g)+eps)`.
-- Proposal scoring can combine local Q and clipped global transitive V (`proposal_score_mode: q_plus_v`).
+- Subgoal bonus defaults to ``log(clip(V(s,z)*V(z,g)))`` for TRL.
+- Proposal selection and SPI both use local Q only.
 - For initial TRL experiments, prefer `goal_representation: full` so triangle consistency is learned in the same state-goal space.
 
 Example config: `config/antmaze_large_trl.yaml`.
@@ -186,10 +186,8 @@ critic_agent:
   value_base_horizon: 5
   value_transitive_weight_mode: inverse_value_offset
   lambda_q_local: 1.0
-  proposal_score_mode: q_plus_v
-  proposal_v_weight: 0.1
-  proposal_v_score_clip: 5.0
-  subgoal_value_bonus_type: transitive_ratio
+  subgoal_value_bonus_type: transitive_log_product
+  subgoal_value_log_eps: 1.0e-6
   subgoal_value_ratio_eps: 1.0e-3
   subgoal_value_ratio_clip: 5.0
 ```

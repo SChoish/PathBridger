@@ -1197,13 +1197,14 @@ class DynamicsAgent(_DynamicsAgentCore):
     def _subgoal_bonus_type_id(self) -> jnp.ndarray:
         bonus_type = self.config.get('subgoal_value_bonus_type', None)
         if bonus_type is None:
-            bonus_type = 'transitive_ratio' if self._is_trl_mode() else 'single_value'
+            bonus_type = 'transitive_product' if self._is_trl_mode() else 'single_value'
         bonus_type = str(bonus_type).lower()
         ids = {
             'none': 0.0,
             'single_value': 1.0,
             'transitive_product': 2.0,
             'transitive_ratio': 3.0,
+            'transitive_log_product': 4.0,
         }
         return jnp.asarray(ids.get(bonus_type, -1.0), dtype=jnp.float32)
 
@@ -1262,20 +1263,19 @@ class DynamicsAgent(_DynamicsAgentCore):
         alpha = jnp.asarray(float(self.config.get('subgoal_value_alpha', 0.0)), dtype=jnp.float32)
         bonus_type = self.config.get('subgoal_value_bonus_type', None)
         if bonus_type is None:
-            bonus_type = 'transitive_ratio' if self._is_trl_mode() else 'single_value'
+            bonus_type = 'transitive_log_product' if self._is_trl_mode() else 'single_value'
         bonus_type = str(bonus_type).lower()
 
         if self._is_trl_mode() and critic_value_params is not None:
             v_s_sg = self._subgoal_values(observations, pred_subgoals, critic_value_params)
             v_sg_g = pred_value
             transitive_product = v_s_sg * v_sg_g
-            transitive_ratio = transitive_product / (
-                obs_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-3)), dtype=jnp.float32)
-            )
-            transitive_ratio = jnp.clip(
-                transitive_ratio,
-                0.0,
-                jnp.asarray(float(self.config.get('subgoal_value_ratio_clip', 5.0)), dtype=jnp.float32),
+            transitive_log_product = jnp.log(
+                jnp.clip(
+                    transitive_product,
+                    jnp.asarray(float(self.config.get('subgoal_value_log_eps', 1e-6)), dtype=jnp.float32),
+                    1.0,
+                )
             )
             if bonus_type == 'none':
                 raw_bonus = jnp.zeros_like(pred_value)
@@ -1283,12 +1283,21 @@ class DynamicsAgent(_DynamicsAgentCore):
                 raw_bonus = pred_value
             elif bonus_type == 'transitive_product':
                 raw_bonus = transitive_product
+            elif bonus_type == 'transitive_log_product':
+                raw_bonus = transitive_log_product
             elif bonus_type == 'transitive_ratio':
-                raw_bonus = transitive_ratio
+                raw_bonus = jnp.clip(
+                    transitive_product / (
+                        obs_value
+                        + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-3)), dtype=jnp.float32)
+                    ),
+                    0.0,
+                    jnp.asarray(float(self.config.get('subgoal_value_ratio_clip', 5.0)), dtype=jnp.float32),
+                )
             else:
                 raise ValueError(
                     "subgoal_value_bonus_type must be one of 'none', 'single_value', "
-                    f"'transitive_product', or 'transitive_ratio', got {bonus_type!r}."
+                    f"'transitive_product', 'transitive_log_product', or 'transitive_ratio', got {bonus_type!r}."
                 )
             subgoal_value_bonus = jnp.where(alpha > 0.0, alpha * raw_bonus, jnp.zeros_like(pred_value))
         else:
@@ -1298,10 +1307,18 @@ class DynamicsAgent(_DynamicsAgentCore):
                 raw_bonus = jnp.zeros_like(pred_value)
             elif bonus_type in ('single_value', 'transitive_product', 'transitive_ratio'):
                 raw_bonus = pred_value
+            elif bonus_type == 'transitive_log_product':
+                raw_bonus = jnp.log(
+                    jnp.clip(
+                        pred_value,
+                        jnp.asarray(float(self.config.get('subgoal_value_log_eps', 1e-6)), dtype=jnp.float32),
+                        1.0,
+                    )
+                )
             else:
                 raise ValueError(
                     "subgoal_value_bonus_type must be one of 'none', 'single_value', "
-                    f"'transitive_product', or 'transitive_ratio', got {bonus_type!r}."
+                    f"'transitive_product', 'transitive_log_product', or 'transitive_ratio', got {bonus_type!r}."
                 )
             subgoal_value_bonus = jnp.where(
                 alpha > 0.0,
@@ -1394,14 +1411,8 @@ class DynamicsAgent(_DynamicsAgentCore):
                 )
             loss_sub = stochastic_loss_term - jnp.mean(subgoal_value_bonus)
             pred_sg_out = pred_sample
-            subgoal_transitive_product = subgoal_trl_v_s_sg * subgoal_trl_v_sg_g
-            subgoal_transitive_ratio = subgoal_transitive_product / (
-                current_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-3)), dtype=jnp.float32)
-            )
-            subgoal_transitive_ratio = jnp.clip(
-                subgoal_transitive_ratio,
-                0.0,
-                jnp.asarray(float(self.config.get('subgoal_value_ratio_clip', 5.0)), dtype=jnp.float32),
+            subgoal_value_alpha = jnp.asarray(
+                float(self.config.get('subgoal_value_alpha', 0.0)), dtype=jnp.float32
             )
             subgoal_extra_info = {
                 'phase1/subgoal_nll': jnp.mean(nll_per_sample),
@@ -1432,8 +1443,10 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_v_s_z_mean': jnp.mean(subgoal_trl_v_s_sg),
                 'phase1/subgoal_v_z_g_mean': jnp.mean(subgoal_trl_v_sg_g),
                 'phase1/subgoal_v_s_g_mean': jnp.mean(current_value),
-                'phase1/subgoal_transitive_product_mean': jnp.mean(subgoal_transitive_product),
-                'phase1/subgoal_transitive_ratio_mean': jnp.mean(subgoal_transitive_ratio),
+                'phase1/subgoal_transitive_log_product_mean': jnp.mean(
+                    subgoal_value_bonus
+                    / jnp.maximum(subgoal_value_alpha, jnp.asarray(1e-8, dtype=jnp.float32))
+                ),
             }
         else:
             pred_sg = self.network.select('subgoal_net')(
@@ -1460,14 +1473,8 @@ class DynamicsAgent(_DynamicsAgentCore):
             loss_sub = jnp.mean(weighted_subgoal_mse) - jnp.mean(subgoal_value_bonus)
             pred_sg_out = pred_sg
             zero = jnp.asarray(0.0, dtype=jnp.float32)
-            subgoal_transitive_product = subgoal_trl_v_s_sg * subgoal_trl_v_sg_g
-            subgoal_transitive_ratio = subgoal_transitive_product / (
-                current_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-3)), dtype=jnp.float32)
-            )
-            subgoal_transitive_ratio = jnp.clip(
-                subgoal_transitive_ratio,
-                0.0,
-                jnp.asarray(float(self.config.get('subgoal_value_ratio_clip', 5.0)), dtype=jnp.float32),
+            subgoal_value_alpha = jnp.asarray(
+                float(self.config.get('subgoal_value_alpha', 0.0)), dtype=jnp.float32
             )
             subgoal_extra_info = {
                 'phase1/subgoal_nll': zero,
@@ -1496,8 +1503,10 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_v_s_z_mean': jnp.mean(subgoal_trl_v_s_sg),
                 'phase1/subgoal_v_z_g_mean': jnp.mean(subgoal_trl_v_sg_g),
                 'phase1/subgoal_v_s_g_mean': jnp.mean(current_value),
-                'phase1/subgoal_transitive_product_mean': jnp.mean(subgoal_transitive_product),
-                'phase1/subgoal_transitive_ratio_mean': jnp.mean(subgoal_transitive_ratio),
+                'phase1/subgoal_transitive_log_product_mean': jnp.mean(
+                    subgoal_value_bonus
+                    / jnp.maximum(subgoal_value_alpha, jnp.asarray(1e-8, dtype=jnp.float32))
+                ),
             }
         return loss_sub, subgoal_mse, subgoal_value, subgoal_value_bonus, pred_sg_out, subgoal_extra_info
 
@@ -1810,6 +1819,7 @@ def _get_common_config():
             # clipping and preserves historical behavior.
             subgoal_value_weight_max=0.0,
             subgoal_value_bonus_type='single_value',
+            subgoal_value_log_eps=1e-6,
             subgoal_value_ratio_eps=1e-6,
             subgoal_value_ratio_clip=5.0,
             # Goal input to the subgoal estimator. 'full' preserves historical

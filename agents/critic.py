@@ -44,13 +44,9 @@ def _canonicalize_critic_config(config: dict) -> tuple[str, str, bool]:
         config['critic_type'] = 'trl'
         config['algorithm'] = 'trl'
         config['use_chunk_critic'] = False
-        if config.get('proposal_score_mode', None) in (None, ''):
-            config['proposal_score_mode'] = 'q_plus_v'
-        if config.get('proposal_v_weight', None) is None:
-            config['proposal_v_weight'] = 0.1
-        config['proposal_v_score_clip'] = float(config.get('proposal_v_score_clip', 5.0))
         if config.get('subgoal_value_bonus_type', None) in (None, ''):
-            config['subgoal_value_bonus_type'] = 'transitive_ratio'
+            config['subgoal_value_bonus_type'] = 'transitive_log_product'
+        config['subgoal_value_log_eps'] = float(config.get('subgoal_value_log_eps', 1e-6))
         if config.get('subgoal_value_ratio_eps', None) is None:
             config['subgoal_value_ratio_eps'] = 1e-3
         config['subgoal_value_ratio_clip'] = float(config.get('subgoal_value_ratio_clip', 5.0))
@@ -58,10 +54,6 @@ def _canonicalize_critic_config(config: dict) -> tuple[str, str, bool]:
         config['use_chunk_critic'] = False
     else:
         config['critic_type'] = critic_type
-    if config.get('proposal_score_mode', None) in (None, ''):
-        config['proposal_score_mode'] = 'q_only'
-    if config.get('proposal_v_weight', None) is None:
-        config['proposal_v_weight'] = 1.0
     if config.get('subgoal_value_bonus_type', None) in (None, ''):
         config['subgoal_value_bonus_type'] = 'single_value'
     if config.get('subgoal_value_ratio_eps', None) is None:
@@ -510,36 +502,6 @@ class CriticAgent(flax.struct.PyTreeNode):
         qs = jax.nn.sigmoid(logits).reshape(logits.shape[0], obs.shape[0], num_candidates)
         return self.aggregate_ensemble_q(qs).reshape(obs.shape[0], num_candidates)
 
-    @partial(jax.jit, static_argnames=())
-    def score_transitive_subgoals(
-        self,
-        observations: jnp.ndarray,
-        subgoals: jnp.ndarray,
-        goals: jnp.ndarray,
-        network_params: dict | None = None,
-    ) -> jnp.ndarray:
-        eps = jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-3)), dtype=jnp.float32)
-        clip_max = jnp.asarray(float(self.config.get('proposal_v_score_clip', 5.0)), dtype=jnp.float32)
-        obs = jnp.asarray(observations, dtype=jnp.float32)
-        z = jnp.asarray(subgoals, dtype=jnp.float32)
-        g = jnp.asarray(goals, dtype=jnp.float32)
-        num_candidates = z.shape[1] if z.ndim == 3 else 1
-        obs_rep = jnp.repeat(obs[:, None, :], num_candidates, axis=1).reshape(obs.shape[0] * num_candidates, -1)
-        if z.ndim == 3:
-            z_flat = z.reshape(z.shape[0] * num_candidates, -1)
-        else:
-            z_flat = z
-        if g.ndim == 3:
-            g_flat = g.reshape(g.shape[0] * num_candidates, -1)
-        else:
-            g_flat = jnp.repeat(g[:, None, :], num_candidates, axis=1).reshape(obs.shape[0] * num_candidates, -1)
-
-        v_s_z = jax.nn.sigmoid(self.network.select('value')(obs_rep, z_flat, params=network_params))
-        v_z_g = jax.nn.sigmoid(self.network.select('value')(z_flat, g_flat, params=network_params))
-        v_s_g = jax.nn.sigmoid(self.network.select('value')(obs_rep, g_flat, params=network_params))
-        ratio = (v_s_z * v_z_g) / (v_s_g + eps)
-        return jnp.clip(ratio, 0.0, clip_max).reshape(obs.shape[0], num_candidates)
-
     @jax.jit
     def total_loss(self, batch: dict, grad_params: dict, rng=None):
         batch = jax.tree_util.tree_map(lambda x: jnp.asarray(x), batch)
@@ -791,12 +753,9 @@ def get_config():
             lambda_q_local=1.0,
             q_target_from_value=True,
             subgoal_value_bonus_type=None,
+            subgoal_value_log_eps=1e-6,
             subgoal_value_ratio_eps=None,
             subgoal_value_ratio_clip=5.0,
-            proposal_score_mode=None,
-            proposal_q_weight=1.0,
-            proposal_v_weight=None,
-            proposal_v_score_clip=5.0,
             rescore_single_candidate=False,
             q_value_eps=1e-6,
             distill_method='expectile',

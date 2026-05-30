@@ -40,12 +40,19 @@ class ActorAgent(flax.struct.PyTreeNode):
 
     def _goals(self, batch: dict) -> jnp.ndarray | None:
         # ``spi_goals`` is the dynamics-predicted subgoal (or broadcast) from
-        # ``main._build_actor_batch_from_dynamics``. π and the critic scorer in
-        # ``actor_loss`` share this vector so Q stays consistent with π.
+        # ``main._build_actor_batch_from_dynamics``. π and actor Q in ``actor_loss``
+        # share this vector so the policy stays consistent with the selected subgoal.
         goals = batch.get('spi_goals', None)
         if goals is None:
             goals = batch.get('value_goals', None)
         return None if goals is None else jnp.asarray(goals, dtype=jnp.float32)
+
+    def _proposal_q_goals(self, batch: dict) -> jnp.ndarray | None:
+        """Goals used to score proposal action chunks for the SPI target distribution."""
+        goals = batch.get('proposal_goals', None)
+        if goals is None:
+            return self._goals(batch)
+        return jnp.asarray(goals, dtype=jnp.float32)
 
     def _chunk_dim(self) -> int:
         return int(self.config['actor_chunk_horizon']) * int(self.config['action_dim'])
@@ -79,23 +86,22 @@ class ActorAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch: dict, actor_params: dict, critic_agent: Any) -> tuple[jnp.ndarray, dict]:
         proposal_chunks = self._proposal_chunks(batch)
-        proposal_scores = batch.get('proposal_scores', None)
-        if proposal_scores is None:
-            raise ValueError(
-                'SPI actor path requires proposal_scores precomputed from the current critic snapshot. '
-                'Rescore proposals in the training loop before actor update.'
-            )
-        proposal_scores = jax.lax.stop_gradient(jnp.asarray(proposal_scores, dtype=jnp.float32))
-        if proposal_scores.ndim != 2:
-            raise ValueError(f'proposal_scores must be rank-2 [B, K], got shape={proposal_scores.shape}')
-        if proposal_scores.shape[:2] != proposal_chunks.shape[:2]:
-            raise ValueError(
-                'proposal_scores must align with proposal_partial_chunks, '
-                f'got scores={proposal_scores.shape} proposals={proposal_chunks.shape}.'
-            )
-
         goals = self._goals(batch)
-        rho = jax.nn.softmax(float(self.config['spi_beta']) * proposal_scores, axis=1)
+        proposal_q_goals = self._proposal_q_goals(batch)
+        proposal_q = critic_agent.score_action_chunks(
+            batch['observations'],
+            proposal_q_goals,
+            proposal_chunks,
+            network_params=critic_agent.network.params,
+            use_partial_critic=True,
+        )
+        proposal_q = jax.lax.stop_gradient(jnp.asarray(proposal_q, dtype=jnp.float32))
+        if proposal_q.shape != proposal_chunks.shape[:2]:
+            raise ValueError(
+                'proposal Q scores must align with proposal_partial_chunks, '
+                f'got q={proposal_q.shape} proposals={proposal_chunks.shape}.'
+            )
+        rho = jax.nn.softmax(float(self.config['spi_beta']) * proposal_q, axis=1)
         rho = jax.lax.stop_gradient(rho)
 
         actor_chunk = self.actor(batch['observations'], goals, params=actor_params)
@@ -121,6 +127,9 @@ class ActorAgent(flax.struct.PyTreeNode):
         rho_entropy = -jnp.sum(rho * jnp.log(rho + rho_eps), axis=1).mean()
         return actor_loss, {
             'spi_actor/actor_loss': actor_loss,
+            'spi_actor/proposal_q_mean': proposal_q.mean(),
+            'spi_actor/proposal_q_max': proposal_q.max(),
+            'spi_actor/proposal_q_min': proposal_q.min(),
             'spi_actor/q_mean': actor_q.mean(),
             'spi_actor/q_max': actor_q.max(),
             'spi_actor/q_min': actor_q.min(),

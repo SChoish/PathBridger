@@ -262,12 +262,13 @@ def test_rescore_keeps_global_best_proposal_before_spi():
     best_idx = jnp.argmax(scores, axis=1)
     expected_goals = jnp.take_along_axis(cand_goals, best_idx[:, None, None], axis=1)[:, 0, :]
 
-    assert out_batch['proposal_partial_chunks'].shape == (BATCH, 1, 2, ACTION_DIM)
-    assert out_batch['proposal_scores'].shape == (BATCH, 1)
+    assert out_batch['proposal_partial_chunks'].shape == (BATCH, subgoal_samples * plan_candidates, 2, ACTION_DIM)
+    assert 'proposal_goals' in out_batch
+    assert out_batch['proposal_goals'].shape == (BATCH, subgoal_samples * plan_candidates, STATE_DIM)
     np.testing.assert_allclose(np.asarray(out_batch['spi_goals']), np.asarray(expected_goals), rtol=1e-5, atol=1e-6)
     assert float(stats['proposal_best_of_n']) == float(subgoal_samples * plan_candidates)
     assert float(stats['proposal_pre_best_count']) == float(subgoal_samples * plan_candidates)
-    assert float(stats['proposal_post_best_count']) == 1.0
+    assert float(stats['proposal_post_best_count']) == float(subgoal_samples * plan_candidates)
 
 
 # ---------------------------------------------------------------------------
