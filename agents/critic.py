@@ -44,16 +44,28 @@ def _canonicalize_critic_config(config: dict) -> tuple[str, str, bool]:
         config['critic_type'] = 'trl'
         config['algorithm'] = 'trl'
         config['use_chunk_critic'] = False
-        config['proposal_score_mode'] = 'q_plus_v'
-        config['proposal_v_weight'] = float(config.get('proposal_v_weight', 0.1))
+        if config.get('proposal_score_mode', None) in (None, ''):
+            config['proposal_score_mode'] = 'q_plus_v'
+        if config.get('proposal_v_weight', None) is None:
+            config['proposal_v_weight'] = 0.1
         config['proposal_v_score_clip'] = float(config.get('proposal_v_score_clip', 5.0))
-        config['subgoal_value_bonus_type'] = 'transitive_ratio'
-        config['subgoal_value_ratio_eps'] = float(config.get('subgoal_value_ratio_eps', 1e-3))
+        if config.get('subgoal_value_bonus_type', None) in (None, ''):
+            config['subgoal_value_bonus_type'] = 'transitive_ratio'
+        if config.get('subgoal_value_ratio_eps', None) is None:
+            config['subgoal_value_ratio_eps'] = 1e-3
         config['subgoal_value_ratio_clip'] = float(config.get('subgoal_value_ratio_clip', 5.0))
     elif critic_type == 'iql' and bool(config.get('use_chunk_critic', False)):
         config['use_chunk_critic'] = False
     else:
         config['critic_type'] = critic_type
+    if config.get('proposal_score_mode', None) in (None, ''):
+        config['proposal_score_mode'] = 'q_only'
+    if config.get('proposal_v_weight', None) is None:
+        config['proposal_v_weight'] = 1.0
+    if config.get('subgoal_value_bonus_type', None) in (None, ''):
+        config['subgoal_value_bonus_type'] = 'single_value'
+    if config.get('subgoal_value_ratio_eps', None) is None:
+        config['subgoal_value_ratio_eps'] = 1e-6
     return str(config['critic_type']), str(config.get('algorithm', algorithm)), is_trl
 
 
@@ -766,7 +778,7 @@ def get_config():
             algorithm='dqc',
             critic_type='dqc',
             use_chunk_critic=True,
-            tau_v=0.9,
+            tau_v=0.7,
             lambda_v_base=1.0,
             lambda_v_tri=1.0,
             lambda_v_self=1.0,
@@ -778,12 +790,12 @@ def get_config():
             value_distance_weight_clip_max=1.0,
             lambda_q_local=1.0,
             q_target_from_value=True,
-            subgoal_value_bonus_type='single_value',
-            subgoal_value_ratio_eps=1e-6,
+            subgoal_value_bonus_type=None,
+            subgoal_value_ratio_eps=None,
             subgoal_value_ratio_clip=5.0,
-            proposal_score_mode='q_only',
+            proposal_score_mode=None,
             proposal_q_weight=1.0,
-            proposal_v_weight=1.0,
+            proposal_v_weight=None,
             proposal_v_score_clip=5.0,
             rescore_single_candidate=False,
             q_value_eps=1e-6,

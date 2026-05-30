@@ -179,7 +179,7 @@ critic_agent:
   algorithm: trl
   use_chunk_critic: false
   goal_representation: full
-  tau_v: 0.9
+  tau_v: 0.7
   lambda_v_self: 1.0
   lambda_v_base: 1.0
   lambda_v_tri: 1.0

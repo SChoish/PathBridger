@@ -117,6 +117,17 @@ def test_validate_config():
         validate_config(cfg)
         assert bool(cfg.use_chunk_critic) is False
 
+    cfg = _cfg('trl')
+    cfg.proposal_score_mode = 'q_only'
+    cfg.proposal_v_weight = 0.0
+    cfg.subgoal_value_bonus_type = 'single_value'
+    cfg.subgoal_value_ratio_eps = 1e-2
+    validate_config(cfg)
+    assert cfg['proposal_score_mode'] == 'q_only'
+    assert float(cfg['proposal_v_weight']) == 0.0
+    assert cfg['subgoal_value_bonus_type'] == 'single_value'
+    assert float(cfg['subgoal_value_ratio_eps']) == 1e-2
+
     cfg = _cfg('dqc')
     cfg.critic_type = 'direct_chunk_trl'
     with pytest.raises(ValueError, match='critic_type'):

@@ -644,7 +644,14 @@ def _rescore_top1_proposal_with_stats_jit(
         ),
         dtype=jnp.float32,
     )
-    if hasattr(critic_agent, 'score_transitive_subgoals'):
+    mode = str(critic_agent.config.get('proposal_score_mode', 'q_only')).lower()
+    is_trl_proposal = _is_trl_type(
+        str(critic_agent.config.get('critic_type', 'dqc')),
+        str(critic_agent.config.get('algorithm', '')),
+    )
+    proposal_v_weight = float(critic_agent.config.get('proposal_v_weight', 1.0))
+    needs_v_scores = mode == 'v_only' or (mode == 'q_plus_v' and proposal_v_weight != 0.0)
+    if is_trl_proposal and needs_v_scores and hasattr(critic_agent, 'score_transitive_subgoals'):
         v_scores = jnp.asarray(
             critic_agent.score_transitive_subgoals(
                 obs,
@@ -661,7 +668,6 @@ def _rescore_top1_proposal_with_stats_jit(
         0.0,
         float(critic_agent.config.get('proposal_v_score_clip', 5.0)),
     )
-    mode = str(critic_agent.config.get('proposal_score_mode', 'q_only')).lower()
     if mode == 'q_only':
         scores = q_scores
     elif mode == 'v_only':
@@ -669,7 +675,7 @@ def _rescore_top1_proposal_with_stats_jit(
     elif mode == 'q_plus_v':
         scores = (
             float(critic_agent.config.get('proposal_q_weight', 1.0)) * q_scores
-            + float(critic_agent.config.get('proposal_v_weight', 1.0)) * v_scores
+            + proposal_v_weight * v_scores
         )
     else:
         raise ValueError(

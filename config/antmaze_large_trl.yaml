@@ -35,7 +35,7 @@ critic_agent:
   action_chunk_horizon: 5
   full_chunk_horizon: 25
   discount: 0.995
-  tau_v: 0.9
+  tau_v: 0.7
   lambda_v_self: 1.0
   lambda_v_base: 1.0
   lambda_v_tri: 1.0
