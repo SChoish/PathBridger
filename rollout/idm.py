@@ -69,7 +69,7 @@ from rollout.maze_navigator import MazeNavigatorMap
 def rollout_dynamics_idm_env(
     env,
     agent: DynamicsAgent,
-    idm_model: InverseDynamicsMLP,
+    idm_model: InverseDynamicsMLP | None,
     idm_params,
     s0: np.ndarray,
     s_g: np.ndarray,
@@ -110,9 +110,12 @@ def rollout_dynamics_idm_env(
         cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
     d = int(cur.shape[-1])
 
-    @jax.jit
-    def _idm_actions(p, o_stack: jnp.ndarray, on_stack: jnp.ndarray) -> jnp.ndarray:
-        return idm_model.apply({'params': p}, o_stack, on_stack)
+    if idm_model is not None:
+        @jax.jit
+        def _standalone_idm_actions(p, o_stack: jnp.ndarray, on_stack: jnp.ndarray) -> jnp.ndarray:
+            return idm_model.apply({'params': p}, o_stack, on_stack)
+    else:
+        _standalone_idm_actions = None
 
     plan_rng = jax.random.PRNGKey(int(planner_seed))
     use_stoch_plan = float(planner_noise_scale) > 0.0
@@ -141,17 +144,27 @@ def rollout_dynamics_idm_env(
         )
         plan_seg = np.asarray(chunk_traj_plot[1:], dtype=np.float32)
 
-        o_prev = jnp.asarray(chunk_traj_raw[:-1], dtype=jnp.float32)
-        o_next = jnp.asarray(chunk_traj_raw[1:], dtype=jnp.float32)
-        actions = np.asarray(
-            jax.device_get(
-                agent._idm_actions_from_trajectories(
-                    jnp.asarray(chunk_traj_raw[None, ...], dtype=jnp.float32),
-                    int(action_chunk_horizon),
-                )
-            ),
-            dtype=np.float32,
-        )[0]
+        horizon = int(action_chunk_horizon)
+        if idm_model is None:
+            # Embedded IDM path: let DynamicsAgent normalize states consistently with training.
+            actions = np.asarray(
+                jax.device_get(
+                    agent._idm_actions_from_trajectories(
+                        jnp.asarray(chunk_traj_raw[None, ...], dtype=jnp.float32),
+                        horizon,
+                    )
+                ),
+                dtype=np.float32,
+            )[0]
+        else:
+            # Legacy standalone checkpoints were trained on raw observation pairs.
+            o_prev = jnp.asarray(chunk_traj_raw[:-1], dtype=jnp.float32)
+            o_next = jnp.asarray(chunk_traj_raw[1:], dtype=jnp.float32)
+            assert _standalone_idm_actions is not None
+            actions = np.asarray(
+                jax.device_get(_standalone_idm_actions(idm_params, o_prev, o_next)),
+                dtype=np.float32,
+            )[:horizon]
 
         n_exec = min(int(actions.shape[0]), max(1, int(action_chunk_horizon)))
         for _ in range(n_exec):
@@ -331,21 +344,14 @@ def main() -> None:
     if not idm_ck_stripped:
         ptree = agent.network.params
         # Flax ``nn.scan`` / combined modules may prefix keys with ``modules_``.
-        if 'idm_net' in ptree:
-            idm_params = ptree['idm_net']
-        elif 'modules_idm_net' in ptree:
-            idm_params = ptree['modules_idm_net']
-        else:
+        if 'idm_net' not in ptree and 'modules_idm_net' not in ptree:
             raise FileNotFoundError(
                 'Dynamics checkpoint has no idm_net / modules_idm_net '
                 '(train with embedded IDM or pass --idm_checkpoint).'
             )
-        idm_model = InverseDynamicsMLP(
-            obs_dim=int(s0.shape[-1]),
-            action_dim=int(agent.config['idm_action_dim']),
-            hidden_dims=tuple(int(x) for x in agent.config['idm_hidden_dims']),
-        )
-        print('Using idm_net from dynamics checkpoint')
+        idm_model = None
+        idm_params = None
+        print('Using embedded idm_net from dynamics checkpoint')
     else:
         idm_ckpt_path = Path(idm_ck_stripped).resolve()
         if not idm_ckpt_path.is_file():

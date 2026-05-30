@@ -212,7 +212,7 @@ Resume 로그는 `run_resume_from<E>_<timestamp>.log`로 따로 저장됩니다.
 
 ## 현재 Config 레이아웃
 
-현재 저장소의 `config/`에는 antmaze-medium 중심 baseline과 goal-representation/target-mode table ablation YAML만 포함되어 있습니다. 다른 환경(cube/puzzle/humanoid/large/giant/teleport) YAML은 현재 코드 트리에 없으며, 필요하면 `scripts/write_*_res_subgoal_grid_yaml.py` 또는 `scripts/write_sweep_run_yaml.py`로 생성하는 구조입니다.
+현재 저장소의 `config/`에는 antmaze-medium baseline/table ablation YAML과 antmaze-large direct-chunk TRL YAML이 포함되어 있습니다. cube/puzzle/humanoid/giant/teleport 같은 다른 환경 YAML은 현재 코드 트리에 없으며, 필요하면 `scripts/write_*_res_subgoal_grid_yaml.py` 또는 `scripts/write_sweep_run_yaml.py`로 생성하는 구조입니다. `--run_config`를 생략하면 코드 기본값은 `config/antmaze_medium_navigate.yaml`입니다.
 
 | Config | 환경/용도 | 비고 |
 |--------|-----------|------|
@@ -221,6 +221,8 @@ Resume 로그는 `run_resume_from<E>_<timestamp>.log`로 따로 저장됩니다.
 | `antmaze_medium_navigate_table_full_disp.yaml` | medium table ablation | full goal + displacement target |
 | `antmaze_medium_navigate_table_phi_abs.yaml` | medium table ablation | phi goal + absolute target |
 | `antmaze_medium_navigate_table_phi_disp.yaml` | medium table ablation | phi goal + displacement target |
+| `antmaze_large_direct_chunk_trl.yaml` | `antmaze-large-navigate-v0` direct-chunk TRL | large 환경용 `direct_chunk_trl` 예시 config |
+| `antmaze_large_direct_chunk_trl_gap0_alpha1.yaml` | large direct-chunk TRL ablation | gap/alpha ablation config |
 
 ## Run Directory
 
