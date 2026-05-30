@@ -1,9 +1,8 @@
-# trl on antmaze-large-navigate-v0.
-# Primary state-pair transitive V + local subgoal-conditioned Q.
+# dqc on antmaze-large-navigate-v0 (gap0 / alpha0), 200 epochs.
 
 env_name: antmaze-large-navigate-v0
-run_group: antmaze_large_trl_te0_sn0
-train_epochs: 600
+run_group: antmaze_large_dqc_te0_sn0_gap0_alpha0_200ep
+train_epochs: 200
 log_every_n_epochs: 10
 save_every_n_epochs: 100
 horizon: 25
@@ -16,7 +15,7 @@ dynamics:
   subgoal_stochastic_loss: nll
   subgoal_num_samples: 1
   subgoal_value_alpha: 0.0
-  subgoal_value_gap_scale: 10.0
+  subgoal_value_gap_scale: 0.0
   subgoal_goal_representation: phi
   subgoal_target_mode: absolute
   planner_type: forward_bridge_residual
@@ -29,30 +28,17 @@ dynamics:
   state_normalization: false
 
 critic_agent:
-  algorithm: trl
-  critic_type: trl
-  use_chunk_critic: false
+  algorithm: dqc
+  critic_type: dqc
+  use_chunk_critic: true
   action_chunk_horizon: 5
   full_chunk_horizon: 25
   discount: 0.995
-  tau_v: 0.7
-  lambda_v_self: 1.0
-  lambda_v_base: 1.0
-  lambda_v_tri: 1.0
-  value_base_horizon: 5
-  value_transitive_reweight: true
-  value_distance_weight_power: 0.0
-  lambda_q_local: 1.0
-  q_target_from_value: true
-  goal_representation: full
   kappa_b: 0.9
   kappa_d: 0.9
   max_goal_steps_from_env: true
   clip_chunk_to_goal: true
-  subgoal_value_bonus_type: transitive_product
-  subgoal_value_log_eps: 1.0e-6
-  subgoal_value_ratio_eps: 1.0e-3
-  subgoal_value_ratio_clip: 5.0
+  goal_representation: full
 
 actor:
   spi_beta: 1.0
@@ -60,3 +46,4 @@ actor:
 
 batch_size: 1024
 eval_freq: 100
+final_eval_episodes_per_task: 20

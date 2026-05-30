@@ -439,6 +439,48 @@ def test_subgoal_value_bonus_by_critic_mode():
     np.testing.assert_allclose(np.asarray(bonus), np.asarray(expected_ratio), rtol=1e-5, atol=1e-6)
 
 
+def test_subgoal_transitive_product_bonus():
+    trl_critic = _make_critic('trl')
+    trl_agent = _make_dynamics_agent(
+        'diag_gaussian',
+        config_updates={
+            **_VALUE_SHARED,
+            'critic_type': 'trl',
+            'algorithm': 'trl',
+            'subgoal_value_alpha': 1.0,
+            'subgoal_value_bonus_type': 'transitive_product',
+        },
+    )
+    _, _, _, bonus, _, _, _, v_s_sg, v_sg_g = _subgoal_value_terms(
+        trl_agent, trl_critic.network.params['modules_value'], rng_seed=23,
+    )
+    expected = np.asarray(v_s_sg * v_sg_g)
+    np.testing.assert_allclose(np.asarray(bonus), expected, rtol=1e-5, atol=1e-6)
+
+
+def test_subgoal_transitive_log_product_uses_log_gamma():
+    discount = 0.995
+    trl_critic = _make_critic('trl')
+    trl_agent = _make_dynamics_agent(
+        'diag_gaussian',
+        config_updates={
+            **_VALUE_SHARED,
+            'critic_type': 'trl',
+            'algorithm': 'trl',
+            'discount': discount,
+            'subgoal_value_alpha': 1.0,
+            'subgoal_value_bonus_type': 'transitive_log_product',
+            'subgoal_value_log_eps': 1e-6,
+        },
+    )
+    _, _, _, bonus, _, _, _, v_s_sg, v_sg_g = _subgoal_value_terms(
+        trl_agent, trl_critic.network.params['modules_value'], rng_seed=23,
+    )
+    product = np.clip(np.asarray(v_s_sg * v_sg_g), 1e-6, 1.0)
+    expected = np.log(product) / np.log(discount)
+    np.testing.assert_allclose(np.asarray(bonus), expected, rtol=1e-5, atol=1e-6)
+
+
 if __name__ == '__main__':
     failures = []
     for name, fn in list(globals().items()):

@@ -1,9 +1,8 @@
-# trl on antmaze-large-navigate-v0.
-# Primary state-pair transitive V + local subgoal-conditioned Q.
+# trl on antmaze-large-navigate-v0 (gap0 / alpha10), 200 epochs.
 
 env_name: antmaze-large-navigate-v0
-run_group: antmaze_large_trl_te0_sn0
-train_epochs: 600
+run_group: antmaze_large_trl_te0_sn0_gap0_alpha10_200ep
+train_epochs: 200
 log_every_n_epochs: 10
 save_every_n_epochs: 100
 horizon: 25
@@ -15,8 +14,8 @@ dynamics:
   subgoal_distribution: diag_gaussian
   subgoal_stochastic_loss: nll
   subgoal_num_samples: 1
-  subgoal_value_alpha: 0.0
-  subgoal_value_gap_scale: 10.0
+  subgoal_value_alpha: 10.0
+  subgoal_value_gap_scale: 0.0
   subgoal_goal_representation: phi
   subgoal_target_mode: absolute
   planner_type: forward_bridge_residual

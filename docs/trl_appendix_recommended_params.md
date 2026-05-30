@@ -54,7 +54,7 @@ Q(s,a,g) \leftarrow Q(s,a,z)Q(z,a',g)
 
 3. **distance-based reweighting**
    - 긴 segment \(s_i\to s_j\) target은 짧은 segment \(s_i\to s_k\), \(s_k\to s_j\) 값에 의존하므로, 짧은 segment를 더 정확히 맞추도록 weight를 둔다.
-   - TRL paper의 형태는 대략 estimated distance에 반비례하는 weight이다.
+   - TRL appendix: \(w(s_i,s_j)=1/(1+\log_\gamma Q(s_i,a_i,s_j))^\lambda\). PathBridger는 stopgrad \(V(s_i,s_j)\)로 \(\log_\gamma Q\)를 근사한다.
 
 ---
 
@@ -294,37 +294,35 @@ TRL appendix Table 5 기준, \(\kappa=0.7\)가 거의 모든 task에서 공통�
 tau_v: 0.7
 ```
 
-거리 reweight \(\lambda\)는 다음처럼 시작한다.
+거리 reweight \(\lambda\)는 TRL appendix Table 5와 같다. PathBridger에서는 `value_distance_weight_power`에 \(\lambda\)를 그대로 넣는다:
 
-| 환경군 | appendix λ | PathBridger 추천 |
-|---|---:|---:|
-| humanoidmaze-giant | 0 | `value_distance_weight_power: 0.0` or `0.5` |
-| puzzle-4x5 / 4x6 | 0 | `0.0` or `0.5` |
-| pointmaze-large | 0.7 | `0.7` |
-| antmaze-large | 0 | `0.0` or `0.5` |
-| humanoidmaze-medium | 0 | `0.0` |
-| humanoidmaze-large | 0.1 | `0.1` |
-| antsoccer-arena | 0.5 | `0.5` |
-| cube-single | 0.7 | `0.7` |
-| cube-double | 1.0 | `1.0` |
-| scene | 1.0 | `1.0` |
-| puzzle-3x3 | 0.5 | `0.5` |
-| puzzle-4x4 | 2.0 | `1.0` or `2.0` |
+\[
+w = \frac{1}{\bigl(1 + \log_\gamma V(s,g)\bigr)^\lambda}
+\]
 
-PathBridger에서 giant/cube/puzzle를 주로 볼 경우 추천 시작점은 다음이다.
+(\(\lambda=0\)이면 \(w=1\) — uniform weight.)
 
-```yaml
-# safer
-value_distance_weight_power: 0.5
+| OGBench task | PathBridger `env_name` | appendix \(\lambda\) | `value_distance_weight_power` |
+|--------------|------------------------|---------------------:|------------------------------:|
+| humanoidmaze-giant | `humanoidmaze-giant-navigate-v0` | 0 | 0.0 |
+| puzzle-4x5 | `puzzle-4x5-navigate-v0` | 0 | 0.0 |
+| puzzle-4x6 | `puzzle-4x6-navigate-v0` | 0 | 0.0 |
+| pointmaze-large | `pointmaze-large-navigate-v0` | 0.7 | 0.7 |
+| antmaze-large | `antmaze-large-navigate-v0` | 0 | 0.0 |
+| humanoidmaze-medium | `humanoidmaze-medium-navigate-v0` | 0 | 0.0 |
+| humanoidmaze-large | `humanoidmaze-large-navigate-v0` | 0.1 | 0.1 |
+| antsoccer-arena | `antsoccer-arena-navigate-v0` | 0.5 | 0.5 |
+| cube-single | `cube-single-navigate-v0` | 0.7 | 0.7 |
+| cube-double | `cube-double-navigate-v0` | 1.0 | 1.0 |
+| scene | `scene-navigate-v0` | 1.0 | 1.0 |
+| puzzle-3x3 | `puzzle-3x3-navigate-v0` | 0.5 | 0.5 |
+| puzzle-4x4 | `puzzle-4x4-navigate-v0` | 2.0 | 2.0 |
 
-# more TRL-like for cube/puzzle standard
-value_distance_weight_power: 1.0
-```
-
-현재 구현처럼 `inverse_value_offset`를 기본으로 두고, split-balance term은 ablation으로만 둔다.
+expectile \(\kappa=0.7\)는 `tau_v: 0.7` (모든 task 공통).
 
 ```yaml
-value_transitive_weight_mode: inverse_value_offset
+value_transitive_reweight: true
+value_distance_weight_power: 0.0  # antmaze-large
 value_distance_weight_clip_min: 0.05
 value_distance_weight_clip_max: 1.0
 ```
@@ -391,7 +389,6 @@ critic_agent:
 
   value_base_horizon: 5
   value_transitive_reweight: true
-  value_transitive_weight_mode: inverse_value_offset
   value_distance_weight_power: 0.5
   value_distance_weight_clip_min: 0.05
   value_distance_weight_clip_max: 1.0
@@ -434,7 +431,6 @@ critic_agent:
 
   value_base_horizon: 5
   value_transitive_reweight: true
-  value_transitive_weight_mode: inverse_value_offset
   value_distance_weight_power: 1.0
   value_distance_weight_clip_min: 0.05
   value_distance_weight_clip_max: 1.0
@@ -575,7 +571,7 @@ plan_candidates: 8
 1. `_canonicalize_critic_config()`에서 explicit YAML override를 덮어쓰지 않기.
 2. `target_v_left/right`의 short leg exact replacement 추가.
 3. TRL mode first-run config에서 `goal_representation: full` 명시.
-4. `value_transitive_weight_mode` 기본은 `inverse_value_offset`, split-balance는 ablation으로만 사용.
+4. TRL transitive distance weight는 `value_distance_weight_power` (= appendix \(\lambda\))만 조정한다.
 
 ---
 
@@ -595,7 +591,6 @@ critic_agent:
   lambda_q_local: 1.0
   value_base_horizon: 5
   value_transitive_reweight: true
-  value_transitive_weight_mode: inverse_value_offset
   value_distance_weight_power: 0.5
 
 dynamics:

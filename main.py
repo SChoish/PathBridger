@@ -377,7 +377,7 @@ def _format_epoch_log(metrics: dict[str, float]) -> str:
         ('dyn_path', 'train/dynamics/phase1/loss_path_step_epoch_mean'),
         ('dyn_roll', 'train/dynamics/phase1/loss_roll_epoch_mean'),
         ('dyn_sub', 'train/dynamics/phase1/loss_subgoal_epoch_mean'),
-        ('sg_logprod', 'train/dynamics/phase1/subgoal_transitive_log_product_mean_epoch_mean'),
+        ('sg_vprod', 'train/dynamics/phase1/subgoal_transitive_product_mean_epoch_mean'),
         ('dyn_idm', 'train/dynamics/phase1/loss_idm_epoch_mean'),
         ('fb_path', 'train/dynamics/forward_bridge/loss_path_interior_epoch_mean'),
         ('fb_next', 'train/dynamics/forward_bridge/loss_path_next_epoch_mean'),
@@ -850,6 +850,7 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     critic_config = _update_config(get_critic_config(), critic_updates)
     actor_config = _merge_actor_updates(get_actor_config(), actor_updates)
     dynamics_config, critic_config = _apply_horizon(dynamics_config, critic_config)
+    dynamics_config['discount'] = float(critic_config.get('discount', dynamics_config.get('discount', 0.99)))
     actor_config['actor_chunk_horizon'] = int(critic_config['action_chunk_horizon'])
     # Subgoal-value bonus net shares parameters with the critic value net, so its
     # architecture must mirror the critic; force-sync here so users only configure it once.
@@ -862,9 +863,9 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     dynamics_config['algorithm'] = str(critic_config.get('algorithm', 'dqc'))
     if _is_trl_type(str(critic_config.get('critic_type', 'dqc')), str(critic_config.get('algorithm', ''))):
         bonus_type = critic_config.get('subgoal_value_bonus_type', None)
-        bonus_type = 'transitive_log_product' if bonus_type in (None, '') else str(bonus_type).lower()
+        bonus_type = 'transitive_product' if bonus_type in (None, '') else str(bonus_type).lower()
         dynamics_config['subgoal_value_bonus_type'] = (
-            'transitive_log_product' if bonus_type == 'single_value' else bonus_type
+            'transitive_product' if bonus_type == 'single_value' else bonus_type
         )
         dynamics_config['subgoal_value_log_eps'] = float(critic_config.get('subgoal_value_log_eps', 1e-6))
         dynamics_config['subgoal_value_ratio_eps'] = float(critic_config.get('subgoal_value_ratio_eps', 1e-3))
@@ -884,7 +885,7 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     dynamics_config['algorithm'] = str(critic_config.get('algorithm', 'dqc'))
     if _is_trl_type(str(critic_config.get('critic_type', 'dqc')), str(critic_config.get('algorithm', ''))):
         dynamics_config['subgoal_value_bonus_type'] = str(
-            critic_config.get('subgoal_value_bonus_type', 'transitive_log_product')
+            critic_config.get('subgoal_value_bonus_type', 'transitive_product')
         )
         dynamics_config['subgoal_value_log_eps'] = float(critic_config.get('subgoal_value_log_eps', 1e-6))
         dynamics_config['subgoal_value_ratio_eps'] = float(critic_config.get('subgoal_value_ratio_eps', 1e-3))

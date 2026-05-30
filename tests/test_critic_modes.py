@@ -110,6 +110,15 @@ def test_trl_transitive_contract():
     assert leaf_sum(grads['modules_target_value']) == 0.0
 
 
+def test_trl_distance_weight():
+    critic, batch = _build('trl')
+    cfg = critic.config
+    assert float(cfg.get('value_distance_weight_power', 1.0)) == 1.0
+    _, info = critic.update(batch)
+    assert np.isfinite(float(info['value/tri_distance_weight_mean']))
+    assert 0.05 <= float(info['value/tri_distance_weight_mean']) <= 1.0
+
+
 def test_validate_config():
     for critic_type in ('iql', 'trl'):
         cfg = _cfg(critic_type)

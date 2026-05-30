@@ -167,9 +167,37 @@ TRL semantics (current implementation):
 - `V(s,g)` is the primary state-space critic trained with BCE self/base + BCE-expectile transitive targets.
 - `Q(s, A_h, z)` is a local action-chunk critic bootstrapped from `target_V(s+H, z)`.
 - `direct_chunk_trl` is not an alias for this mode; it should be treated as a separate legacy ablation if restored.
-- Subgoal bonus defaults to ``log(clip(V(s,z)*V(z,g)))`` for TRL.
+- Subgoal bonus defaults to ``V(s,z) * V(z,g)`` for TRL (`transitive_product`).
 - Proposal selection and SPI both use local Q only.
 - For initial TRL experiments, prefer `goal_representation: full` so triangle consistency is learned in the same state-goal space.
+
+#### TRL distance reweight λ (appendix Table 5)
+
+Transitive tri loss sample weight:
+
+\[
+w(s_i, s_j) = \frac{1}{\bigl(1 + \log_\gamma V(s_i, s_j)\bigr)^\lambda}
+\]
+
+PathBridger config: `value_distance_weight_power: <λ>`. \(\lambda=0\)이면 \(w=1\) (uniform). expectile \(\kappa=0.7\) → `tau_v: 0.7`.
+
+| OGBench task | PathBridger `env_name` | appendix λ | `value_distance_weight_power` |
+|--------------|------------------------|----------:|--------------------------------:|
+| humanoidmaze-giant | `humanoidmaze-giant-navigate-v0` | 0 | 0.0 |
+| puzzle-4x5 | `puzzle-4x5-navigate-v0` | 0 | 0.0 |
+| puzzle-4x6 | `puzzle-4x6-navigate-v0` | 0 | 0.0 |
+| pointmaze-large | `pointmaze-large-navigate-v0` | 0.7 | 0.7 |
+| **antmaze-large** | **`antmaze-large-navigate-v0`** | **0** | **0.0** |
+| humanoidmaze-medium | `humanoidmaze-medium-navigate-v0` | 0 | 0.0 |
+| humanoidmaze-large | `humanoidmaze-large-navigate-v0` | 0.1 | 0.1 |
+| antsoccer-arena | `antsoccer-arena-navigate-v0` | 0.5 | 0.5 |
+| cube-single | `cube-single-navigate-v0` | 0.7 | 0.7 |
+| cube-double | `cube-double-navigate-v0` | 1.0 | 1.0 |
+| scene | `scene-navigate-v0` | 1.0 | 1.0 |
+| puzzle-3x3 | `puzzle-3x3-navigate-v0` | 0.5 | 0.5 |
+| puzzle-4x4 | `puzzle-4x4-navigate-v0` | 2.0 | 2.0 |
+
+상세 rationale·다른 TRL 하이퍼(α, N)는 `docs/trl_appendix_recommended_params.md` §4 참고.
 
 Example config: `config/antmaze_large_trl.yaml`.
 
@@ -184,9 +212,10 @@ critic_agent:
   lambda_v_base: 1.0
   lambda_v_tri: 1.0
   value_base_horizon: 5
-  value_transitive_weight_mode: inverse_value_offset
+  value_transitive_reweight: true
+  value_distance_weight_power: 0.0  # antmaze-large appendix λ=0
   lambda_q_local: 1.0
-  subgoal_value_bonus_type: transitive_log_product
+  subgoal_value_bonus_type: transitive_product
   subgoal_value_log_eps: 1.0e-6
   subgoal_value_ratio_eps: 1.0e-3
   subgoal_value_ratio_clip: 5.0
@@ -251,7 +280,7 @@ Dynamics agent는 다음 손실을 함께 학습합니다.
 - `phase1/loss_dynamics`: reverse mean matching (또는 `forward_bridge*` 모드의 forward bridge mean matching)
 - `phase1/loss_path_step`: dataset segment와 step-aligned path loss
 - `phase1/loss_roll`: short rollout consistency
-- `phase1/loss_subgoal`: deterministic은 target-value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 `subgoal_stochastic_loss=mse`이면 reparameterized sample에 대해 `stopgrad(w(Delta V)) * MSE(sample, target) - alpha * bonus`를 쓰고, `subgoal_stochastic_loss=nll`이면 `stopgrad(w(Delta V)) * NLL(target | mu, log_std) - alpha * bonus`를 씁니다. 기본 bonus는 `V(sample_abs, g)`이며, `trl`일 때는 `V(s, sample_abs) * V(sample_abs, g) / (V(s,g)+eps)`입니다.
+- `phase1/loss_subgoal`: deterministic은 target-value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 `subgoal_stochastic_loss=mse`이면 reparameterized sample에 대해 `stopgrad(w(ΔV)) * MSE(sample, target) - alpha * bonus`를 쓰고, `subgoal_stochastic_loss=nll`이면 `stopgrad(w(ΔV)) * NLL(target | mu, log_std) - alpha * bonus`를 씁니다. 기본 bonus는 `V(sample_abs, g)`이며, `trl` + `transitive_product`일 때는 `V(s,ẑ) * V(ẑ,g)`입니다.
 - `phase1/loss_idm`: embedded inverse dynamics MSE
 
 Critic + SPI actor:

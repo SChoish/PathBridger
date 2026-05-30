@@ -45,7 +45,7 @@ def _canonicalize_critic_config(config: dict) -> tuple[str, str, bool]:
         config['algorithm'] = 'trl'
         config['use_chunk_critic'] = False
         if config.get('subgoal_value_bonus_type', None) in (None, ''):
-            config['subgoal_value_bonus_type'] = 'transitive_log_product'
+            config['subgoal_value_bonus_type'] = 'transitive_product'
         config['subgoal_value_log_eps'] = float(config.get('subgoal_value_log_eps', 1e-6))
         if config.get('subgoal_value_ratio_eps', None) is None:
             config['subgoal_value_ratio_eps'] = 1e-3
@@ -347,29 +347,14 @@ class CriticAgent(flax.struct.PyTreeNode):
         loss_v_tri_per = _bce_expectile_loss(v_tri_logits, target_v_tri, tau_v)
 
         if bool(self.config.get('value_transitive_reweight', True)):
-            value_offsets = jnp.asarray(batch.get('value_offsets', jnp.ones_like(tri_valid)), dtype=jnp.float32)
-            split_offsets = jnp.asarray(
-                batch.get('trans_v_split_offsets', value_offsets),
-                dtype=jnp.float32,
-            )
-            horizon = jnp.asarray(float(self.config['action_chunk_horizon']), dtype=jnp.float32)
-            dist = jnp.maximum(value_offsets, 1.0)
             power = float(self.config.get('value_distance_weight_power', 1.0))
-            dist_w = jnp.power(horizon / dist, power)
-            weight_mode = str(self.config.get('value_transitive_weight_mode', 'inverse_value_offset')).lower()
-            if weight_mode in ('inverse_value_offset_balance', 'inverse_value_offset_with_split_balance'):
-                balance = 4.0 * jnp.maximum(split_offsets, 1.0) * jnp.maximum(value_offsets - split_offsets, 1.0)
-                dist_w = dist_w * balance / jnp.maximum(dist * dist, 1.0)
-            elif weight_mode != 'inverse_value_offset':
-                raise ValueError(
-                    "value_transitive_weight_mode must be 'inverse_value_offset' or "
-                    f"'inverse_value_offset_balance', got {weight_mode!r}."
-                )
-            dist_w = jnp.clip(
-                dist_w,
-                float(self.config.get('value_distance_weight_clip_min', 0.05)),
-                float(self.config.get('value_distance_weight_clip_max', 1.0)),
-            )
+            clip_min = float(self.config.get('value_distance_weight_clip_min', 0.05))
+            clip_max = float(self.config.get('value_distance_weight_clip_max', 1.0))
+            v_for_weight = jax.lax.stop_gradient(jnp.clip(v_tri, eps, 1.0))
+            d_est = jnp.log(v_for_weight) / jnp.log(jnp.asarray(discount, dtype=jnp.float32))
+            d_est = jnp.maximum(d_est, 0.0)
+            dist_w = 1.0 / jnp.power(1.0 + d_est, power)
+            dist_w = jnp.clip(dist_w, clip_min, clip_max)
             dist_w = jax.lax.stop_gradient(dist_w)
             tri_weights = tri_valid * dist_w
         else:
@@ -443,8 +428,8 @@ class CriticAgent(flax.struct.PyTreeNode):
             bsz, num_candidates = actions.shape[:2]
             return actions.reshape(bsz, num_candidates, -1), num_candidates
         if actions.ndim == 3:
-            bsz = actions.shape[0]
-            return actions.reshape(bsz, 1, -1), 1
+            bsz, num_candidates = actions.shape[0], actions.shape[1]
+            return actions, int(num_candidates)
         if actions.ndim == 2:
             return actions[:, None, :], 1
         raise ValueError(f'action_chunk_actions must be rank-2/3/4, got shape={actions.shape}')
@@ -746,7 +731,6 @@ def get_config():
             lambda_v_self=1.0,
             value_base_horizon=5,
             value_transitive_reweight=True,
-            value_transitive_weight_mode='inverse_value_offset',
             value_distance_weight_power=1.0,
             value_distance_weight_clip_min=0.05,
             value_distance_weight_clip_max=1.0,
