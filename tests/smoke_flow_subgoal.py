@@ -36,7 +36,6 @@ def _config(mode: str):
     cfg.subgoal_distribution = mode
     cfg.subgoal_num_samples = 3
     cfg.subgoal_flow_steps = 2
-    cfg.subgoal_flow_use_value_bonus = False
     cfg.subgoal_value_alpha = 0.0
     cfg.subgoal_target_mode = 'displacement'
     cfg.residual_target_mode = 'displacement'

@@ -471,18 +471,20 @@ def compose_state_subgoal_env_frames(
     state_frames: np.ndarray,
     subgoal_frames: np.ndarray,
     *,
+    goal_frames: np.ndarray | None = None,
     output_scale: float = 1.0,
     label_left: str | None = 'state',
     label_right: str | None = 'subgoal',
+    label_goal: str | None = 'goal',
     label_pad: int = 4,
     label_font_size: int = 14,
 ) -> np.ndarray:
-    """Stack two same-length env-render streams horizontally into a single RGB video.
+    """Stack two (or three) same-length env-render streams horizontally into a single RGB video.
 
     ``state_frames`` and ``subgoal_frames`` are uint8 ``(T, H, W, 3)`` arrays. If their per-frame
-    sizes differ, the right panel is resized to match the left panel's height. A small label
-    bar is drawn above each panel when ``label_left`` / ``label_right`` are non-empty (best-effort
-    PIL; falls back to no labels if PIL is unavailable).
+    sizes differ, trailing panels are resized to match the left panel's height. A small label
+    bar is drawn above each panel when labels are non-empty (best-effort PIL; falls back to no
+    labels if PIL is unavailable). When ``goal_frames`` is provided, a third panel is appended.
     """
     if state_frames.ndim != 4 or state_frames.shape[-1] != 3:
         raise ValueError(f'Expected uint8 state_frames (T,H,W,3), got {state_frames.shape}')
@@ -492,6 +494,13 @@ def compose_state_subgoal_env_frames(
     T_right = int(subgoal_frames.shape[0])
     if T_left != T_right:
         raise ValueError(f'state/subgoal frame counts must match, got {T_left} vs {T_right}.')
+    if goal_frames is not None:
+        if goal_frames.ndim != 4 or goal_frames.shape[-1] != 3:
+            raise ValueError(f'Expected uint8 goal_frames (T,H,W,3), got {goal_frames.shape}')
+        if int(goal_frames.shape[0]) != T_left:
+            raise ValueError(
+                f'goal frame count must match state/subgoal, got {goal_frames.shape[0]} vs {T_left}.'
+            )
     if T_left == 0:
         return np.zeros((0, 1, 2, 3), dtype=np.uint8)
 
@@ -502,19 +511,26 @@ def compose_state_subgoal_env_frames(
         pil_ok = False
 
     H_left = int(state_frames.shape[1])
-    if int(subgoal_frames.shape[1]) != H_left and pil_ok:
-        target_w = int(round(int(subgoal_frames.shape[2]) * H_left / int(subgoal_frames.shape[1])))
+
+    def _resize_panel_to_height(frames: np.ndarray, height: int) -> np.ndarray:
+        if int(frames.shape[1]) == height or not pil_ok:
+            return frames
+        target_w = int(round(int(frames.shape[2]) * height / int(frames.shape[1])))
         resized: list[np.ndarray] = []
-        for t in range(T_right):
+        for t in range(int(frames.shape[0])):
             resized.append(
                 np.asarray(
-                    Image.fromarray(subgoal_frames[t]).resize((target_w, H_left), Image.Resampling.LANCZOS),
+                    Image.fromarray(frames[t]).resize((target_w, height), Image.Resampling.LANCZOS),
                     dtype=np.uint8,
                 )
             )
-        subgoal_frames = np.stack(resized, axis=0)
+        return np.stack(resized, axis=0)
 
-    show_labels = bool(label_left or label_right) and pil_ok
+    subgoal_frames = _resize_panel_to_height(subgoal_frames, H_left)
+    if goal_frames is not None:
+        goal_frames = _resize_panel_to_height(goal_frames, H_left)
+
+    show_labels = bool(label_left or label_right or (goal_frames is not None and label_goal)) and pil_ok
     label_h = 0
     font = None
     if show_labels:
@@ -534,23 +550,27 @@ def compose_state_subgoal_env_frames(
 
     out = []
     for t in range(T_left):
-        left = state_frames[t]
-        right = subgoal_frames[t]
-        body = np.concatenate([left, right], axis=1)
+        panels = [state_frames[t], subgoal_frames[t]]
+        if goal_frames is not None:
+            panels.append(goal_frames[t])
+        panel_starts = [0]
+        for p in panels[:-1]:
+            panel_starts.append(panel_starts[-1] + int(p.shape[1]))
+        body = np.concatenate(panels, axis=1)
         if show_labels:
             full = np.full((label_h + body.shape[0], body.shape[1], 3), 22, dtype=np.uint8)
             full[label_h:] = body
             img = Image.fromarray(full)
             draw = ImageDraw.Draw(img)
-            if label_left:
-                draw.text((int(label_pad), int(label_pad)), str(label_left), fill=(240, 240, 245), font=font)
-            if label_right:
-                draw.text(
-                    (int(left.shape[1]) + int(label_pad), int(label_pad)),
-                    str(label_right),
-                    fill=(240, 240, 245),
-                    font=font,
-                )
+            label_specs = [
+                (label_left, panel_starts[0]),
+                (label_right, panel_starts[1]),
+            ]
+            if goal_frames is not None:
+                label_specs.append((label_goal, panel_starts[2]))
+            for text, x0 in label_specs:
+                if text:
+                    draw.text((int(x0) + int(label_pad), int(label_pad)), str(text), fill=(240, 240, 245), font=font)
             body = np.asarray(img, dtype=np.uint8)
         if float(output_scale) > 1.0 and pil_ok:
             ch, cw, _ = body.shape

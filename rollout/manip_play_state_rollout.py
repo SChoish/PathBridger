@@ -55,7 +55,7 @@ from rollout.env import (
     snapshot_manip_mocap,
     sync_env_state_from_compact_manip_obs,
 )
-from rollout.manip_play_rollouts import _write_state_subgoal_mp4
+from rollout.manip_play_rollouts import _reset_task_env, _write_state_subgoal_mp4
 from utils.env_utils import make_env_and_datasets
 from utils.run_io import (
     list_checkpoint_suffixes,
@@ -235,6 +235,7 @@ def _run_one_task(
     stop_on_success: bool,
     fps: float,
     min_mp4_seconds: float,
+    show_goal_panel: bool = True,
 ) -> dict[str, Any]:
     configure_mujoco_gl(mujoco_gl)
     cfg, env_name = load_run_flags(run_dir)
@@ -250,11 +251,7 @@ def _run_one_task(
     if not (1 <= int(task_id) <= n_tasks):
         raise ValueError(f'task_id must be in [1, {n_tasks}]')
 
-    ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=False))
-    if 'goal' not in info:
-        raise RuntimeError('reset did not set info["goal"]')
-    s0 = np.asarray(ob, dtype=np.float32).reshape(-1)
-    s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+    s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
     mocap = snapshot_manip_mocap(env)
 
     dyn_dir = resolve_dynamics_checkpoint_dir(run_dir)
@@ -298,6 +295,9 @@ def _run_one_task(
             fps=float(fps),
             min_mp4_seconds=float(min_mp4_seconds),
             mocap_snapshots=mocap_list,
+            s_g=s_g,
+            goal_rendered=goal_rendered,
+            show_goal_panel=show_goal_panel,
         )
         mp4_rel = _path_rel_to(out_dir, mp4_path)
         print(
@@ -376,6 +376,12 @@ def main() -> None:
         help='If >0, pad MP4 by repeating last frame until at least this duration.',
     )
     p.add_argument(
+        '--show_goal_panel',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Append a third MP4 panel showing the task goal configuration (default: on).',
+    )
+    p.add_argument(
         '--no_exclusive_lock',
         action='store_true',
         help='기본 배타 락(out_dir/.manip_play_state_rollout.lock)을 쓰지 않음 (디버그용).',
@@ -418,6 +424,7 @@ def main() -> None:
                     stop_on_success=not bool(args.no_stop_on_success),
                     fps=float(args.fps),
                     min_mp4_seconds=float(args.min_mp4_seconds),
+                    show_goal_panel=bool(args.show_goal_panel),
                 )
             )
         summary_path = _write_summary_csv(out_dir, rows)

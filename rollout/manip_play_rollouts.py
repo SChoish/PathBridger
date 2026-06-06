@@ -181,6 +181,40 @@ def _write_rollout_task_summary_csv(out_dir: Path, rows: list[dict[str, Any]]) -
     return path
 
 
+def _render_goal_reference_frames(
+    env_name: str,
+    frame_stack: int | None,
+    task_id: int,
+    s_g: np.ndarray,
+    n_frames: int,
+    *,
+    goal_rendered: np.ndarray | None = None,
+) -> np.ndarray:
+    """Render the task goal ``s_g`` as a constant reference panel (repeated ``n_frames`` times)."""
+    if n_frames < 1:
+        return np.zeros((0, 1, 1, 3), dtype=np.uint8)
+    if goal_rendered is not None:
+        frame = np.asarray(goal_rendered, dtype=np.uint8)
+        if frame.ndim != 3 or frame.shape[-1] != 3:
+            raise ValueError(f'goal_rendered must be (H,W,3), got {frame.shape}')
+        return np.stack([frame] * int(n_frames), axis=0)
+
+    sub_env, _, _ = make_env_and_datasets(env_name, frame_stack=frame_stack, render_mode='rgb_array')
+    sub_env.reset(options=dict(task_id=int(task_id), render_goal=False))
+    sync_env_state_from_compact_manip_obs(sub_env, np.asarray(s_g, dtype=np.float32))
+    try:
+        fr = env_render_rgb_u8(sub_env)
+        if fr is None:
+            raise RuntimeError('Failed to render goal reference frame.')
+        frame = np.asarray(fr, dtype=np.uint8)
+    finally:
+        try:
+            sub_env.close()
+        except Exception:
+            pass
+    return np.stack([frame] * int(n_frames), axis=0)
+
+
 def _render_subgoal_frames(
     env_name: str,
     frame_stack: int | None,
@@ -232,6 +266,9 @@ def _write_state_subgoal_mp4(
     fps: float,
     min_mp4_seconds: float,
     mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] | None = None,
+    s_g: np.ndarray | None = None,
+    goal_rendered: np.ndarray | None = None,
+    show_goal_panel: bool = False,
 ) -> int:
     """Write left=actual env, right=predicted-subgoal env MP4 and return frame count."""
     # ``run_chunked_episode`` records one initial frame plus one frame per executed env step.
@@ -258,21 +295,53 @@ def _write_state_subgoal_mp4(
     subgoal_frames = _render_subgoal_frames(
         env_name, frame_stack, task_id, subgoals[:n], n, mocap_snapshots=mocap_use
     )
+    goal_frames = None
+    if show_goal_panel and s_g is not None:
+        goal_frames = _render_goal_reference_frames(
+            env_name,
+            frame_stack,
+            task_id,
+            np.asarray(s_g, dtype=np.float32),
+            n,
+            goal_rendered=goal_rendered,
+        )
     composed = compose_state_subgoal_env_frames(
         step_frames,
         subgoal_frames,
+        goal_frames=goal_frames,
         output_scale=1.1,
         label_left='state',
         label_right='predicted subgoal',
+        label_goal='goal' if goal_frames is not None else None,
     )
     frames = _pad_rgb_frames_min_duration(composed, float(fps), float(min_mp4_seconds))
+    caption_lines = ['left: env state', 'middle: env @ predicted subgoal']
+    if goal_frames is not None:
+        caption_lines.append('right: task goal (target configuration)')
     write_rgb_array_mp4(
         frames,
         path,
         float(fps),
-        caption_lines=['left: env state', 'right: env @ predicted subgoal'],
+        caption_lines=caption_lines,
     )
     return int(frames.shape[0])
+
+
+def _reset_task_env(
+    env,
+    task_id: int,
+    *,
+    show_goal_panel: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=bool(show_goal_panel)))
+    if 'goal' not in info:
+        raise RuntimeError('reset did not set info["goal"]')
+    s0 = np.asarray(ob, dtype=np.float32).reshape(-1)
+    s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+    goal_rendered = info.get('goal_rendered') if show_goal_panel else None
+    if goal_rendered is not None:
+        goal_rendered = np.asarray(goal_rendered, dtype=np.uint8)
+    return s0, s_g, goal_rendered
 
 
 def _run_one_task(
@@ -288,11 +357,16 @@ def _run_one_task(
     actor_max_chunks: int,
     fps: float,
     min_mp4_seconds: float,
+    show_goal_panel: bool = True,
+    idm_horizon: int | None = None,
+    idm_only: bool = False,
 ) -> dict[str, Any]:
     configure_mujoco_gl(mujoco_gl)
     cfg, env_name = load_run_flags(run_dir)
     family = manip_play_family(env_name)
     em, idm_h, act_h = _load_eval_rollout_limits(run_dir)
+    if idm_horizon is not None and int(idm_horizon) > 0:
+        idm_h = int(idm_horizon)
 
     env, train_raw, _ = make_env_and_datasets(
         env_name,
@@ -304,11 +378,7 @@ def _run_one_task(
     if not (1 <= int(task_id) <= n_tasks):
         raise ValueError(f'task_id must be in [1, {n_tasks}]')
 
-    ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=False))
-    if 'goal' not in info:
-        raise RuntimeError('reset did not set info["goal"]')
-    s0 = np.asarray(ob, dtype=np.float32).reshape(-1)
-    s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+    s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
 
     dyn_dir = resolve_dynamics_checkpoint_dir(run_dir)
     ckpt_epoch = pick_epoch(int(ckpt_epoch), list_checkpoint_suffixes(dyn_dir))
@@ -330,9 +400,7 @@ def _run_one_task(
         if int(idm_max_chunks) >= 0
         else _chunk_budget_for_full_episode(env, int(idm_h), int(em))
     )
-    ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=False))
-    s0 = np.asarray(ob, dtype=np.float32).reshape(-1)
-    s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+    s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
     idm_subgoals_per_step: list[np.ndarray] = []
     idm_mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] = []
 
@@ -375,6 +443,9 @@ def _run_one_task(
             fps=float(fps),
             min_mp4_seconds=float(min_mp4_seconds),
             mocap_snapshots=idm_mocap_snapshots if idm_mocap_snapshots else None,
+            s_g=s_g,
+            goal_rendered=goal_rendered,
+            show_goal_panel=show_goal_panel,
         )
         idm_mp4_rel = _path_rel_to(out_dir, mp4_idm)
         print(
@@ -384,6 +455,26 @@ def _run_one_task(
         )
     else:
         print(f'[task {task_id}] IDM: no RGB frames states={idm_outcome.states.shape[0]}')
+
+    if idm_only:
+        return {
+            'task_id': int(task_id),
+            'env_name': str(env_name),
+            'family': str(family),
+            'checkpoint_epoch': int(ckpt_epoch),
+            'actor_checkpoint_epoch': int(act_ep),
+            'eval_max_chunks': int(em),
+            'idm_horizon': int(idm_h),
+            'actor_horizon': int(act_h),
+            'idm_chunks': int(idm_outcome.n_chunks),
+            'actor_chunks': 0,
+            'idm_env_success': int(bool(idm_outcome.ok_env)),
+            'actor_env_success': 0,
+            'idm_mp4': idm_mp4_rel,
+            'actor_mp4': '',
+            'idm_mp4_frames': idm_mp4_frames,
+            'actor_mp4_frames': 0,
+        }
 
     flags_path = run_dir / 'flags.json'
     actor_cfg = _load_actor_cfg(flags_path)
@@ -398,9 +489,7 @@ def _run_one_task(
         if int(actor_max_chunks) >= 0
         else _chunk_budget_for_full_episode(env, int(act_h), int(em))
     )
-    ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=False))
-    s0 = np.asarray(ob, dtype=np.float32).reshape(-1)
-    s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+    s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
     actor_subgoals_per_step: list[np.ndarray] = []
     actor_mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] = []
 
@@ -452,6 +541,9 @@ def _run_one_task(
             fps=float(fps),
             min_mp4_seconds=float(min_mp4_seconds),
             mocap_snapshots=actor_mocap_snapshots if actor_mocap_snapshots else None,
+            s_g=s_g,
+            goal_rendered=goal_rendered,
+            show_goal_panel=show_goal_panel,
         )
         actor_mp4_rel = _path_rel_to(out_dir, mp4_ac)
         print(
@@ -497,6 +589,17 @@ def main() -> None:
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--fps', type=float, default=30.0, help='MP4 playback FPS (default 30).')
     p.add_argument(
+        '--idm_horizon',
+        type=int,
+        default=-1,
+        help='IDM action-chunk length (default: flags critic action_chunk_horizon).',
+    )
+    p.add_argument(
+        '--idm_only',
+        action='store_true',
+        help='Run IDM rollout only (skip actor).',
+    )
+    p.add_argument(
         '--idm_max_chunks',
         type=int,
         default=-1,
@@ -513,6 +616,12 @@ def main() -> None:
         type=float,
         default=0.0,
         help='If >0, pad MP4 by repeating the last frame until at least this duration (0 = actual length only).',
+    )
+    p.add_argument(
+        '--show_goal_panel',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Append a third MP4 panel showing the task goal configuration (default: on).',
     )
     p.add_argument(
         '--no_exclusive_lock',
@@ -555,6 +664,9 @@ def main() -> None:
                     actor_max_chunks=int(args.actor_max_chunks),
                     fps=float(args.fps),
                     min_mp4_seconds=float(args.min_mp4_seconds),
+                    show_goal_panel=bool(args.show_goal_panel),
+                    idm_horizon=int(args.idm_horizon) if int(args.idm_horizon) > 0 else None,
+                    idm_only=bool(args.idm_only),
                 )
             )
         summary_path = _write_rollout_task_summary_csv(out_dir, rows)

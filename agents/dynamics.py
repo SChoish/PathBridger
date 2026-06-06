@@ -788,6 +788,50 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         """Backward-compatible alias for :meth:`predict_subgoal`."""
         return self.predict_subgoal(observations, high_actor_goals)
 
+    def infer_subgoal_for_eval(
+        self,
+        observations,
+        high_actor_goals,
+        critic_agent=None,
+        rng=None,
+    ):
+        """Eval-time subgoal endpoint selection (zero-noise mean or value BoN)."""
+        selection = str(self.config.get('subgoal_eval_selection', 'zero_noise')).lower()
+        if selection != 'best_of_n_value' or critic_agent is None:
+            return self.predict_subgoal(observations, high_actor_goals)
+
+        squeeze = observations.ndim == 1
+        if squeeze:
+            observations = observations[None]
+            high_actor_goals = high_actor_goals[None]
+        if rng is None:
+            rng = jax.random.PRNGKey(int(self.config.get('subgoal_eval_seed', 0)))
+
+        num_samples = max(1, int(self.config.get('subgoal_eval_num_samples', 4)))
+        include_zero = bool(self.config.get('subgoal_eval_include_zero_candidate', True))
+        candidates, _ = self.sample_subgoal_candidates(
+            observations,
+            high_actor_goals,
+            rng,
+            num_candidates=num_samples,
+            include_mean=include_zero,
+        )
+        scores = critic_agent.score_transitive_subgoals(
+            observations,
+            candidates,
+            high_actor_goals,
+            network_params=critic_agent.network.params,
+        )
+        best_idx = jnp.argmax(scores, axis=1)
+        best = jnp.take_along_axis(
+            candidates,
+            best_idx[:, None, None],
+            axis=1,
+        )[:, 0, :]
+        if squeeze:
+            best = best[0]
+        return best
+
     @jax.jit
     def infer_subgoal_mean(self, observations, high_actor_goals):
         """Distributional API: returns mu (== deterministic point in deterministic mode)."""
@@ -868,9 +912,10 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         sub_mode = _subgoal_mode(self.config)
         if sub_mode == 'flow':
             B, D = obs.shape
+            noise_scale = float(self.config.get('subgoal_flow_noise_scale', 1.0))
             n_rand = num_candidates - 1 if include_mean else num_candidates
             z0 = jnp.zeros((B, 1 if include_mean else 0, D), dtype=jnp.float32)
-            z_rand = jax.random.normal(rng, (B, n_rand, D), dtype=jnp.float32)
+            z_rand = jax.random.normal(rng, (B, n_rand, D), dtype=jnp.float32) * noise_scale
             z = jnp.concatenate([z0, z_rand], axis=1)
             flat_obs = jnp.repeat(obs[:, None, :], num_candidates, axis=1).reshape(B * num_candidates, D)
             flat_goals = jnp.repeat(goals[:, None, :], num_candidates, axis=1).reshape(B * num_candidates, D)
@@ -1519,8 +1564,13 @@ class DynamicsAgent(_DynamicsAgentCore):
             subgoal_adv_logit = self._subgoal_adv_logit_from_gap(subgoal_value_gap)
             subgoal_mse_weight = self._subgoal_mse_weight_from_gap(subgoal_value_gap)
             subgoal_weight = jax.lax.stop_gradient(subgoal_mse_weight)
-            weighted_subgoal_mse = subgoal_weight * subgoal_mse
-            loss_fm = jnp.mean(weighted_subgoal_mse)
+            energy_weighted = bool(self.config.get('subgoal_flow_energy_weighted', True))
+            if energy_weighted:
+                weighted_subgoal_mse = subgoal_weight * subgoal_mse
+                loss_fm = jnp.mean(weighted_subgoal_mse)
+            else:
+                weighted_subgoal_mse = subgoal_mse
+                loss_fm = jnp.mean(subgoal_mse)
 
             zero = jnp.asarray(0.0, dtype=jnp.float32)
             use_value_bonus = bool(self.config.get('subgoal_flow_use_value_bonus', False))
@@ -1561,6 +1611,9 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_flow_loss': loss_sub,
                 'phase1/subgoal_flow_fm_raw': jnp.mean(subgoal_mse),
                 'phase1/subgoal_flow_weighted_fm': loss_fm,
+                'phase1/subgoal_flow_energy_weighted': jnp.asarray(
+                    1.0 if energy_weighted else 0.0, dtype=jnp.float32,
+                ),
                 'phase1/subgoal_flow_weight_mean': jnp.mean(subgoal_mse_weight),
                 'phase1/subgoal_flow_weight_max': jnp.max(subgoal_mse_weight),
                 'phase1/subgoal_flow_value_gap_mean': jnp.mean(subgoal_value_gap),
@@ -2094,10 +2147,16 @@ def _get_common_config():
             subgoal_use_mean_for_actor_goal=True,
             subgoal_flow_steps=8,
             subgoal_flow_t_min=1e-4,
+            subgoal_flow_noise_scale=1.0,
             subgoal_flow_time_embed_dim=64,
             subgoal_flow_use_time_embedding=True,
             subgoal_flow_velocity_reg=0.0,
+            subgoal_flow_energy_weighted=True,
             subgoal_flow_use_value_bonus=False,
+            subgoal_eval_selection='zero_noise',
+            subgoal_eval_num_samples=4,
+            subgoal_eval_include_zero_candidate=True,
+            subgoal_eval_seed=0,
             discount=0.99,
             subgoal_steps=25,
             # When False: PathHGCDataset overrides high_actor_targets with the

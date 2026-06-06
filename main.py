@@ -970,6 +970,7 @@ def _evaluate_env_tasks(
     actor_config: Any,
     critic_config: Any,
     *,
+    critic_agent: Any | None = None,
     task_ids: tuple[int, ...],
     episodes_per_task: int,
     max_chunks: int,
@@ -1002,19 +1003,37 @@ def _evaluate_env_tasks(
 
     actor_video_by_task: dict[int, np.ndarray] = {}
     idm_video_by_task: dict[int, np.ndarray] = {}
+    eval_selection = str(dynamics_agent.config.get('subgoal_eval_selection', 'zero_noise')).lower()
+    use_eval_bon = eval_selection == 'best_of_n_value' and critic_agent is not None
+    eval_seed_base = int(dynamics_agent.config.get('subgoal_eval_seed', 0))
 
-    def _actor_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+    def _eval_subgoal(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
+        if use_eval_bon:
+            rng = jax.random.PRNGKey(eval_seed_base + int(ep_ix))
+            pred = dynamics_agent.infer_subgoal_for_eval(
+                jnp.asarray(obs, dtype=jnp.float32),
+                jnp.asarray(goal, dtype=jnp.float32),
+                critic_agent=critic_agent,
+                rng=rng,
+            )
+            return np.asarray(pred, dtype=np.float32).reshape(-1)
+        return np.asarray(
+            dynamics_agent.infer_subgoal(obs, goal),
+            dtype=np.float32,
+        ).reshape(-1)
+
+    def _actor_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
-            pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix)
         return np.asarray(actor_agent.sample_actions(obs, pred), dtype=np.float32).reshape(actor_horizon, -1)
 
-    def _idm_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+    def _idm_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
-            pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix)
         return _idm_action_chunk(dynamics_agent, obs, pred, idm_horizon)
 
     for task_id in task_ids:
@@ -1044,7 +1063,7 @@ def _evaluate_env_tasks(
                 low,
                 high,
                 max_chunks,
-                sample_action_chunk=_actor_chunk,
+                sample_action_chunk=lambda o, g: _actor_chunk(o, g, ep_ix=ep_ix),
                 render_buf=actor_buf if record_wb else None,
                 goal_frame=goal_frame,
                 should_render=bool(record_wb),
@@ -1072,7 +1091,7 @@ def _evaluate_env_tasks(
                 low,
                 high,
                 max_chunks,
-                sample_action_chunk=_idm_chunk,
+                sample_action_chunk=lambda o, g: _idm_chunk(o, g, ep_ix=ep_ix),
                 render_buf=idm_buf if record_wb else None,
                 goal_frame=goal_frame,
                 should_render=bool(record_wb),
@@ -1497,6 +1516,7 @@ def main(_):
                         actor_agent,
                         actor_config,
                         critic_config,
+                        critic_agent=critic_agent,
                         task_ids=eval_task_ids,
                         episodes_per_task=eval_episode_count,
                         max_chunks=eval_max_chunks,
