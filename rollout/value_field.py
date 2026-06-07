@@ -21,6 +21,33 @@ from utils.run_io import (
 )
 
 
+def log_gamma(
+    v: np.ndarray,
+    discount: float,
+    *,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """``log_gamma(v) = log(v) / log(discount)`` for probabilities in ``(0, 1]``."""
+    clip_eps = float(eps)
+    disc = float(discount)
+    if not (0.0 < disc < 1.0):
+        raise ValueError(f'discount must be in (0, 1), got {disc}')
+    vv = np.clip(np.asarray(v, dtype=np.float32), clip_eps, 1.0)
+    return np.log(vv) / np.log(np.float32(disc))
+
+
+def _mesh_vmin_vmax(flat: np.ndarray) -> tuple[float, float]:
+    if flat.size == 0:
+        return 0.0, 1.0
+    lo = float(np.min(flat))
+    hi = float(np.max(flat))
+    span = hi - lo
+    if span < 1e-5:
+        return lo, hi if hi > lo else lo + 1.0
+    pad = max(0.02 * span, 1e-4)
+    return lo - pad, hi + pad
+
+
 def load_critic_for_run(
     run_dir: Path,
     critic_epoch: int,
@@ -74,8 +101,15 @@ def value_mesh_for_xy(
     *,
     grid_n: int = 56,
     batch_size: int = 4096,
+    value_scale: str = 'log_gamma',
+    discount: float = 0.99,
+    log_eps: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
-    """Return ``(XX, YY, ZZ, vmin, vmax)`` for ``pcolormesh`` (``ZZ`` matches ``XX``/``YY`` shape)."""
+    """Return ``(XX, YY, ZZ, vmin, vmax)`` for ``pcolormesh`` (``ZZ`` matches ``XX``/``YY`` shape).
+
+    ``value_scale='linear'``: ``ZZ = sigmoid(V(s,g))`` in ``[0, 1]``.
+    ``value_scale='log_gamma'``: ``ZZ = log(V) / log(discount)`` (TRL ``log_γ`` distance).
+    """
     if grid_n < 4:
         raise ValueError('grid_n must be >= 4')
     xs = np.linspace(float(xlim[0]), float(xlim[1]), int(grid_n), dtype=np.float32)
@@ -105,13 +139,15 @@ def value_mesh_for_xy(
         outs.append(np.asarray(jax.device_get(_v_batch(ob, gb)), dtype=np.float32))
     zz_flat = np.concatenate(outs, axis=0)
     ZZ = zz_flat.reshape(XX.shape)
+    scale = str(value_scale).strip().lower()
+    if scale == 'log_gamma':
+        ZZ = log_gamma(ZZ, float(discount), eps=float(log_eps))
+    elif scale != 'linear':
+        raise ValueError(f'Unknown value_scale {value_scale!r}; expected linear or log_gamma.')
     flat = ZZ[np.isfinite(ZZ)]
     if flat.size == 0:
         vmin, vmax = 0.0, 1.0
-    else:
-        # Sigmoid V(s,g) lies in ~[0, 1]. Tight percentile windows made vmin/vmax almost equal
-        # so the colormap used only a sliver of ``magma``. Prefer data min/max with padding; if
-        # the field is still almost flat, use the full unit interval so hues span the whole map.
+    elif scale == 'linear':
         lo = float(np.min(flat))
         hi = float(np.max(flat))
         span = hi - lo
@@ -123,4 +159,6 @@ def value_mesh_for_xy(
             vmax = min(1.0, hi + pad)
             if vmax - vmin < 0.12:
                 vmin, vmax = 0.0, 1.0
+    else:
+        vmin, vmax = _mesh_vmin_vmax(flat)
     return XX, YY, ZZ, vmin, vmax

@@ -11,6 +11,52 @@ import numpy as np
 from rollout.maze_navigator import MazeNavigatorMap
 
 
+def _heatmap_cmap(value_heatmap_scale: str) -> str:
+    scale = str(value_heatmap_scale).strip().lower()
+    if scale == 'log_gamma':
+        # ``log_γ V`` is small near the goal; ``magma_r`` maps low values to warm colors.
+        return 'magma_r'
+    return 'magma'
+
+
+def draw_value_heatmap(
+    ax,
+    value_heatmap: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    value_heatmap_vmin: float | None,
+    value_heatmap_vmax: float | None,
+    *,
+    value_heatmap_alpha: float = 0.5,
+    value_heatmap_scale: str = 'log_gamma',
+    cmap: str | None = None,
+) -> None:
+    """Draw goal-conditioned value field on ``ax`` with a fixed linear colormap scale."""
+    if value_heatmap is None:
+        return
+    XX, YY, ZZ = value_heatmap
+    zz_plot = np.asarray(ZZ, dtype=np.float32)
+    finite = zz_plot[np.isfinite(zz_plot)]
+    if finite.size == 0:
+        return
+    lo = float(value_heatmap_vmin) if value_heatmap_vmin is not None else float(np.min(finite))
+    hi = float(value_heatmap_vmax) if value_heatmap_vmax is not None else float(np.max(finite))
+    if hi - lo < 1e-6:
+        lo, hi = 0.0, 1.0
+    heat_norm = mcolors.Normalize(vmin=lo, vmax=hi)
+    cmap_name = str(cmap) if cmap is not None else _heatmap_cmap(value_heatmap_scale)
+    mesh = ax.pcolormesh(
+        XX,
+        YY,
+        zz_plot,
+        shading='auto',
+        cmap=cmap_name,
+        alpha=float(value_heatmap_alpha),
+        norm=heat_norm,
+        zorder=1,
+        rasterized=True,
+    )
+    return mesh
+
+
 def axis_limits(
     traj: np.ndarray,
     roll: np.ndarray,
@@ -132,7 +178,18 @@ def _draw_rollout_step_frame(
     title: str,
     navigator: MazeNavigatorMap | None = None,
     chunk_hat_stride: int | None = None,
+    value_heatmap: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    value_heatmap_vmin: float | None = None,
+    value_heatmap_vmax: float | None = None,
+    value_heatmap_scale: str = 'log_gamma',
 ) -> None:
+    draw_value_heatmap(
+        ax,
+        value_heatmap,
+        value_heatmap_vmin,
+        value_heatmap_vmax,
+        value_heatmap_scale=value_heatmap_scale,
+    )
     plot_maze_cell_tiles(ax, navigator, d0, d1)
     draw_dataset_background(ax, traj, d0, d1)
     n_trans = int(roll.shape[0]) - 1
@@ -277,6 +334,7 @@ def overlay_rgb_frames_obs2d_panel(
     value_heatmap_vmin: float | None = None,
     value_heatmap_vmax: float | None = None,
     value_heatmap_alpha: float = 0.5,
+    value_heatmap_scale: str = 'log_gamma',
 ) -> np.ndarray:
     """Compose env frames with a right-side XY panel.
 
@@ -286,9 +344,9 @@ def overlay_rgb_frames_obs2d_panel(
 
     Pass ``navigator`` from ``--navigator snap`` if maze tiles should appear on the panel.
 
-    Optional ``value_heatmap=(XX, YY, ZZ)`` draws a goal-conditioned scalar value field (e.g.
-    ``sigmoid(V)``) under trajectories using ``pcolormesh`` (same ``xlim``/``ylim`` as the panel).
-    The colormap uses log normalization so low-value regions remain visually separable.
+    Optional ``value_heatmap=(XX, YY, ZZ)`` draws a goal-conditioned scalar value field under
+    trajectories using ``pcolormesh`` (same ``xlim``/``ylim`` as the panel). ``ZZ`` is either
+    ``sigmoid(V)`` (``value_heatmap_scale='linear'``) or ``log_γ V = log(V)/log(discount)``.
     ``output_scale`` upsamples the final combined frame slightly for a larger MP4.
     """
     if frames.ndim != 4 or frames.shape[-1] != 3:
@@ -315,34 +373,14 @@ def overlay_rgb_frames_obs2d_panel(
         fig, ax = plt.subplots(figsize=(pw / float(dpi), H / float(dpi)), dpi=int(dpi))
         fig.patch.set_facecolor('white')
         ax.set_facecolor('white')
-        if value_heatmap is not None:
-            XX, YY, ZZ = value_heatmap
-            zz_plot = np.asarray(ZZ, dtype=np.float32)
-            finite = zz_plot[np.isfinite(zz_plot)]
-            heat_norm = None
-            if finite.size > 0:
-                pos = finite[finite > 0.0]
-                if pos.size > 0:
-                    log_floor = max(float(np.min(pos)), 1e-6)
-                    if value_heatmap_vmin is not None:
-                        log_floor = max(log_floor, float(value_heatmap_vmin), 1e-6)
-                    log_ceil = float(np.max(finite))
-                    if value_heatmap_vmax is not None:
-                        log_ceil = min(log_ceil, float(value_heatmap_vmax))
-                    log_ceil = max(log_ceil, log_floor * 1.001)
-                    zz_plot = np.maximum(zz_plot, log_floor)
-                    heat_norm = mcolors.LogNorm(vmin=log_floor, vmax=log_ceil)
-            ax.pcolormesh(
-                XX,
-                YY,
-                zz_plot,
-                shading='auto',
-                cmap='magma',
-                alpha=float(value_heatmap_alpha),
-                norm=heat_norm,
-                zorder=1,
-                rasterized=True,
-            )
+        draw_value_heatmap(
+            ax,
+            value_heatmap,
+            value_heatmap_vmin,
+            value_heatmap_vmax,
+            value_heatmap_alpha=value_heatmap_alpha,
+            value_heatmap_scale=value_heatmap_scale,
+        )
         plot_maze_cell_tiles(ax, nav_panel, d0, d1)
         cur = roll[min(int(t), int(roll.shape[0]) - 1)]
         plan_seg = None
@@ -672,6 +710,10 @@ def write_rollout_mp4(
     chunk_hat_stride: int | None = None,
     *,
     env_name: str | None = None,
+    value_heatmap: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    value_heatmap_vmin: float | None = None,
+    value_heatmap_vmax: float | None = None,
+    value_heatmap_scale: str = 'log_gamma',
 ) -> None:
     from matplotlib.animation import FFMpegWriter
 
@@ -705,6 +747,10 @@ def write_rollout_mp4(
                 title,
                 navigator=nav,
                 chunk_hat_stride=chunk_hat_stride,
+                value_heatmap=value_heatmap,
+                value_heatmap_vmin=value_heatmap_vmin,
+                value_heatmap_vmax=value_heatmap_vmax,
+                value_heatmap_scale=value_heatmap_scale,
             )
             writer.grab_frame()
         else:
@@ -737,6 +783,10 @@ def write_rollout_mp4(
                     title,
                     navigator=nav,
                     chunk_hat_stride=chunk_hat_stride,
+                    value_heatmap=value_heatmap,
+                    value_heatmap_vmin=value_heatmap_vmin,
+                    value_heatmap_vmax=value_heatmap_vmax,
+                    value_heatmap_scale=value_heatmap_scale,
                 )
                 writer.grab_frame()
 

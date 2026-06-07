@@ -188,6 +188,13 @@ def main() -> None:
         help='Overlay scalar value V(s, goal) on the right XY panel (checkpoints/critic/).',
     )
     p.add_argument('--value_grid_n', type=int, default=56)
+    p.add_argument(
+        '--value_heatmap_scale',
+        type=str,
+        choices=('linear', 'log_gamma'),
+        default='log_gamma',
+        help='Heatmap scalar: linear sigmoid(V) or log_γ V = log(V)/log(discount).',
+    )
     p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = dynamics epoch used.')
     args = p.parse_args()
 
@@ -325,6 +332,9 @@ def main() -> None:
             xlim,
             ylim,
             grid_n=int(args.value_grid_n),
+            value_scale=str(args.value_heatmap_scale),
+            discount=float(dynamics_cfg.get('discount', 0.99)),
+            log_eps=float(dynamics_cfg.get('subgoal_value_log_eps', 1e-6)),
         )
         heat_mesh = (XX, YY, ZZ)
 
@@ -386,6 +396,7 @@ def main() -> None:
                     value_heatmap=heat_mesh,
                     value_heatmap_vmin=heat_vmin,
                     value_heatmap_vmax=heat_vmax,
+                    value_heatmap_scale=str(args.value_heatmap_scale),
                 )
                 write_rgb_array_mp4(frames, mp4_out, float(args.fps))
             print(f'Wrote MP4 {mp4_out.resolve()}')

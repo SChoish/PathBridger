@@ -100,13 +100,13 @@ def run_chunked_episode(
             truncated = bool(trunc)
             success_flag = bool(info.get('success', False)) if isinstance(info, dict) else False
             cum_env = cum_env or success_flag
+            states.append(obs.copy())
             if record_rgb:
                 _maybe_append_rgb(env, rgb_frames)
             if post_step_hook is not None:
                 post_step_hook(env)
             if success_flag:
                 break
-        states.append(obs.copy())
         n_chunks += 1
 
     rgb = np.stack(rgb_frames, axis=0) if rgb_frames else None

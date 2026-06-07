@@ -56,7 +56,6 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import numpy as np
 
 from agents.dynamics import DynamicsAgent
@@ -66,6 +65,7 @@ from rollout.env import format_maze_navigator_log, load_maze_navigator_snap, mak
 from rollout.plot import (
     axis_limits,
     draw_dataset_background,
+    draw_value_heatmap,
     maze_navigator_for_xy_plot,
     plot_maze_cell_tiles,
     write_rollout_mp4,
@@ -110,45 +110,6 @@ def _segment_alignment_errors(
         'final_l2_full': float(l2_full[-1]),
         'final_l2_xy': float(l2_xy[-1]),
     }
-
-
-def _draw_value_heatmap(
-    ax,
-    value_heatmap: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
-    value_heatmap_vmin: float | None,
-    value_heatmap_vmax: float | None,
-    *,
-    value_heatmap_alpha: float = 0.5,
-) -> None:
-    if value_heatmap is None:
-        return
-    XX, YY, ZZ = value_heatmap
-    zz_plot = np.asarray(ZZ, dtype=np.float32)
-    finite = zz_plot[np.isfinite(zz_plot)]
-    heat_norm = None
-    if finite.size > 0:
-        pos = finite[finite > 0.0]
-        if pos.size > 0:
-            log_floor = max(float(np.min(pos)), 1e-6)
-            if value_heatmap_vmin is not None:
-                log_floor = max(log_floor, float(value_heatmap_vmin), 1e-6)
-            log_ceil = float(np.max(finite))
-            if value_heatmap_vmax is not None:
-                log_ceil = min(log_ceil, float(value_heatmap_vmax))
-            log_ceil = max(log_ceil, log_floor * 1.001)
-            zz_plot = np.maximum(zz_plot, log_floor)
-            heat_norm = mcolors.LogNorm(vmin=log_floor, vmax=log_ceil)
-    ax.pcolormesh(
-        XX,
-        YY,
-        zz_plot,
-        shading='auto',
-        cmap='magma',
-        alpha=float(value_heatmap_alpha),
-        norm=heat_norm,
-        zorder=1,
-        rasterized=True,
-    )
 
 
 def bridge_trajectory(
@@ -349,6 +310,13 @@ def main():
         help='Overlay scalar value V(s, goal) on the plot.',
     )
     p.add_argument('--value_grid_n', type=int, default=56)
+    p.add_argument(
+        '--value_heatmap_scale',
+        type=str,
+        choices=('linear', 'log_gamma'),
+        default='log_gamma',
+        help='Heatmap scalar: linear sigmoid(V) or log_γ V = log(V)/log(discount).',
+    )
     p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = dynamics epoch used.')
     p.add_argument(
         '--navigator_clamp',
@@ -653,6 +621,9 @@ def main():
             xlim_heat,
             ylim_heat,
             grid_n=int(args.value_grid_n),
+            value_scale=str(args.value_heatmap_scale),
+            discount=float(cfg.get('discount', 0.99)),
+            log_eps=float(cfg.get('subgoal_value_log_eps', 1e-6)),
         )
         heat_mesh = (XX, YY, ZZ)
 
@@ -666,7 +637,9 @@ def main():
         )
         xlim, ylim = axis_limits(traj, roll_union, hats_union, d0, d1, s_g, s0, navigator=plot_nav, seg=seg)
         fig, ax = plt.subplots(figsize=(8, 6.5))
-        _draw_value_heatmap(ax, heat_mesh, heat_vmin, heat_vmax)
+        draw_value_heatmap(
+            ax, heat_mesh, heat_vmin, heat_vmax, value_heatmap_scale=str(args.value_heatmap_scale)
+        )
         plot_maze_cell_tiles(ax, plot_nav, d0, d1)
         draw_dataset_background(ax, traj, d0, d1)
         colors = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
@@ -795,7 +768,9 @@ def main():
                 )
 
             fig, ax = plt.subplots(figsize=(7, 6))
-            _draw_value_heatmap(ax, heat_mesh, heat_vmin, heat_vmax)
+            draw_value_heatmap(
+                ax, heat_mesh, heat_vmin, heat_vmax, value_heatmap_scale=str(args.value_heatmap_scale)
+            )
             plot_maze_cell_tiles(ax, plot_nav, d0, d1)
             draw_dataset_background(ax, traj, d0, d1)
             if args.segment_compare and seg is not None:
@@ -956,6 +931,10 @@ def main():
                         navigator=plot_nav,
                         seg=seg,
                         chunk_hat_stride=int(iter_state_chunk_h),
+                        value_heatmap=heat_mesh,
+                        value_heatmap_vmin=heat_vmin,
+                        value_heatmap_vmax=heat_vmax,
+                        value_heatmap_scale=str(args.value_heatmap_scale),
                     )
                     print(f'Wrote MP4 {mp4_out.resolve()}')
                 except Exception as e:
