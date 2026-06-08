@@ -637,12 +637,20 @@ class CriticAgent(flax.struct.PyTreeNode):
             'qz/target_prod_mean': target_prod.mean(),
             'qz/valid_fraction': jnp.mean(qz_valid),
             'qz/loss_tri': jnp.asarray(0.0, dtype=jnp.float32),
+            'qz/tri_valid_fraction': jnp.asarray(0.0, dtype=jnp.float32),
+            'qz/tri_same_subgoal_fraction': jnp.asarray(0.0, dtype=jnp.float32),
+            'qz/target_tri_mean': jnp.asarray(0.0, dtype=jnp.float32),
         }
 
         if bool(self.config.get('qz_use_transitive_backup', False)) and 'qz_tri_split_observations' in batch:
             tau_qz = float(self.config.get('qz_tau', 0.7))
             split_obs = batch['qz_tri_split_observations']  # s_l
             tri_valid = jnp.asarray(batch['qz_tri_valid_mask'], dtype=jnp.float32) * valid_mask
+            tri_split_off = jnp.asarray(batch['qz_tri_split_offsets'], dtype=jnp.float32)  # l - i
+            tri_right_off = jnp.asarray(batch['qz_tri_right_offsets'], dtype=jnp.float32)  # j - l
+
+            # Left leg: target Q_Z(s_i, z; s_l). When l == k (split == subgoal),
+            # Q_Z(s_i, z; z) is degenerate; replace it with the bar-V leg V(s_i, z).
             qz_left = jnp.clip(
                 self.aggregate_ensemble_q(
                     jax.nn.sigmoid(self.network.select('target_qz_critic')(observations, qz_subgoals, split_obs))
@@ -650,15 +658,40 @@ class CriticAgent(flax.struct.PyTreeNode):
                 eps,
                 1.0,
             )
+            same_as_subgoal = jnp.abs(tri_split_off - sub_off) <= 1e-6
+            qz_left = jnp.where(same_as_subgoal, v_left, qz_left)
+
+            # Right leg: bar-V(s_l, g) with short-leg gamma^offset replacement.
             v_tri_right = jnp.clip(
                 jax.nn.sigmoid(self.network.select('target_value')(split_obs, qz_goals)), eps, 1.0
             )
+            v_tri_right = jnp.where(tri_right_off <= base_h, jnp.power(discount, tri_right_off), v_tri_right)
+
             target_tri = jax.lax.stop_gradient(jnp.clip(qz_left * v_tri_right, eps, 1.0))
-            loss_tri_per = _bce_expectile_loss(qz_logits, target_tri[None, :], tau_qz)
-            loss_tri = self._weighted_mean(jnp.mean(loss_tri_per, axis=0), tri_valid)
+            loss_tri_per = jnp.mean(_bce_expectile_loss(qz_logits, target_tri[None, :], tau_qz), axis=0)
+
+            # Optional TRL-style estimated-distance reweighting on the QZ prediction.
+            if bool(self.config.get('qz_transitive_reweight', False)):
+                power = float(self.config.get('qz_distance_weight_power', 1.0))
+                clip_min = float(self.config.get('qz_distance_weight_clip_min', 0.05))
+                clip_max = float(self.config.get('qz_distance_weight_clip_max', 1.0))
+                qz_prob = jax.lax.stop_gradient(jnp.clip(qz_pred, eps, 1.0))
+                d_est = jnp.log(qz_prob) / jnp.log(jnp.asarray(discount, dtype=jnp.float32))
+                d_est = jnp.maximum(d_est, 0.0)
+                tri_w = 1.0 / jnp.power(1.0 + d_est, power)
+                tri_w = jax.lax.stop_gradient(jnp.clip(tri_w, clip_min, clip_max))
+                tri_weights = tri_valid * tri_w
+            else:
+                tri_weights = tri_valid
+
+            loss_tri = self._weighted_mean(loss_tri_per, tri_weights)
             total = total + lambda_tri * loss_tri
             info['qz/loss_tri'] = loss_tri
             info['qz/target_tri_mean'] = target_tri.mean()
+            info['qz/tri_valid_fraction'] = jnp.mean(tri_valid)
+            info['qz/tri_same_subgoal_fraction'] = self._weighted_mean(
+                same_as_subgoal.astype(jnp.float32), tri_valid
+            )
 
         info['qz/loss_total'] = total
         return total, info

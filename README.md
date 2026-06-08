@@ -168,7 +168,9 @@ TRL semantics (current implementation):
 - `Q(s, A_h, z)` is a local action-chunk critic bootstrapped from `target_V(s+H, z)`.
 - `direct_chunk_trl` is not an alias for this mode; it should be treated as a separate legacy ablation if restored.
 - Subgoal bonus defaults to ``V(s,z) * V(z,g)`` for TRL (`transitive_product`).
-- Proposal selection and SPI both use local Q only.
+- `actor_type='action_chunk'`일 때는 proposal selection과 SPI 모두 local action critic `Q(s,A_h,z)`를 씁니다.
+- `actor_type='state_subgoal'`일 때는 SPI가 상태 부분목표 `z`를 state-space energy `E(s,z,g)`와 dynamics 제안에 대한 Wasserstein anchor로 최적화합니다.
+- `actor_type='state_proposal'`일 때는 학습 actor가 없으며, 동일한 state-space energy로 dynamics 제안을 비모수적으로 선택합니다.
 - For initial TRL experiments, prefer `goal_representation: full` so triangle consistency is learned in the same state-goal space.
 
 #### TRL distance reweight λ (appendix Table 5)

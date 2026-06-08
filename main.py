@@ -1214,6 +1214,12 @@ def main(_):
         render_mode='rgb_array',
     )
     _attach_state_normalization_stats(dynamics_config, train_plain)
+    # Mirror dynamics state-normalization stats into the actor config so the
+    # state-SPI Wasserstein metric_space='normalized' can use real stats
+    # (otherwise that mode fails loudly in state_actor_loss).
+    if 'state_mean' in actor_config and dynamics_config.get('state_mean', ()):
+        actor_config['state_mean'] = tuple(float(x) for x in dynamics_config.get('state_mean', ()))
+        actor_config['state_std'] = tuple(float(x) for x in dynamics_config.get('state_std', ()))
     obs_dim_env = int(np.prod(env.observation_space.shape))
     phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
     if not phi_idxs:

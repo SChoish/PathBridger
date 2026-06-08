@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
+import pytest
 
 import jax.numpy as jnp
 
@@ -313,6 +314,102 @@ def test_state_actor_execution_through_bridge_and_idm():
     )
     assert chunk.shape == (1, horizon, ACTION_DIM)
     assert np.all(np.isfinite(chunk))
+
+
+def _make_critic_with_batch(use_qz: bool = False, qz_tri: bool = False):
+    cfg = get_critic_config()
+    cfg.critic_type = 'trl'
+    cfg.algorithm = 'trl'
+    cfg.goal_representation = 'full'
+    cfg.action_chunk_horizon = 4
+    cfg.full_chunk_horizon = 8
+    cfg.value_base_horizon = 4
+    cfg.value_hidden_dims = (32, 32)
+    cfg.action_dim = ACTION_DIM
+    cfg.use_qz_critic = use_qz
+    cfg.qz_use_transitive_backup = qz_tri
+    if qz_tri:
+        cfg.qz_transitive_reweight = True
+        cfg.lambda_qz_tri = 1.0
+    batch = CriticSequenceDataset(_dummy_dataset(), cfg).sample(BATCH)
+    critic = CriticAgent.create(
+        seed=0,
+        ex_observations=batch['observations'],
+        ex_full_chunk_actions=None,
+        ex_action_chunk_actions=batch['action_chunk_actions'],
+        config=cfg,
+        ex_goals=batch['value_goals'],
+    )
+    return critic, batch
+
+
+def test_qz_loss_update_finite():
+    # Test 4 (QZ loss): one critic update with qz fields -> finite qz/loss_prod.
+    critic, batch = _make_critic_with_batch(use_qz=True)
+    _, info = critic.update(batch)
+    assert np.isfinite(float(info['qz/loss_prod']))
+    assert np.isfinite(float(info['qz/loss_total']))
+    assert np.isfinite(float(info['total_loss']))
+
+
+def test_qz_transitive_backup_runs_and_logs():
+    critic, batch = _make_critic_with_batch(use_qz=True, qz_tri=True)
+    assert 'qz_tri_split_observations' in batch
+    assert 'qz_tri_split_offsets' in batch
+    assert 'qz_tri_right_offsets' in batch
+    _, info = critic.update(batch)
+    assert np.isfinite(float(info['qz/loss_tri']))
+    assert np.isfinite(float(info['qz/tri_valid_fraction']))
+    assert np.isfinite(float(info['qz/tri_same_subgoal_fraction']))
+    assert np.isfinite(float(info['qz/target_tri_mean']))
+
+
+def test_sample_actions_raises_for_state_subgoal():
+    # Rollout must not call sample_actions for state actors.
+    actor = _make_state_actor()
+    with pytest.raises(ValueError):
+        actor.sample_actions(np.zeros((STATE_DIM,), dtype=np.float32), np.zeros((STATE_DIM,), dtype=np.float32))
+
+
+def test_state_proposal_sample_subgoals_raises():
+    cfg = get_actor_config()
+    cfg.actor_type = 'state_proposal'
+    cfg.actor_chunk_horizon = 2
+    cfg.action_dim = ACTION_DIM
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    actor = ActorAgent.create(seed=0, ex_observations=ex_obs, config=cfg, ex_goals=ex_obs)
+    with pytest.raises(ValueError):
+        actor.sample_subgoals(np.zeros((STATE_DIM,), dtype=np.float32), np.zeros((STATE_DIM,), dtype=np.float32))
+
+
+def test_normalized_metric_requires_stats():
+    cfg = get_actor_config()
+    cfg.actor_type = 'state_subgoal'
+    cfg.actor_chunk_horizon = 2
+    cfg.action_dim = ACTION_DIM
+    cfg.spi_tau = 5.0
+    cfg.state_spi_metric_space = 'normalized'  # no state_mean/std provided
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    actor = ActorAgent.create(seed=0, ex_observations=ex_obs, config=cfg, ex_goals=ex_obs)
+    critic = _make_critic('v_product')
+    with pytest.raises(ValueError):
+        actor.update(_state_batch(), critic)
+
+
+def test_normalized_metric_uses_stats_when_present():
+    cfg = get_actor_config()
+    cfg.actor_type = 'state_subgoal'
+    cfg.actor_chunk_horizon = 2
+    cfg.action_dim = ACTION_DIM
+    cfg.spi_tau = 5.0
+    cfg.state_spi_metric_space = 'normalized'
+    cfg.state_mean = tuple(0.0 for _ in range(STATE_DIM))
+    cfg.state_std = tuple(1.0 for _ in range(STATE_DIM))
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    actor = ActorAgent.create(seed=0, ex_observations=ex_obs, config=cfg, ex_goals=ex_obs)
+    critic = _make_critic('v_product')
+    _, info = actor.update(_state_batch(), critic)
+    assert np.isfinite(float(info['state_spi/actor_loss']))
 
 
 def test_qz_dataset_fields_absent_when_disabled():

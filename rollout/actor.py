@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
@@ -39,6 +40,7 @@ from rollout.env import (
     sync_env_state_from_compact_manip_obs,
     sync_env_state_from_obs_vector_aligned,
 )
+from rollout.common import align_action_to_env
 from rollout.episode_runner import make_actor_chunk_fn, run_chunked_episode
 from rollout.plot import (
     axis_limits,
@@ -84,12 +86,26 @@ def rollout_dynamics_actor_env(
     actor_horizon: int,
     env_action_dim: int,
     record_env_rgb: bool = True,
+    actor_type: str = 'action_chunk',
+    critic_agent: Any = None,
+    energy_type: str = 'v_product',
+    plan_candidates: int = 1,
+    plan_noise_scale: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray]:
     """Chunked dynamics-subgoal + actor rollout via the shared runner.
 
     Success is decided **only** by the env (``info['success']``); no user-defined
     tolerance is applied here.
+
+    ``actor_type`` selects the chunk-sampling policy:
+
+    - ``action_chunk``: dynamics subgoal + ``actor.sample_actions`` (unchanged).
+    - ``state_subgoal``: ``z = actor.sample_subgoals(obs, goal)`` then bridge + IDM
+      via ``main._idm_action_chunk``.
+    - ``state_proposal``: no learned actor; pick the lowest state-space-energy
+      dynamics proposal (requires ``critic_agent``).
     """
+    actor_type = str(actor_type).lower()
     if is_manipspace_env(env):
         # ManipSpace uses compact observations, not qpos||qvel. For task-mode rollouts
         # the caller has already reset the env to s0; for offline traj rollouts we can
@@ -102,28 +118,103 @@ def rollout_dynamics_actor_env(
         cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
     goal = np.asarray(s_g, dtype=np.float32).reshape(-1)
 
-    base_chunk_fn = make_actor_chunk_fn(
-        dynamics_agent,
-        actor_agent,
-        int(actor_horizon),
-        int(env_action_dim),
-    )
     hats_per_step: list[np.ndarray] = []
 
-    def _chunk(obs: np.ndarray, g: np.ndarray) -> np.ndarray:
-        import jax
-        import jax.numpy as jnp
+    if actor_type == 'action_chunk':
+        base_chunk_fn = make_actor_chunk_fn(
+            dynamics_agent,
+            actor_agent,
+            int(actor_horizon),
+            int(env_action_dim),
+        )
 
-        pred = np.asarray(
-            jax.device_get(
-                dynamics_agent.infer_subgoal(jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(g, dtype=jnp.float32))
-            ),
-            dtype=np.float32,
-        ).reshape(-1)
-        chunk = base_chunk_fn(obs, g)
-        for _ in range(int(chunk.shape[0])):
-            hats_per_step.append(pred.copy())
-        return chunk
+        def _chunk(obs: np.ndarray, g: np.ndarray) -> np.ndarray:
+            import jax
+            import jax.numpy as jnp
+
+            pred = np.asarray(
+                jax.device_get(
+                    dynamics_agent.infer_subgoal(
+                        jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(g, dtype=jnp.float32)
+                    )
+                ),
+                dtype=np.float32,
+            ).reshape(-1)
+            chunk = base_chunk_fn(obs, g)
+            for _ in range(int(chunk.shape[0])):
+                hats_per_step.append(pred.copy())
+            return chunk
+
+    elif actor_type == 'state_subgoal':
+        from main import _idm_action_chunk
+
+        def _chunk(obs: np.ndarray, g: np.ndarray) -> np.ndarray:
+            import jax
+            import jax.numpy as jnp
+
+            z = np.asarray(
+                jax.device_get(
+                    actor_agent.sample_subgoals(
+                        jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(g, dtype=jnp.float32)
+                    )
+                ),
+                dtype=np.float32,
+            ).reshape(-1)
+            chunk = np.asarray(
+                _idm_action_chunk(dynamics_agent, obs, z, int(actor_horizon)), dtype=np.float32
+            ).reshape(int(actor_horizon), -1)
+            if not chunk.flags.writeable:
+                chunk = chunk.copy()
+            for i in range(int(chunk.shape[0])):
+                chunk[i] = align_action_to_env(chunk[i], int(env_action_dim))
+            for _ in range(int(chunk.shape[0])):
+                hats_per_step.append(z.copy())
+            return chunk
+
+    elif actor_type == 'state_proposal':
+        if critic_agent is None:
+            raise ValueError(
+                "actor_type='state_proposal' rollout requires critic_agent to score "
+                "dynamics proposals by state-space energy."
+            )
+
+        def _chunk(obs: np.ndarray, g: np.ndarray) -> np.ndarray:
+            obs_b = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+            g_b = np.asarray(g, dtype=np.float32).reshape(1, -1)
+            _mu, cand_actions, cand_goals, _rng = dynamics_agent.build_actor_proposals(
+                obs_b,
+                g_b,
+                dynamics_agent.rng,
+                proposal_horizon=int(actor_horizon),
+                plan_candidates=max(1, int(plan_candidates)),
+                sample_noise_scale=float(plan_noise_scale),
+            )
+            energies = np.asarray(
+                critic_agent.energy_state_subgoals(
+                    obs_b,
+                    cand_goals,
+                    g_b,
+                    network_params=critic_agent.network.params,
+                    energy_type=str(energy_type),
+                ),
+                dtype=np.float32,
+            )  # [1, N]
+            m = int(np.argmin(energies[0]))
+            chunk = np.asarray(cand_actions[0, m], dtype=np.float32).reshape(int(actor_horizon), -1)
+            if not chunk.flags.writeable:
+                chunk = chunk.copy()
+            for i in range(int(chunk.shape[0])):
+                chunk[i] = align_action_to_env(chunk[i], int(env_action_dim))
+            chosen_goal = np.asarray(cand_goals[0, m], dtype=np.float32).reshape(-1)
+            for _ in range(int(chunk.shape[0])):
+                hats_per_step.append(chosen_goal.copy())
+            return chunk
+
+    else:
+        raise ValueError(
+            f"Unknown actor_type={actor_type!r}; expected 'action_chunk', "
+            "'state_subgoal', or 'state_proposal'."
+        )
 
     outcome = run_chunked_episode(
         env,
@@ -196,6 +287,18 @@ def main() -> None:
         help='Heatmap scalar: linear sigmoid(V) or log_γ V = log(V)/log(discount).',
     )
     p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = dynamics epoch used.')
+    p.add_argument(
+        '--plan_candidates',
+        type=int,
+        default=16,
+        help="actor_type='state_proposal' only: number of dynamics proposals to score per replan.",
+    )
+    p.add_argument(
+        '--plan_noise_scale',
+        type=float,
+        default=0.5,
+        help="actor_type='state_proposal' only: bridge sampling noise scale for proposals.",
+    )
     args = p.parse_args()
 
     try:
@@ -292,8 +395,15 @@ def main() -> None:
             'Add a TimeLimit wrapper or hard-code the budget here.'
         )
     max_chunks = (int(env_max_steps) + int(actor_horizon) - 1) // int(actor_horizon) + 1
+    actor_type = str(actor_cfg.get('actor_type', 'action_chunk')).lower()
+    energy_type = str(critic_agent.config.get('state_spi_energy_type', 'v_product'))
+    cond_desc = {
+        'action_chunk': 'predicted dynamics subgoal (spi_goals)',
+        'state_subgoal': 'learned state subgoal z=pi_Z(s,g) -> bridge + IDM',
+        'state_proposal': 'lowest state-space-energy dynamics proposal',
+    }.get(actor_type, actor_type)
     print(
-        f'Actor conditioning at inference: predicted dynamics subgoal (spi_goals). '
+        f'Actor conditioning at inference: {cond_desc}. '
         f'env_max_steps={int(env_max_steps)} actor_horizon={actor_horizon} → max_chunks={int(max_chunks)}'
     )
     roll, hats, n_chunks, reached, env_frames, hats_per_step = rollout_dynamics_actor_env(
@@ -303,6 +413,11 @@ def main() -> None:
         s0,
         s_g,
         int(max_chunks),
+        actor_type=actor_type,
+        critic_agent=critic_agent,
+        energy_type=energy_type,
+        plan_candidates=int(args.plan_candidates),
+        plan_noise_scale=float(args.plan_noise_scale),
         low=low,
         high=high,
         actor_horizon=actor_horizon,

@@ -292,12 +292,29 @@ class ActorAgent(flax.struct.PyTreeNode):
             energy_type=str(critic_agent.config.get('state_spi_energy_type', 'v_product')),
         )[:, 0]
 
+        metric_space = str(self.config.get('state_spi_metric_space', 'raw'))
+        state_mean = None
+        state_std = None
+        if metric_space == 'normalized':
+            sm = self.config.get('state_mean', None)
+            ss = self.config.get('state_std', None)
+            if sm is None or ss is None or len(sm) == 0 or len(ss) == 0:
+                raise ValueError(
+                    "state_spi_metric_space='normalized' requires state_mean/state_std in the "
+                    "actor config (mirrored from dynamics state normalization stats). Set "
+                    "state_normalization=true on dynamics or use state_spi_metric_space='raw'."
+                )
+            state_mean = jnp.asarray(sm, dtype=jnp.float32)
+            state_std = jnp.asarray(ss, dtype=jnp.float32)
+
         anchor_dist2, extra = finite_anchor_distance(
             z_pi,
             candidate_goals,
             obs,
             mode=str(self.config.get('state_spi_anchor_metric', 'wasserstein_empirical')),
-            metric_space=str(self.config.get('state_spi_metric_space', 'raw')),
+            metric_space=metric_space,
+            state_mean=state_mean,
+            state_std=state_std,
             softmin_tau=float(self.config.get('state_spi_anchor_softmin_tau', 1.0)),
             anchor_weights=batch.get('anchor_weights', None),
         )
@@ -383,10 +400,21 @@ class ActorAgent(flax.struct.PyTreeNode):
         return chunk
 
     def sample_subgoals(self, observations, goals=None):
-        """Return absolute state subgoal ``z = pi_Z(s, g)`` for state actors."""
-        if self._actor_type() not in ('state_subgoal', 'state_proposal'):
+        """Return absolute state subgoal ``z = pi_Z(s, g)`` for the learned state actor.
+
+        Only valid for ``actor_type='state_subgoal'``. ``state_proposal`` is a
+        nonparametric mode with no learned actor: proposals must be selected
+        through dynamics generation + critic state-space energy, never through a
+        (randomly initialized / never-trained) actor head.
+        """
+        if self._actor_type() == 'state_proposal':
             raise ValueError(
-                f"sample_subgoals requires a state actor_type, got {self._actor_type()!r}."
+                "actor_type='state_proposal' has no learned actor; select subgoals via "
+                "dynamics proposals scored by critic_agent.energy_state_subgoals, not sample_subgoals."
+            )
+        if self._actor_type() != 'state_subgoal':
+            raise ValueError(
+                f"sample_subgoals requires actor_type='state_subgoal', got {self._actor_type()!r}."
             )
         observations = jnp.asarray(observations, dtype=jnp.float32)
         squeeze = observations.ndim == 1
@@ -447,6 +475,10 @@ def get_actor_config():
             state_spi_anchor_metric='wasserstein_empirical',
             state_spi_metric_space='raw',  # 'raw' | 'normalized' | 'displacement'
             state_spi_anchor_softmin_tau=1.0,
+            # Mirrored from dynamics state normalization stats by main._prepare_configs /
+            # _attach_state_normalization_stats; required when metric_space='normalized'.
+            state_mean=(),
+            state_std=(),
             # π and Q in the SPI loss are always conditioned on the dynamics-predicted
             # subgoal (``spi_goals`` from ``main._build_actor_batch_from_dynamics``).
             actor_chunk_horizon=ml_collections.config_dict.placeholder(int),
