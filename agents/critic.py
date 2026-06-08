@@ -137,6 +137,44 @@ class BinaryChunkCritic(nn.Module):
         return jnp.stack(logits, axis=0)
 
 
+class TernarySubgoalCritic(nn.Module):
+    """Subgoal-conditioned ternary critic ``Q_Z(s, z; g) -> logits [num_qs, B]``.
+
+    Input concat is ``[observations, subgoals, goal_representation(goals)]``.
+    Subgoals enter in raw state space (they are states); only the final goal is
+    passed through ``goal_representation`` to match the value/Q critics.
+    """
+
+    hidden_dims: Sequence[int]
+    num_qs: int
+    layer_norm: bool = True
+    goal_representation: str = 'full'
+    phi_goal_obs_indices: tuple[int, ...] = ()
+    env_name: str = ''
+
+    @nn.compact
+    def __call__(
+        self,
+        observations: jnp.ndarray,
+        subgoals: jnp.ndarray,
+        goals: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
+        xs = [observations, subgoals]
+        if goals is not None:
+            xs.append(
+                goal_representation(
+                    goals,
+                    self.goal_representation,
+                    self.phi_goal_obs_indices,
+                    env_name=self.env_name,
+                )
+            )
+        x = jnp.concatenate(xs, axis=-1)
+        h = MLP(tuple(self.hidden_dims), activate_final=True, layer_norm=self.layer_norm)(x)
+        logits = [nn.Dense(1, name=f'qz_head_{i}')(h).squeeze(-1) for i in range(int(self.num_qs))]
+        return jnp.stack(logits, axis=0)
+
+
 class CriticAgent(flax.struct.PyTreeNode):
     """Chunk critic + action critic + scalar value stack."""
 
@@ -487,6 +525,144 @@ class CriticAgent(flax.struct.PyTreeNode):
         qs = jax.nn.sigmoid(logits).reshape(logits.shape[0], obs.shape[0], num_candidates)
         return self.aggregate_ensemble_q(qs).reshape(obs.shape[0], num_candidates)
 
+    def _use_qz(self) -> bool:
+        """True iff a learned subgoal critic Q_Z should be instantiated/trained."""
+        if bool(self.config.get('use_qz_critic', False)):
+            return True
+        return str(self.config.get('state_spi_energy_type', 'v_product')).lower() == 'qz'
+
+    def _state_subgoal_score(
+        self,
+        observations: jnp.ndarray,
+        subgoals: jnp.ndarray,
+        goals: jnp.ndarray,
+        network_params: dict | None,
+        energy_type: str,
+    ) -> jnp.ndarray:
+        """Probability-scale reachability score S(s, z, g) in ``[0, 1]``, shape ``[B, N]``."""
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        z = jnp.asarray(subgoals, dtype=jnp.float32)
+        if z.ndim == 2:
+            z = z[:, None, :]
+        bsz, num = z.shape[0], z.shape[1]
+        g = jnp.asarray(goals, dtype=jnp.float32)
+        if g.ndim == 2:
+            g = jnp.repeat(g[:, None, :], num, axis=1)
+        elif g.shape[1] != num:
+            raise ValueError(
+                f'energy_state_subgoals: goals shape {g.shape} incompatible with N={num}.'
+            )
+        obs_rep = jnp.repeat(obs[:, None, :], num, axis=1).reshape(bsz * num, -1)
+        z_flat = z.reshape(bsz * num, -1)
+        g_flat = g.reshape(bsz * num, -1)
+
+        energy_type = str(energy_type).lower()
+        if energy_type == 'v_product':
+            v_s_z = jax.nn.sigmoid(self.network.select('value')(obs_rep, z_flat, params=network_params))
+            v_z_g = jax.nn.sigmoid(self.network.select('value')(z_flat, g_flat, params=network_params))
+            score = jnp.clip(v_s_z * v_z_g, 0.0, 1.0)
+        elif energy_type == 'qz':
+            qz_logits = self.network.select('qz_critic')(obs_rep, z_flat, g_flat, params=network_params)
+            score = jnp.clip(self.aggregate_ensemble_q(jax.nn.sigmoid(qz_logits)), 0.0, 1.0)
+        else:
+            raise ValueError(f"state_spi_energy_type must be 'v_product' or 'qz', got {energy_type!r}")
+        return score.reshape(bsz, num)
+
+    def energy_state_subgoals(
+        self,
+        observations: jnp.ndarray,
+        subgoals: jnp.ndarray,
+        goals: jnp.ndarray,
+        network_params: dict | None = None,
+        energy_type: str | None = None,
+    ) -> jnp.ndarray:
+        """Probability-scale cost energy for state subgoals, shape ``[B, N]``.
+
+        ``E = -S`` where ``S`` is the reachability score (no constant offset:
+        the ``+1`` from ``1 - S`` is dropped as it does not affect the actor
+        argmin or its gradient). Smaller energy is better. ``E in [-1, 0]``.
+
+        Option A (``v_product``): ``S = V(s, z) V(z, g)``.
+        Option B (``qz``):        ``S = Q_Z(s, z; g)``.
+        """
+        energy_type = energy_type or str(self.config.get('state_spi_energy_type', 'v_product'))
+        score = self._state_subgoal_score(observations, subgoals, goals, network_params, energy_type)
+        return -score
+
+    def score_state_subgoals(
+        self,
+        observations: jnp.ndarray,
+        subgoals: jnp.ndarray,
+        goals: jnp.ndarray,
+        network_params: dict | None = None,
+        energy_type: str | None = None,
+    ) -> jnp.ndarray:
+        """Probability-scale reachability score ``S = -E`` in ``[0, 1]``, shape ``[B, N]``."""
+        energy_type = energy_type or str(self.config.get('state_spi_energy_type', 'v_product'))
+        return self._state_subgoal_score(observations, subgoals, goals, network_params, energy_type)
+
+    def qz_loss(self, batch: dict, grad_params: dict) -> tuple[jnp.ndarray, dict]:
+        """Probability-scale subgoal critic Q_Z training (product + optional transitive)."""
+        eps = float(self.config.get('qz_value_eps', 1e-6))
+        discount = float(self.config['discount'])
+        valid_mask = self._valid_mask(batch)
+        base_h = float(self.config.get('value_base_horizon', self.config['action_chunk_horizon']))
+
+        observations = batch['observations']
+        qz_subgoals = batch['qz_subgoals']
+        qz_goals = batch['qz_goals']
+        sub_off = jnp.asarray(batch['qz_subgoal_offsets'], dtype=jnp.float32)  # k - i
+        goal_off = jnp.asarray(batch['qz_goal_offsets'], dtype=jnp.float32)  # j - i
+        right_off = jnp.maximum(goal_off - sub_off, 0.0)  # j - k
+        qz_valid = jnp.asarray(batch['qz_valid_mask'], dtype=jnp.float32) * valid_mask
+
+        # Bar-V legs (target value net), with short-leg gamma^offset replacement.
+        v_left = jnp.clip(jax.nn.sigmoid(self.network.select('target_value')(observations, qz_subgoals)), eps, 1.0)
+        v_right = jnp.clip(jax.nn.sigmoid(self.network.select('target_value')(qz_subgoals, qz_goals)), eps, 1.0)
+        v_left = jnp.where(sub_off <= base_h, jnp.power(discount, sub_off), v_left)
+        v_right = jnp.where(right_off <= base_h, jnp.power(discount, right_off), v_right)
+        target_prod = jax.lax.stop_gradient(jnp.clip(v_left * v_right, eps, 1.0))
+
+        qz_logits = self.network.select('qz_critic')(observations, qz_subgoals, qz_goals, params=grad_params)
+        loss_prod_per = jnp.mean(optax.sigmoid_binary_cross_entropy(qz_logits, target_prod[None, :]), axis=0)
+        loss_prod = self._weighted_mean(loss_prod_per, qz_valid)
+        qz_pred = self.aggregate_ensemble_q(jnp.clip(jax.nn.sigmoid(qz_logits), eps, 1.0))
+
+        lambda_prod = float(self.config.get('lambda_qz_prod', 1.0))
+        lambda_tri = float(self.config.get('lambda_qz_tri', 0.0))
+        total = lambda_prod * loss_prod
+        info = {
+            'qz/loss_prod': loss_prod,
+            'qz/pred_mean': qz_pred.mean(),
+            'qz/target_prod_mean': target_prod.mean(),
+            'qz/valid_fraction': jnp.mean(qz_valid),
+            'qz/loss_tri': jnp.asarray(0.0, dtype=jnp.float32),
+        }
+
+        if bool(self.config.get('qz_use_transitive_backup', False)) and 'qz_tri_split_observations' in batch:
+            tau_qz = float(self.config.get('qz_tau', 0.7))
+            split_obs = batch['qz_tri_split_observations']  # s_l
+            tri_valid = jnp.asarray(batch['qz_tri_valid_mask'], dtype=jnp.float32) * valid_mask
+            qz_left = jnp.clip(
+                self.aggregate_ensemble_q(
+                    jax.nn.sigmoid(self.network.select('target_qz_critic')(observations, qz_subgoals, split_obs))
+                ),
+                eps,
+                1.0,
+            )
+            v_tri_right = jnp.clip(
+                jax.nn.sigmoid(self.network.select('target_value')(split_obs, qz_goals)), eps, 1.0
+            )
+            target_tri = jax.lax.stop_gradient(jnp.clip(qz_left * v_tri_right, eps, 1.0))
+            loss_tri_per = _bce_expectile_loss(qz_logits, target_tri[None, :], tau_qz)
+            loss_tri = self._weighted_mean(jnp.mean(loss_tri_per, axis=0), tri_valid)
+            total = total + lambda_tri * loss_tri
+            info['qz/loss_tri'] = loss_tri
+            info['qz/target_tri_mean'] = target_tri.mean()
+
+        info['qz/loss_total'] = total
+        return total, info
+
     @jax.jit
     def total_loss(self, batch: dict, grad_params: dict, rng=None):
         batch = jax.tree_util.tree_map(lambda x: jnp.asarray(x), batch)
@@ -496,6 +672,10 @@ class CriticAgent(flax.struct.PyTreeNode):
             tl, ti = self.trl_loss(batch, grad_params)
             info['chunk_critic/critic_loss'] = jnp.asarray(0.0, dtype=jnp.float32)
             info.update(ti)
+            if self._use_qz():
+                ql, qi = self.qz_loss(batch, grad_params)
+                tl = tl + ql
+                info.update(qi)
             info['total_loss'] = tl
             return tl, info
         if self._has_chunk_critic():
@@ -532,6 +712,12 @@ class CriticAgent(flax.struct.PyTreeNode):
                 updated['modules_value'],
                 updated['modules_target_value'],
             )
+        if self._use_qz() and 'modules_target_qz_critic' in updated:
+            updated['modules_target_qz_critic'] = jax.tree_util.tree_map(
+                lambda p, tp: p * tau + tp * (1.0 - tau),
+                updated['modules_qz_critic'],
+                updated['modules_target_qz_critic'],
+            )
         return network.replace(params=updated)
 
     def _validate_trl_batch(self, batch: dict) -> None:
@@ -553,6 +739,17 @@ class CriticAgent(flax.struct.PyTreeNode):
         missing = [key for key in required if key not in batch]
         if missing:
             raise KeyError(f"trl batch missing required keys: {missing}")
+        if self._use_qz():
+            qz_required = (
+                'qz_subgoals',
+                'qz_goals',
+                'qz_subgoal_offsets',
+                'qz_goal_offsets',
+                'qz_valid_mask',
+            )
+            qz_missing = [key for key in qz_required if key not in batch]
+            if qz_missing:
+                raise KeyError(f"qz-enabled trl batch missing required keys: {qz_missing}")
 
     def update(self, batch: dict):
         self._validate_trl_batch(batch)
@@ -635,6 +832,20 @@ class CriticAgent(flax.struct.PyTreeNode):
             network_info['value'] = (value_def, (ex_obs, ex_goal))
             network_info['target_value'] = (target_value_def, (ex_obs, ex_goal))
 
+        use_qz = bool(config.get('use_qz_critic', False)) or str(
+            config.get('state_spi_energy_type', 'v_product')
+        ).lower() == 'qz'
+        if use_qz:
+            qz_nq = int(config.get('qz_num_qs', config.get('num_qs', 2)))
+            qz_critic_def = TernarySubgoalCritic(
+                hdims, qz_nq, ln, goal_representation=goal_rep, phi_goal_obs_indices=phi_idxs, env_name=env_name
+            )
+            target_qz_critic_def = TernarySubgoalCritic(
+                hdims, qz_nq, ln, goal_representation=goal_rep, phi_goal_obs_indices=phi_idxs, env_name=env_name
+            )
+            network_info['qz_critic'] = (qz_critic_def, (ex_obs, ex_obs, ex_goal))
+            network_info['target_qz_critic'] = (target_qz_critic_def, (ex_obs, ex_obs, ex_goal))
+
         if critic_type == 'dqc':
             if ex_full_chunk_actions is None:
                 raise ValueError(
@@ -659,6 +870,8 @@ class CriticAgent(flax.struct.PyTreeNode):
         network_params['modules_target_action_critic'] = network_params['modules_action_critic']
         if is_trl:
             network_params['modules_target_value'] = network_params['modules_value']
+        if use_qz:
+            network_params['modules_target_qz_critic'] = network_params['modules_qz_critic']
         network = TrainState.create(network_def, network_params, tx=optax.adam(float(config['lr'])))
         cfg_out = dict(config)
         cfg_out['phi_goal_obs_indices'] = phi_idxs
@@ -742,6 +955,21 @@ def get_config():
             subgoal_value_ratio_clip=5.0,
             rescore_single_candidate=False,
             q_value_eps=1e-6,
+            # State-space SPI energy + optional learned subgoal critic Q_Z.
+            # 'v_product': E = -V(s,z)V(z,g).  'qz': E = -Q_Z(s,z;g).
+            state_spi_energy_type='v_product',
+            use_qz_critic=False,
+            qz_num_qs=2,
+            qz_tau=0.7,
+            lambda_qz_prod=1.0,
+            lambda_qz_tri=0.0,
+            lambda_qz_value_readout=0.0,
+            qz_value_eps=1e-6,
+            qz_use_transitive_backup=False,
+            qz_transitive_reweight=False,
+            qz_distance_weight_power=1.0,
+            qz_distance_weight_clip_min=0.05,
+            qz_distance_weight_clip_max=1.0,
             distill_method='expectile',
             kappa_d=0.7,
             implicit_backup_type='quantile',
@@ -763,6 +991,7 @@ def get_config():
 __all__ = [
     'BinaryChunkCritic',
     'ScalarValueNet',
+    'TernarySubgoalCritic',
     'CriticAgent',
     'validate_config',
     'extract_critic_primary_score',

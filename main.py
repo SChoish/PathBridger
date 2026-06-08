@@ -177,6 +177,12 @@ _SPI_ACTOR_KEYS = {
     'spi_beta',
     'spi_actor_layer_norm',
     'spi_q_norm_eps',
+    'actor_type',
+    'state_spi_actor_layer_norm',
+    'state_spi_target_mode',
+    'state_spi_anchor_metric',
+    'state_spi_metric_space',
+    'state_spi_anchor_softmin_tau',
 }
 def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
     return max(1, math.ceil(dataset_size / batch_size))
@@ -950,6 +956,7 @@ def _evaluate_env_tasks(
     actor_config: Any,
     critic_config: Any,
     *,
+    critic_agent: Any = None,
     task_ids: tuple[int, ...],
     episodes_per_task: int,
     max_chunks: int,
@@ -983,7 +990,37 @@ def _evaluate_env_tasks(
     actor_video_by_task: dict[int, np.ndarray] = {}
     idm_video_by_task: dict[int, np.ndarray] = {}
 
+    actor_type = str(actor_config.get('actor_type', 'action_chunk')).lower()
+
+    def _state_proposal_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        if critic_agent is None:
+            raise ValueError("actor_type='state_proposal' eval requires critic_agent.")
+        obs_b = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+        goal_b = np.asarray(goal, dtype=np.float32).reshape(1, -1)
+        plan_candidates = max(1, int(FLAGS.plan_candidates))
+        noise = float(FLAGS.plan_noise_scale) if plan_candidates > 1 else 0.0
+        _mu, cand_actions, cand_goals, _rng = dynamics_agent.build_actor_proposals(
+            obs_b, goal_b, dynamics_agent.rng,
+            proposal_horizon=idm_horizon, plan_candidates=plan_candidates, sample_noise_scale=noise,
+        )
+        energies = np.asarray(
+            critic_agent.energy_state_subgoals(
+                obs_b, cand_goals, goal_b,
+                network_params=critic_agent.network.params,
+                energy_type=str(critic_config.get('state_spi_energy_type', 'v_product')),
+            ),
+            dtype=np.float32,
+        )  # [1, N]
+        m = int(np.argmin(energies[0]))
+        return np.asarray(cand_actions[0, m], dtype=np.float32).reshape(idm_horizon, -1)
+
     def _actor_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        if actor_type == 'state_proposal':
+            return _state_proposal_chunk(obs, goal)
+        if actor_type == 'state_subgoal':
+            # State actor outputs a subgoal z; convert to actions via bridge + IDM.
+            z = np.asarray(actor_agent.sample_subgoals(obs, goal), dtype=np.float32).reshape(-1)
+            return _idm_action_chunk(dynamics_agent, obs, z, idm_horizon)
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
@@ -1422,11 +1459,18 @@ def main(_):
                 _block_until_ready(critic_info)
                 critic_time += time.perf_counter() - t0
 
+            actor_type = str(actor_config.get('actor_type', 'action_chunk')).lower()
             if measure_timing:
                 t0 = time.perf_counter()
-            actor_batch_for_update, score_coupling_info = _rescore_actor_batch_for_update(
-                actor_batch, critic_agent, actor_config
-            )
+            if actor_type in ('state_subgoal', 'state_proposal'):
+                # State actors consume the dynamics proposal set directly (no
+                # action-chunk rescoring); candidate_goals is the W2 anchor.
+                actor_batch_for_update = actor_batch
+                score_coupling_info = {}
+            else:
+                actor_batch_for_update, score_coupling_info = _rescore_actor_batch_for_update(
+                    actor_batch, critic_agent, actor_config
+                )
             coupling_info = dict(coupling_info)
             coupling_info.update(score_coupling_info)
             if measure_timing:
@@ -1477,6 +1521,7 @@ def main(_):
                         actor_agent,
                         actor_config,
                         critic_config,
+                        critic_agent=critic_agent,
                         task_ids=eval_task_ids,
                         episodes_per_task=eval_episode_count,
                         max_chunks=eval_max_chunks,

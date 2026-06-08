@@ -230,6 +230,59 @@ class CriticSequenceDataset:
             'q_goal_offsets': (value_goal_idxs - idxs).astype(np.float32),
         }
 
+    def _use_qz(self) -> bool:
+        if bool(self.config.get('use_qz_critic', False)):
+            return True
+        return str(self.config.get('state_spi_energy_type', 'v_product')).lower() == 'qz'
+
+    def _sample_qz_fields(self, idxs: np.ndarray, value_goal_idxs: np.ndarray) -> dict:
+        """Sample QZ tuples: goal ``j > i`` and subgoal ``k`` with ``i < k <= j``.
+
+        Invalid samples (no room for a strictly-future subgoal) use safe dummy
+        indices and a zero ``qz_valid_mask``. Optional transitive samples add
+        ``l`` with ``k <= l < j``.
+        """
+        batch_size = len(idxs)
+        finals = self._lookup_finals(idxs)
+        j = np.asarray(value_goal_idxs, dtype=np.int64)
+        goal_off = (j - idxs).astype(np.int64)
+        valid = goal_off >= 1
+
+        k = idxs.copy()
+        if np.any(valid):
+            span = goal_off[valid]  # >= 1
+            draw = 1 + np.floor(np.random.rand(int(valid.sum())) * span).astype(np.int64)
+            k[valid] = np.minimum(idxs[valid] + draw, j[valid])
+        k = np.clip(k, idxs, finals).astype(np.int64)
+
+        out = {
+            'qz_subgoals': np.asarray(self.get_observations(k), dtype=np.float32),
+            'qz_goals': np.asarray(self.get_observations(j), dtype=np.float32),
+            'qz_subgoal_offsets': (k - idxs).astype(np.float32),
+            'qz_goal_offsets': goal_off.astype(np.float32),
+            'qz_valid_mask': valid.astype(np.float32),
+        }
+
+        if bool(self.config.get('qz_use_transitive_backup', False)):
+            l = k.copy()
+            tri_valid = valid & (j > k)
+            if np.any(tri_valid):
+                span = (j - k)[tri_valid]  # >= 1
+                draw = np.floor(np.random.rand(int(tri_valid.sum())) * span).astype(np.int64)
+                l[tri_valid] = np.minimum(k[tri_valid] + draw, j[tri_valid] - 1)
+            l = np.clip(l, idxs, finals).astype(np.int64)
+            split_obs = np.asarray(self.get_observations(l), dtype=np.float32)
+            out.update(
+                {
+                    'qz_tri_split_observations': split_obs,
+                    'qz_tri_split_goals': split_obs,
+                    'qz_tri_split_offsets': (l - idxs).astype(np.float32),
+                    'qz_tri_right_offsets': (j - l).astype(np.float32),
+                    'qz_tri_valid_mask': tri_valid.astype(np.float32),
+                }
+            )
+        return out
+
     def augment(self, batch: dict, keys: list[str]) -> None:
         p_aug = self.config.get('p_aug')
         if not p_aug or float(p_aug) <= 0:
@@ -315,6 +368,8 @@ class CriticSequenceDataset:
                     **self._sample_trl_fields(idxs, value_goal_idxs),
                 }
             )
+            if self._use_qz():
+                batch.update(self._sample_qz_fields(idxs, value_goal_idxs))
 
         if not evaluation:
             aug_keys = [
@@ -335,5 +390,9 @@ class CriticSequenceDataset:
                         'q_goals',
                     ]
                 )
+                if self._use_qz():
+                    aug_keys.extend(['qz_subgoals', 'qz_goals'])
+                    if bool(self.config.get('qz_use_transitive_backup', False)):
+                        aug_keys.extend(['qz_tri_split_observations', 'qz_tri_split_goals'])
             self.augment(batch, aug_keys)
         return batch

@@ -290,6 +290,138 @@ Critic + SPI actor:
 - `spi_tau`가 작을수록 후보 chunk 쪽으로 더 강하게 당깁니다.
 - Actor와 critic SPI 경로는 항상 dynamics가 예측한 subgoal(`spi_goals`)에 condition됩니다.
 
+## State-space SPI with Wasserstein proximal geometry
+
+기본 `actor_type: action_chunk` 경로는 그대로 두고, 상태 부분목표(state subgoal)를 직접
+최적화하는 **state-space SPI** 모드를 옵션으로 추가했습니다. MPI 스타일의 proximal policy
+improvement 목적함수를 **비용 에너지(cost energy)** \(E\)(작을수록 좋음)와 **Wasserstein
+proximal** 항으로 구성합니다.
+
+\[
+\mathcal L_{\mathrm{SPI}}(\pi)
+= E(s,\pi(s,g),g)
++ \frac{1}{2\tau_{\mathrm{SPI}}}\, d_M^2(\pi_0,\pi).
+\]
+
+에너지는 비용이므로 **마이너스 부호 없이 그대로 더합니다**. log-scale score나 softmax weighted
+BC는 쓰지 않습니다.
+
+### Anchor policy \(\pi_0\)
+
+\(\pi_0(z\mid s,g)\)는 dynamics가 생성한 state-subgoal 제안 분포이며, 코드에서는 유한 후보
+`candidate_goals` (`[B, N, D]`)로 표현됩니다.
+
+### Wasserstein proximal term
+
+결정론적 state actor `\pi(\cdot\mid s,g)=\delta_{\pi_Z(s,g)}`와 경험적 anchor
+`\pi_0\approx\frac1N\sum_m\delta_{z_m}`에 대해, Dirac–empirical 간 \(W_2^2\)는 정확히
+
+\[
+W_2^2(\pi,\pi_0)=\frac1N\sum_m\lVert\phi_M(\pi_Z(s,g))-\phi_M(z_m)\rVert_2^2.
+\]
+
+이것이 기본 `state_spi_anchor_metric: wasserstein_empirical`이며, `finite_anchor_distance`가
+계산합니다. `candidate_goals`에는 stop-gradient가 적용되고 \(z_\pi\)로만 gradient가 흐릅니다.
+`support_nearest`/`support_soft_nearest`는 nearest-support 휴리스틱(ablation 전용)으로, **
+Wasserstein이 아닙니다**. metric space는 `raw`(기본) / `normalized`(state_mean·std, 없으면
+raw로 fallback) / `displacement`(z-s) 를 지원합니다.
+
+### Energy 옵션 (상수 1 미포함)
+
+probability-scale score \(S\in[0,1]\)에 대해 비용 에너지는 `E = -S`로 정의합니다(상수 `1`은
+argmin/gradient에 무의미하므로 생략, \(E\in[-1,0]\)).
+
+- Option A `v_product`: \(S=V(s,z)\,V(z,g)\) → `E = -V(s,z)V(z,g)`.
+- Option B `qz`: \(S=Q_Z(s,z;g)\) → `E = -Q_Z(s,z;g)`. `use_qz_critic: true`일 때
+  `TernarySubgoalCritic`(+ EMA target)을 학습합니다. 학습 타깃은 product
+  \(y=\bar V(s,z)\bar V(z,g)\) (짧은 leg는 \(\gamma^{\text{offset}}\)로 치환)이고, 선택적
+  transitive backup도 지원합니다. 작은 에너지가 더 좋은 부분목표입니다.
+
+`critic_agent.energy_state_subgoals(s, z, g) -> [B, N]`, `score_state_subgoals(...) = -E`를
+제공합니다.
+
+### SPI temperature \(\tau_{\mathrm{SPI}}\) (`spi_tau`)
+
+Wasserstein anchoring 강도를 조절합니다. 작은 \(\tau\)는 dynamics 제안에 더 가깝게, 큰 \(\tau\)는
+더 에너지를 좇습니다.
+
+### Execution
+
+state actor는 부분목표 \(z\)만 출력합니다. 실행/eval에서는 `z -> bridge path -> IDM -> action
+chunk` 순서로 변환합니다(`actor.sample_subgoals` → `dynamics.plan` → `_idm_actions_from_trajectories`).
+`actor_type: state_proposal`은 학습 actor 없이 dynamics 제안 중 에너지가 가장 낮은 후보를
+선택해 그 action chunk를 실행합니다.
+
+### Logging
+
+`state_spi/actor_loss`, `state_spi/energy_{mean,min,max}`,
+`state_spi/anchor_dist2_{mean,min,max}`, `state_spi/prox_coef`, `state_spi/z_pred_norm`,
+`state_spi/candidate_goal_norm_mean`, `state_spi/anchor_metric_id`, `state_spi/metric_space_id`
+(soft nearest일 때 `state_spi/anchor_softmin_entropy`).
+
+### YAML 예시
+
+V-product state-SPI:
+
+```yaml
+critic_agent:
+  algorithm: trl
+  critic_type: trl
+  goal_representation: full
+  state_spi_energy_type: v_product
+  use_qz_critic: false
+  subgoal_value_bonus_type: transitive_product
+  lambda_q_local: 0.0
+
+actor:
+  actor_type: state_subgoal
+  spi_tau: 5.0
+  state_spi_target_mode: absolute
+  state_spi_anchor_metric: wasserstein_empirical
+  state_spi_metric_space: raw
+
+dynamics:
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_value_alpha: 0.1
+```
+
+QZ state-SPI:
+
+```yaml
+critic_agent:
+  algorithm: trl
+  critic_type: trl
+  goal_representation: full
+  state_spi_energy_type: qz
+  use_qz_critic: true
+  lambda_qz_prod: 1.0
+  lambda_qz_tri: 0.0
+  qz_tau: 0.7
+  subgoal_value_bonus_type: transitive_product
+  lambda_q_local: 0.0
+
+actor:
+  actor_type: state_subgoal
+  spi_tau: 5.0
+  state_spi_target_mode: absolute
+  state_spi_anchor_metric: wasserstein_empirical
+  state_spi_metric_space: raw
+```
+
+Proposal-only state policy:
+
+```yaml
+critic_agent:
+  algorithm: trl
+  critic_type: trl
+  goal_representation: full
+  state_spi_energy_type: v_product
+
+actor:
+  actor_type: state_proposal
+```
+
 주요 dynamics 로그:
 
 - `dynamics/bridge_gamma_inv`, `dynamics/gamma_inv`, `dynamics/subgoal_target_mode` (`0=absolute`, `1=displacement`)

@@ -176,6 +176,7 @@ def main() -> None:
         actor_agent,
         actor_config,
         critic_eval,
+        critic_agent=critic_agent,
         task_ids=task_ids,
         episodes_per_task=ep_task,
         max_chunks=max_chunks,
