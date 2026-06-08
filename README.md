@@ -316,17 +316,16 @@ BC는 쓰지 않습니다.
 ### Wasserstein proximal term
 
 결정론적 state actor `\pi(\cdot\mid s,g)=\delta_{\pi_Z(s,g)}`와 경험적 anchor
-`\pi_0\approx\frac1N\sum_m\delta_{z_m}`에 대해, Dirac–empirical 간 \(W_2^2\)는 정확히
+`\pi_0\approx\frac1N\sum_m\delta_{z_m}`에 대해, Dirac–empirical 간 \(W_2^2\)는 raw 상태좌표에서
+정확히
 
 \[
-W_2^2(\pi,\pi_0)=\frac1N\sum_m\lVert\phi_M(\pi_Z(s,g))-\phi_M(z_m)\rVert_2^2.
+W_2^2(\pi,\pi_0)=\frac1N\sum_m\lVert \pi_Z(s,g)-z_m\rVert_2^2.
 \]
 
-이것이 기본 `state_spi_anchor_metric: wasserstein_empirical`이며, `finite_anchor_distance`가
-계산합니다. `candidate_goals`에는 stop-gradient가 적용되고 \(z_\pi\)로만 gradient가 흐릅니다.
-`support_nearest`/`support_soft_nearest`는 nearest-support 휴리스틱(ablation 전용)으로, **
-Wasserstein이 아닙니다**. metric space는 `raw`(기본) / `normalized`(state_mean·std, 없으면
-raw로 fallback) / `displacement`(z-s) 를 지원합니다.
+`finite_anchor_distance(z_pi, candidate_goals)`가 이 한 가지 정의를 계산합니다(다른 metric/대안
+모드는 두지 않습니다). `candidate_goals`에는 stop-gradient가 적용되고 \(z_\pi\)로만 gradient가
+흐릅니다.
 
 ### Energy 옵션 (상수 1 미포함)
 
@@ -358,8 +357,7 @@ chunk` 순서로 변환합니다(`actor.sample_subgoals` → `dynamics.plan` →
 
 `state_spi/actor_loss`, `state_spi/energy_{mean,min,max}`,
 `state_spi/anchor_dist2_{mean,min,max}`, `state_spi/prox_coef`, `state_spi/z_pred_norm`,
-`state_spi/candidate_goal_norm_mean`, `state_spi/anchor_metric_id`, `state_spi/metric_space_id`
-(soft nearest일 때 `state_spi/anchor_softmin_entropy`).
+`state_spi/candidate_goal_norm_mean`.
 
 ### YAML 예시
 
@@ -379,8 +377,6 @@ actor:
   actor_type: state_subgoal
   spi_tau: 5.0
   state_spi_target_mode: absolute
-  state_spi_anchor_metric: wasserstein_empirical
-  state_spi_metric_space: raw
 
 dynamics:
   subgoal_distribution: diag_gaussian
@@ -407,8 +403,6 @@ actor:
   actor_type: state_subgoal
   spi_tau: 5.0
   state_spi_target_mode: absolute
-  state_spi_anchor_metric: wasserstein_empirical
-  state_spi_metric_space: raw
 ```
 
 Proposal-only state policy:

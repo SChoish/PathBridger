@@ -180,9 +180,6 @@ _SPI_ACTOR_KEYS = {
     'actor_type',
     'state_spi_actor_layer_norm',
     'state_spi_target_mode',
-    'state_spi_anchor_metric',
-    'state_spi_metric_space',
-    'state_spi_anchor_softmin_tau',
 }
 def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
     return max(1, math.ceil(dataset_size / batch_size))
@@ -1214,12 +1211,6 @@ def main(_):
         render_mode='rgb_array',
     )
     _attach_state_normalization_stats(dynamics_config, train_plain)
-    # Mirror dynamics state-normalization stats into the actor config so the
-    # state-SPI Wasserstein metric_space='normalized' can use real stats
-    # (otherwise that mode fails loudly in state_actor_loss).
-    if 'state_mean' in actor_config and dynamics_config.get('state_mean', ()):
-        actor_config['state_mean'] = tuple(float(x) for x in dynamics_config.get('state_mean', ()))
-        actor_config['state_std'] = tuple(float(x) for x in dynamics_config.get('state_std', ()))
     obs_dim_env = int(np.prod(env.observation_space.shape))
     phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
     if not phi_idxs:

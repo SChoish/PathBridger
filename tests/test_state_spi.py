@@ -68,15 +68,13 @@ def _make_critic(energy_type: str = 'v_product', use_qz: bool = False, qz_tri: b
     )
 
 
-def _make_state_actor(target_mode: str = 'absolute', anchor_metric: str = 'wasserstein_empirical'):
+def _make_state_actor(target_mode: str = 'absolute'):
     cfg = get_actor_config()
     cfg.actor_type = 'state_subgoal'
     cfg.actor_chunk_horizon = 2
     cfg.action_dim = ACTION_DIM
     cfg.spi_tau = 5.0
     cfg.state_spi_target_mode = target_mode
-    cfg.state_spi_anchor_metric = anchor_metric
-    cfg.state_spi_metric_space = 'raw'
     ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
     return ActorAgent.create(seed=0, ex_observations=ex_obs, config=cfg, ex_goals=ex_obs)
 
@@ -136,24 +134,10 @@ def test_wasserstein_empirical_matches_mean_squared():
     rng = np.random.default_rng(1)
     z = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
     cand = jnp.asarray(rng.standard_normal((BATCH, N, STATE_DIM)).astype(np.float32))
-    obs = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    d2, extra = finite_anchor_distance(z, cand, obs, mode='wasserstein_empirical', metric_space='raw')
+    d2 = finite_anchor_distance(z, cand)
     assert d2.shape == (BATCH,)
     assert np.all(np.isfinite(np.asarray(d2)))
     expected = np.mean(
-        np.sum((np.asarray(z)[:, None, :] - np.asarray(cand)) ** 2, axis=-1), axis=1
-    )
-    np.testing.assert_allclose(np.asarray(d2), expected, rtol=1e-5, atol=1e-5)
-    assert not extra
-
-
-def test_support_nearest_is_min_not_wasserstein():
-    rng = np.random.default_rng(2)
-    z = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
-    cand = jnp.asarray(rng.standard_normal((BATCH, N, STATE_DIM)).astype(np.float32))
-    obs = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
-    d2, _ = finite_anchor_distance(z, cand, obs, mode='support_nearest', metric_space='raw')
-    expected = np.min(
         np.sum((np.asarray(z)[:, None, :] - np.asarray(cand)) ** 2, axis=-1), axis=1
     )
     np.testing.assert_allclose(np.asarray(d2), expected, rtol=1e-5, atol=1e-5)
@@ -380,36 +364,6 @@ def test_state_proposal_sample_subgoals_raises():
     actor = ActorAgent.create(seed=0, ex_observations=ex_obs, config=cfg, ex_goals=ex_obs)
     with pytest.raises(ValueError):
         actor.sample_subgoals(np.zeros((STATE_DIM,), dtype=np.float32), np.zeros((STATE_DIM,), dtype=np.float32))
-
-
-def test_normalized_metric_requires_stats():
-    cfg = get_actor_config()
-    cfg.actor_type = 'state_subgoal'
-    cfg.actor_chunk_horizon = 2
-    cfg.action_dim = ACTION_DIM
-    cfg.spi_tau = 5.0
-    cfg.state_spi_metric_space = 'normalized'  # no state_mean/std provided
-    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
-    actor = ActorAgent.create(seed=0, ex_observations=ex_obs, config=cfg, ex_goals=ex_obs)
-    critic = _make_critic('v_product')
-    with pytest.raises(ValueError):
-        actor.update(_state_batch(), critic)
-
-
-def test_normalized_metric_uses_stats_when_present():
-    cfg = get_actor_config()
-    cfg.actor_type = 'state_subgoal'
-    cfg.actor_chunk_horizon = 2
-    cfg.action_dim = ACTION_DIM
-    cfg.spi_tau = 5.0
-    cfg.state_spi_metric_space = 'normalized'
-    cfg.state_mean = tuple(0.0 for _ in range(STATE_DIM))
-    cfg.state_std = tuple(1.0 for _ in range(STATE_DIM))
-    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
-    actor = ActorAgent.create(seed=0, ex_observations=ex_obs, config=cfg, ex_goals=ex_obs)
-    critic = _make_critic('v_product')
-    _, info = actor.update(_state_batch(), critic)
-    assert np.isfinite(float(info['state_spi/actor_loss']))
 
 
 def test_qz_dataset_fields_absent_when_disabled():

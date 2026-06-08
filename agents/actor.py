@@ -58,86 +58,28 @@ class StateSubgoalActor(nn.Module):
         return raw
 
 
-_ANCHOR_METRIC_IDS = {
-    'wasserstein_empirical': 0.0,
-    'wasserstein_weighted': 1.0,
-    'support_nearest': 2.0,
-    'support_soft_nearest': 3.0,
-}
-_METRIC_SPACE_IDS = {
-    'raw': 0.0,
-    'normalized': 1.0,
-    'displacement': 2.0,
-}
-
-
 def finite_anchor_distance(
     z_pi: jnp.ndarray,
     candidate_goals: jnp.ndarray,
-    observations: jnp.ndarray,
-    mode: str = 'wasserstein_empirical',
-    metric_space: str = 'raw',
-    state_mean: jnp.ndarray | None = None,
-    state_std: jnp.ndarray | None = None,
-    softmin_tau: float = 1.0,
-    anchor_weights: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, dict]:
-    """Proximal distance between a Dirac state actor and a finite anchor set.
+) -> jnp.ndarray:
+    """Empirical squared 2-Wasserstein distance to a finite anchor set.
 
-    The deterministic actor ``pi = delta_{z_pi}`` and the dynamics proposal
-    policy ``pi_0 ~ (1/N) sum_m delta_{z_m}`` (``candidate_goals``).  Under the
-    metric ``phi_M`` the default ``wasserstein_empirical`` mode returns the exact
-    squared 2-Wasserstein distance between the Dirac mass and the empirical
-    anchor distribution, ``(1/N) sum_m ||phi(z_pi) - phi(z_m)||^2``.
+    The deterministic state actor is the Dirac mass ``pi = delta_{z_pi}`` and the
+    dynamics proposal policy is the empirical distribution
+    ``pi_0 ~ (1/N) sum_m delta_{z_m}`` (``candidate_goals``). In raw state
+    coordinates the exact ``W2^2`` between a Dirac and an empirical distribution
+    is the mean squared distance to the support points::
+
+        W2^2(delta_{z_pi}, mu_N) = (1/N) sum_m ||z_pi - z_m||^2.
 
     Gradients flow through ``z_pi``; ``candidate_goals`` is stop-gradient.
 
-    Returns
-    -------
-    dist2 : ``[B]`` squared proximal distance.
-    extra : dict with optional diagnostics (e.g. ``softmin_entropy``).
+    Returns ``dist2`` of shape ``[B]``.
     """
     z = jnp.asarray(z_pi, dtype=jnp.float32)[:, None, :]  # [B, 1, D]
     cand = jax.lax.stop_gradient(jnp.asarray(candidate_goals, dtype=jnp.float32))  # [B, N, D]
-    obs = jnp.asarray(observations, dtype=jnp.float32)[:, None, :]  # [B, 1, D]
-    metric_space = str(metric_space).lower()
-    mode = str(mode).lower()
-
-    # phi(z_pi) - phi(z_m); the offset terms (mu for normalized, s for
-    # displacement) cancel in the difference, so we operate directly on diffs.
-    if metric_space == 'normalized' and state_mean is not None and state_std is not None:
-        denom = jnp.asarray(state_std, dtype=jnp.float32) + 1e-6
-        diff = (z - cand) / denom
-    elif metric_space == 'displacement':
-        # phi(z; s) = z - s  ->  phi(z_pi) - phi(z_m) = z_pi - z_m.
-        diff = z - cand + 0.0 * obs
-    else:  # 'raw', or 'normalized' without stats (fall back to raw).
-        diff = z - cand
-    d2 = jnp.sum(diff**2, axis=-1)  # [B, N]
-
-    extra: dict = {}
-    if mode == 'wasserstein_empirical':
-        dist2 = jnp.mean(d2, axis=1)
-    elif mode == 'wasserstein_weighted':
-        if anchor_weights is not None:
-            w = jax.lax.stop_gradient(jnp.asarray(anchor_weights, dtype=jnp.float32))
-            w = w / jnp.maximum(jnp.sum(w, axis=1, keepdims=True), 1e-8)
-            dist2 = jnp.sum(w * d2, axis=1)
-        else:
-            dist2 = jnp.mean(d2, axis=1)
-    elif mode == 'support_nearest':
-        dist2 = jnp.min(d2, axis=1)
-    elif mode == 'support_soft_nearest':
-        omega = jax.nn.softmax(-d2 / jnp.maximum(float(softmin_tau), 1e-6), axis=1)
-        dist2 = jnp.sum(omega * d2, axis=1)
-        extra['softmin_entropy'] = -jnp.sum(omega * jnp.log(omega + 1e-8), axis=1).mean()
-    else:
-        raise ValueError(
-            "state_spi_anchor_metric must be one of 'wasserstein_empirical', "
-            "'wasserstein_weighted', 'support_nearest', 'support_soft_nearest', "
-            f"got {mode!r}"
-        )
-    return dist2, extra
+    d2 = jnp.sum((z - cand) ** 2, axis=-1)  # [B, N]
+    return jnp.mean(d2, axis=1)
 
 
 class ActorAgent(flax.struct.PyTreeNode):
@@ -270,13 +212,14 @@ class ActorAgent(flax.struct.PyTreeNode):
     def state_actor_loss(self, batch: dict, actor_params: dict, critic_agent: Any) -> tuple[jnp.ndarray, dict]:
         """State-space SPI loss with explicit cost energy + Wasserstein prox.
 
-            L = E(s, pi_Z(s, g), g) + (1 / (2 tau_SPI)) * d_M^2(pi_0, pi).
+            L = E(s, pi_Z(s, g), g) + (1 / (2 tau_SPI)) * W2^2(pi_0, pi).
 
         ``E`` is a probability-scale cost energy (smaller is better); the
-        objective adds it directly (no minus sign). ``d_M^2`` defaults to the
-        empirical W2^2 between the Dirac actor and the finite dynamics proposal
-        set ``candidate_goals``. Critic params are constants here, so no critic
-        gradient flows from the actor update.
+        objective adds it directly (no minus sign). The proximal term is the
+        empirical squared 2-Wasserstein distance between the Dirac actor and the
+        finite dynamics proposal set ``candidate_goals`` (raw state coordinates).
+        Critic params are constants here, so no critic gradient flows from the
+        actor update.
         """
         obs = jnp.asarray(batch['observations'], dtype=jnp.float32)
         goals = self._state_goals(batch)
@@ -292,32 +235,7 @@ class ActorAgent(flax.struct.PyTreeNode):
             energy_type=str(critic_agent.config.get('state_spi_energy_type', 'v_product')),
         )[:, 0]
 
-        metric_space = str(self.config.get('state_spi_metric_space', 'raw'))
-        state_mean = None
-        state_std = None
-        if metric_space == 'normalized':
-            sm = self.config.get('state_mean', None)
-            ss = self.config.get('state_std', None)
-            if sm is None or ss is None or len(sm) == 0 or len(ss) == 0:
-                raise ValueError(
-                    "state_spi_metric_space='normalized' requires state_mean/state_std in the "
-                    "actor config (mirrored from dynamics state normalization stats). Set "
-                    "state_normalization=true on dynamics or use state_spi_metric_space='raw'."
-                )
-            state_mean = jnp.asarray(sm, dtype=jnp.float32)
-            state_std = jnp.asarray(ss, dtype=jnp.float32)
-
-        anchor_dist2, extra = finite_anchor_distance(
-            z_pi,
-            candidate_goals,
-            obs,
-            mode=str(self.config.get('state_spi_anchor_metric', 'wasserstein_empirical')),
-            metric_space=metric_space,
-            state_mean=state_mean,
-            state_std=state_std,
-            softmin_tau=float(self.config.get('state_spi_anchor_softmin_tau', 1.0)),
-            anchor_weights=batch.get('anchor_weights', None),
-        )
+        anchor_dist2 = finite_anchor_distance(z_pi, candidate_goals)
 
         prox_coef = 1.0 / (2.0 * float(self.config['spi_tau']))
         loss = energy.mean() + prox_coef * anchor_dist2.mean()
@@ -333,17 +251,7 @@ class ActorAgent(flax.struct.PyTreeNode):
             'state_spi/prox_coef': jnp.asarray(prox_coef, dtype=jnp.float32),
             'state_spi/z_pred_norm': jnp.linalg.norm(z_pi, axis=-1).mean(),
             'state_spi/candidate_goal_norm_mean': jnp.linalg.norm(candidate_goals, axis=-1).mean(),
-            'state_spi/anchor_metric_id': jnp.asarray(
-                _ANCHOR_METRIC_IDS.get(str(self.config.get('state_spi_anchor_metric', 'wasserstein_empirical')).lower(), -1.0),
-                dtype=jnp.float32,
-            ),
-            'state_spi/metric_space_id': jnp.asarray(
-                _METRIC_SPACE_IDS.get(str(self.config.get('state_spi_metric_space', 'raw')).lower(), -1.0),
-                dtype=jnp.float32,
-            ),
         }
-        if 'softmin_entropy' in extra:
-            info['state_spi/anchor_softmin_entropy'] = extra['softmin_entropy']
         return loss, info
 
     def update(self, batch: dict, critic_agent: Any):
@@ -469,16 +377,10 @@ def get_actor_config():
             #     trained with E + W2^2/(2 tau); executed via bridge + IDM.
             # 'state_proposal': no learned actor; pick lowest-energy dynamics proposal.
             actor_type='action_chunk',
-            # State-subgoal actor settings.
+            # State-subgoal actor settings. The proximal term is always the
+            # empirical W2^2 to the dynamics proposal set in raw state space.
             state_spi_actor_layer_norm=True,
             state_spi_target_mode='absolute',  # 'absolute' | 'displacement'
-            state_spi_anchor_metric='wasserstein_empirical',
-            state_spi_metric_space='raw',  # 'raw' | 'normalized' | 'displacement'
-            state_spi_anchor_softmin_tau=1.0,
-            # Mirrored from dynamics state normalization stats by main._prepare_configs /
-            # _attach_state_normalization_stats; required when metric_space='normalized'.
-            state_mean=(),
-            state_std=(),
             # π and Q in the SPI loss are always conditioned on the dynamics-predicted
             # subgoal (``spi_goals`` from ``main._build_actor_batch_from_dynamics``).
             actor_chunk_horizon=ml_collections.config_dict.placeholder(int),
