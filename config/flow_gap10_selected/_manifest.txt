@@ -1,0 +1,7 @@
+# 6 selected Flow configs, gap=10.0, wmax=5.0
+config/flow_gap10_selected/flow_gap10_w5_trl_antmaze_large_rd_sd.yaml
+config/flow_gap10_selected/flow_gap10_w5_trl_antmaze_giant_rd_sd.yaml
+config/flow_gap10_selected/flow_gap10_w5_trl_cube_double_rd_sd.yaml
+config/flow_gap10_selected/flow_gap10_w5_trl_cube_triple_rd_sd.yaml
+config/flow_gap10_selected/flow_gap10_w5_trl_puzzle_3x3_rd_sd.yaml
+config/flow_gap10_selected/flow_gap10_w5_trl_puzzle_4x4_rd_sd.yaml

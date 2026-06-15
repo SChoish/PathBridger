@@ -20,8 +20,6 @@ OUT = REPO / 'config' / 'flow_gap5_by_env'
 
 FLOW_DYNAMICS_PATCH: dict = {
     'subgoal_distribution': 'flow',
-    'subgoal_flow_energy_weighted': False,
-    'subgoal_flow_use_value_bonus': False,
     'subgoal_value_alpha': 0.0,
     'subgoal_value_gap_scale': 5.0,
     'subgoal_value_weight_max': 5.0,

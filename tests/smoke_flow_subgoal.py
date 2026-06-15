@@ -36,8 +36,6 @@ def _config(mode: str):
     cfg.subgoal_distribution = mode
     cfg.subgoal_num_samples = 3
     cfg.subgoal_flow_steps = 2
-    cfg.subgoal_flow_energy_weighted = False
-    cfg.subgoal_flow_use_value_bonus = False
     cfg.subgoal_value_alpha = 0.0
     cfg.subgoal_target_mode = 'displacement'
     cfg.residual_target_mode = 'displacement'
@@ -107,11 +105,8 @@ def main() -> None:
     loss = info['phase1/loss']
     assert bool(jnp.isfinite(loss)), loss
     assert bool(jnp.isfinite(info['phase1/subgoal_flow_loss'])), info['phase1/subgoal_flow_loss']
-    # Plain Flow-BC defaults: no energy weighting, unit weights.
-    assert float(info['phase1/subgoal_flow_energy_weighted']) == 0.0, info['phase1/subgoal_flow_energy_weighted']
-    assert abs(float(info['phase1/subgoal_flow_energy_weight_mean']) - 1.0) < 1e-5, (
-        info['phase1/subgoal_flow_energy_weight_mean']
-    )
+    assert float(info['phase1/subgoal_flow_fm_raw']) >= 0.0
+    assert float(info['phase1/subgoal_flow_weighted_fm']) >= 0.0
 
     # Eval selector without a critic via goal-L2 best-of-N.
     eval_agent = _create_with_eval_selection('flow', 'best_of_n_goal_l2')

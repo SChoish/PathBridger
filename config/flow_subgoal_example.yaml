@@ -4,5 +4,4 @@ dynamics:
   residual_target_mode: displacement
   subgoal_num_samples: 4
   subgoal_flow_steps: 8
-  subgoal_flow_use_value_bonus: true
   subgoal_value_alpha: 0.0

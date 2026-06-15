@@ -1332,10 +1332,7 @@ def main(_):
         bool(dynamics_config.get('subgoal_use_mean_for_actor_goal', True)),
     )
     run_logger.info(
-        'subgoal_flow energy_weighted=%s use_value_bonus=%s noise_scale=%.4g '
-        'eval_selection=%s eval_num_samples=%d eval_include_zero_candidate=%s',
-        bool(dynamics_config.get('subgoal_flow_energy_weighted', False)),
-        bool(dynamics_config.get('subgoal_flow_use_value_bonus', False)),
+        'subgoal_flow noise_scale=%.4g eval_selection=%s eval_num_samples=%d eval_include_zero_candidate=%s',
         float(dynamics_config.get('subgoal_flow_noise_scale', 1.0)),
         str(dynamics_config.get('subgoal_eval_selection', 'zero_noise')),
         int(dynamics_config.get('subgoal_eval_num_samples', 1)),

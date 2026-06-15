@@ -97,8 +97,6 @@ dynamics:
   value_p_curgoal: 0.2
   value_p_randomgoal: 0.3
   value_p_trajgoal: 0.5
-  subgoal_flow_energy_weighted: false
-  subgoal_flow_use_value_bonus: false
   subgoal_flow_steps: 8
   subgoal_flow_t_min: 0.0001
   subgoal_flow_noise_scale: 1.0

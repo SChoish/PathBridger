@@ -31,8 +31,6 @@ dynamics:
   theta_schedule: prefix_progress
   theta_total: 1.0
   progress_alpha: 0.8
-  subgoal_flow_energy_weighted: false
-  subgoal_flow_use_value_bonus: false
   subgoal_value_gap_scale: 5.0
   subgoal_value_weight_max: 5.0
   subgoal_flow_steps: 8

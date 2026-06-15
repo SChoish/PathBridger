@@ -22,8 +22,6 @@ dynamics:
   subgoal_value_gap_scale: 0.0
   subgoal_goal_representation: phi
   subgoal_target_mode: absolute
-  subgoal_flow_energy_weighted: false
-  subgoal_flow_use_value_bonus: false
   subgoal_flow_steps: 8
   subgoal_flow_t_min: 0.0001
   subgoal_flow_noise_scale: 1.0

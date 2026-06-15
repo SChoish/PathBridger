@@ -1571,55 +1571,26 @@ class DynamicsAgent(_DynamicsAgentCore):
             )
             subgoal_mse = jnp.mean((v_pred - v_target) ** 2, axis=-1)
 
-            if critic_value_params is None:
-                current_value = jnp.zeros((s.shape[0],), dtype=jnp.float32)
-                target_value = jnp.zeros_like(current_value)
-            else:
-                value_inputs = jnp.concatenate([s, target_abs], axis=0)
-                value_goals = jnp.concatenate([g_high, g_high], axis=0)
-                current_value, target_value = jnp.split(
-                    self._subgoal_values(value_inputs, value_goals, critic_value_params), 2, axis=0
-                )
-            subgoal_value_gap = target_value - current_value
-            subgoal_adv_logit = self._subgoal_adv_logit_from_gap(subgoal_value_gap)
-            subgoal_mse_weight = self._subgoal_mse_weight_from_gap(subgoal_value_gap)
+            sample_noise = jax.random.normal(sample_rng, target.shape, dtype=target.dtype)
+            sample_raw = self._subgoal_flow_sample_raw(s, g_high, sample_noise, params=grad_params)
+            sample_abs = self._subgoal_abs_from_raw(s, sample_raw)
+            (
+                subgoal_value,
+                current_value,
+                target_value,
+                subgoal_value_bonus,
+                subgoal_mse_weight,
+                subgoal_value_gap,
+                subgoal_adv_logit,
+                subgoal_trl_v_s_sg,
+                subgoal_trl_v_sg_g,
+            ) = self._subgoal_value_terms(s, sample_abs, target_abs, g_high, critic_value_params)
             subgoal_weight = jax.lax.stop_gradient(subgoal_mse_weight)
-            # PathBridger default: plain Flow-BC (no value-gap tilting). This
-            # diverges from douri, where the default was energy-weighted.
-            energy_weighted = bool(self.config.get('subgoal_flow_energy_weighted', False))
-            if energy_weighted:
-                weighted_subgoal_mse = subgoal_weight * subgoal_mse
-                loss_fm = jnp.mean(weighted_subgoal_mse)
-            else:
-                weighted_subgoal_mse = subgoal_mse
-                loss_fm = jnp.mean(subgoal_mse)
+            weighted_subgoal_mse = subgoal_weight * subgoal_mse
+            loss_fm = jnp.mean(weighted_subgoal_mse)
+            pred_sg_out = sample_raw
 
             zero = jnp.asarray(0.0, dtype=jnp.float32)
-            use_value_bonus = bool(self.config.get('subgoal_flow_use_value_bonus', False))
-            if use_value_bonus:
-                sample_noise = jax.random.normal(sample_rng, target.shape, dtype=target.dtype)
-                sample_raw = self._subgoal_flow_sample_raw(s, g_high, sample_noise, params=grad_params)
-                sample_abs = self._subgoal_abs_from_raw(s, sample_raw)
-                (
-                    subgoal_value,
-                    current_value_bonus,
-                    target_value_bonus,
-                    subgoal_value_bonus,
-                    _bonus_weight,
-                    _bonus_gap,
-                    _bonus_adv_logit,
-                    subgoal_trl_v_s_sg,
-                    subgoal_trl_v_sg_g,
-                ) = self._subgoal_value_terms(s, sample_abs, target_abs, g_high, critic_value_params)
-                pred_sg_out = sample_raw
-                current_value = current_value_bonus
-                target_value = target_value_bonus
-            else:
-                subgoal_value = target_value
-                subgoal_value_bonus = jnp.zeros_like(subgoal_mse)
-                subgoal_trl_v_s_sg = jnp.zeros_like(subgoal_mse)
-                subgoal_trl_v_sg_g = target_value
-                pred_sg_out = target
 
             velocity_reg = float(self.config.get('subgoal_flow_velocity_reg', 0.0))
             velocity_norm_sq = jnp.sum(v_pred ** 2, axis=-1)
@@ -1633,9 +1604,6 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_flow_loss': loss_sub,
                 'phase1/subgoal_flow_fm_raw': jnp.mean(subgoal_mse),
                 'phase1/subgoal_flow_weighted_fm': loss_fm,
-                'phase1/subgoal_flow_energy_weighted': jnp.asarray(
-                    1.0 if energy_weighted else 0.0, dtype=jnp.float32,
-                ),
                 'phase1/subgoal_flow_weight_mean': jnp.mean(subgoal_mse_weight),
                 'phase1/subgoal_flow_weight_max': jnp.max(subgoal_mse_weight),
                 'phase1/subgoal_flow_energy_weight_mean': jnp.mean(subgoal_mse_weight),
@@ -2174,10 +2142,6 @@ def _get_common_config():
             subgoal_flow_time_embed_dim=64,
             subgoal_flow_use_time_embedding=True,
             subgoal_flow_velocity_reg=0.0,
-            # PathBridger default: plain Flow-BC. Set True to reproduce douri's
-            # energy-weighted rectified-flow objective.
-            subgoal_flow_energy_weighted=False,
-            subgoal_flow_use_value_bonus=False,
             subgoal_eval_selection='zero_noise',
             subgoal_eval_num_samples=4,
             subgoal_eval_include_zero_candidate=True,

@@ -12,8 +12,6 @@ final_eval_episodes_per_task: 25
 eval_max_chunks: 200
 dynamics:
   subgoal_distribution: flow
-  subgoal_flow_energy_weighted: false
-  subgoal_flow_use_value_bonus: false
   subgoal_value_alpha: 0.0
   subgoal_value_gap_scale: 5.0
   subgoal_value_weight_max: 5.0
