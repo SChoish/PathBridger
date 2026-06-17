@@ -40,6 +40,7 @@ from main import (
 from utils.datasets import Dataset, PathHGCDataset
 from utils.goal_representation import infer_phi_goal_obs_indices, normalize_phi_goal_obs_indices
 from utils.env_utils import make_env_and_datasets
+from utils.eval_results_io import eval_result_path, save_eval_results
 from utils.run_io import (
     list_checkpoint_suffixes,
     load_checkpoint_pkl,
@@ -79,6 +80,12 @@ def main() -> None:
     p.add_argument('--eval_episodes_per_task', type=int, default=-1, help='-1 = use flags.')
     p.add_argument('--eval_max_chunks', type=int, default=-1, help='-1 = use flags.')
     p.add_argument(
+        '--subgoal_eval_num_samples',
+        type=int,
+        default=-1,
+        help='Override dynamics.subgoal_eval_num_samples for eval only; -1 = checkpoint config.',
+    )
+    p.add_argument(
         '--idm_action_chunk_horizon',
         type=int,
         default=5,
@@ -89,6 +96,11 @@ def main() -> None:
         '--subgoal_override_goal',
         action='store_true',
         help='Ablation: ignore predicted subgoals and use the final goal for both IDM and actor.',
+    )
+    p.add_argument(
+        '--skip_if_saved',
+        action='store_true',
+        help='Skip eval when run_dir/eval_results/epoch<E>_n<N>.json already exists.',
     )
     args = p.parse_args()
 
@@ -107,6 +119,8 @@ def main() -> None:
     seed = int(fg['seed']) if int(args.seed) < 0 else int(args.seed)
 
     dynamics_config, critic_config, actor_config = _build_configs(root, fg)
+    if int(args.subgoal_eval_num_samples) > 0:
+        dynamics_config['subgoal_eval_num_samples'] = int(args.subgoal_eval_num_samples)
     env_name = fg['env_name']
     dataset_dir = fg.get('dataset_dir', '')
     env, train_plain, _ = make_env_and_datasets(
@@ -162,10 +176,21 @@ def main() -> None:
         p.error('--idm_action_chunk_horizon must be >= 1')
     critic_eval['action_chunk_horizon'] = idm_h
 
+    eval_n = int(dynamics_config.get('subgoal_eval_num_samples', 1))
+    saved_path = eval_result_path(run_dir, epoch=int(args.epoch), eval_n=eval_n)
+    if bool(args.skip_if_saved) and saved_path.is_file():
+        with open(saved_path, encoding='utf-8') as f:
+            record = json.load(f)
+        print(f'Skip eval (already saved): {saved_path}')
+        print(f"eval_idm/success_rate_mean={record.get('idm_success_rate_mean', float('nan')):.4f}")
+        print(f"eval/success_rate_mean={record.get('actor_success_rate_mean', float('nan')):.4f}")
+        return
+
     print(f'Loaded epoch={ep} from {run_dir}')
     print(
         f'eval task_ids={task_ids} episodes_per_task={ep_task} max_chunks={max_chunks} '
         f'idm_action_chunk_horizon={idm_h} '
+        f'subgoal_eval_num_samples={dynamics_config.get("subgoal_eval_num_samples", "")} '
         f'subgoal_override_goal={bool(args.subgoal_override_goal)} '
         f'(training critic had {int(critic_config["action_chunk_horizon"])})'
     )
@@ -176,6 +201,7 @@ def main() -> None:
         actor_agent,
         actor_config,
         critic_eval,
+        critic_agent=critic_agent,
         task_ids=task_ids,
         episodes_per_task=ep_task,
         max_chunks=max_chunks,
@@ -197,6 +223,18 @@ def main() -> None:
         k = f'eval/task_{tid}/success_rate'
         if k in metrics:
             print(f'  {k}={metrics[k]:.4f}')
+
+    out_path = save_eval_results(
+        run_dir,
+        epoch=ep,
+        subgoal_eval_num_samples=eval_n,
+        task_ids=task_ids,
+        episodes_per_task=ep_task,
+        metrics=metrics,
+        fg=fg,
+        root=root,
+    )
+    print(f'Saved eval results: {out_path}')
 
 
 if __name__ == '__main__':

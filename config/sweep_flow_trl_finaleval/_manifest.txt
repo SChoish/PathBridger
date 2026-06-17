@@ -1,0 +1,37 @@
+# 32 configs (8 envs × 4 gaps)
+# order: puzzle (p3,p4) -> cube (cs,cd,ct) -> antmaze (amm,aml,amg)
+# critic: utils/trl_critic_config.py gap10 baseline
+# train: gap=[1.0, 3.0, 5.0, 10.0]; wmax=5.0; subgoal_num_samples=1
+# post-train final eval: subgoal_eval_num_samples=[1, 2, 4, 8, 16]; episodes_per_task=25
+config/sweep_flow_trl_finaleval/p3_g1_w5_n1.yaml
+config/sweep_flow_trl_finaleval/p3_g3_w5_n1.yaml
+config/sweep_flow_trl_finaleval/p3_g5_w5_n1.yaml
+config/sweep_flow_trl_finaleval/p3_g10_w5_n1.yaml
+config/sweep_flow_trl_finaleval/p4_g1_w5_n1.yaml
+config/sweep_flow_trl_finaleval/p4_g3_w5_n1.yaml
+config/sweep_flow_trl_finaleval/p4_g5_w5_n1.yaml
+config/sweep_flow_trl_finaleval/p4_g10_w5_n1.yaml
+config/sweep_flow_trl_finaleval/cs_g1_w5_n1.yaml
+config/sweep_flow_trl_finaleval/cs_g3_w5_n1.yaml
+config/sweep_flow_trl_finaleval/cs_g5_w5_n1.yaml
+config/sweep_flow_trl_finaleval/cs_g10_w5_n1.yaml
+config/sweep_flow_trl_finaleval/cd_g1_w5_n1.yaml
+config/sweep_flow_trl_finaleval/cd_g3_w5_n1.yaml
+config/sweep_flow_trl_finaleval/cd_g5_w5_n1.yaml
+config/sweep_flow_trl_finaleval/cd_g10_w5_n1.yaml
+config/sweep_flow_trl_finaleval/ct_g1_w5_n1.yaml
+config/sweep_flow_trl_finaleval/ct_g3_w5_n1.yaml
+config/sweep_flow_trl_finaleval/ct_g5_w5_n1.yaml
+config/sweep_flow_trl_finaleval/ct_g10_w5_n1.yaml
+config/sweep_flow_trl_finaleval/amm_g1_w5_n1.yaml
+config/sweep_flow_trl_finaleval/amm_g3_w5_n1.yaml
+config/sweep_flow_trl_finaleval/amm_g5_w5_n1.yaml
+config/sweep_flow_trl_finaleval/amm_g10_w5_n1.yaml
+config/sweep_flow_trl_finaleval/aml_g1_w5_n1.yaml
+config/sweep_flow_trl_finaleval/aml_g3_w5_n1.yaml
+config/sweep_flow_trl_finaleval/aml_g5_w5_n1.yaml
+config/sweep_flow_trl_finaleval/aml_g10_w5_n1.yaml
+config/sweep_flow_trl_finaleval/amg_g1_w5_n1.yaml
+config/sweep_flow_trl_finaleval/amg_g3_w5_n1.yaml
+config/sweep_flow_trl_finaleval/amg_g5_w5_n1.yaml
+config/sweep_flow_trl_finaleval/amg_g10_w5_n1.yaml

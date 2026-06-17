@@ -37,6 +37,7 @@ from utils.env_utils import make_env_and_datasets
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from utils.ogbench_eval_rollout import rollout_chunked_eval_episode
+from utils.eval_results_io import eval_result_path, save_eval_results
 from utils.run_io import parse_int_list
 from utils.goal_representation import infer_phi_goal_obs_indices, normalize_phi_goal_obs_indices
 
@@ -145,6 +146,12 @@ flags.DEFINE_integer(
     'final_eval_episodes_per_task',
     25,
     'If > 0, override eval_episodes_per_task for the final training epoch evaluation only.',
+)
+flags.DEFINE_string(
+    'final_eval_subgoal_eval_num_samples',
+    '',
+    'Comma-separated subgoal_eval_num_samples for final-epoch env eval only (e.g. "1,2,4,8,16"). '
+    'Empty = single eval using dynamics.subgoal_eval_num_samples.',
 )
 flags.DEFINE_integer('eval_max_chunks', 200, 'Maximum action chunks to execute per evaluation episode.')
 flags.DEFINE_integer(
@@ -963,6 +970,29 @@ def _idm_action_chunk(
     return action_chunk[0]
 
 
+def _log_eval_run_logger(
+    run_logger: logging.Logger,
+    *,
+    epoch: int,
+    eval_task_ids: tuple[int, ...],
+    metrics: dict[str, Any],
+    header: str,
+) -> None:
+    run_logger.info('%s epoch=%d num_tasks=%d stat_episodes_per_task=%d', header, epoch, int(metrics.get('eval/num_tasks', 0.0)), int(metrics.get('eval/episodes_per_task', 0.0)))
+    run_logger.info('[IDM POLICY] primary_success=any_step_info_success')
+    run_logger.info('idm env_success_rate_mean=%.2f', metrics.get('eval_idm/success_rate_mean', float('nan')))
+    for task_id in eval_task_ids:
+        task_key = f'eval_idm/task_{task_id}/success_rate'
+        if task_key in metrics:
+            run_logger.info('idm task_%d env=%.2f', task_id, metrics[task_key])
+    run_logger.info('[ACTOR POLICY] (same success definition)')
+    run_logger.info('actor env_success_rate_mean=%.2f', metrics.get('eval/success_rate_mean', float('nan')))
+    for task_id in eval_task_ids:
+        task_key = f'eval/task_{task_id}/success_rate'
+        if task_key in metrics:
+            run_logger.info('actor task_%d env=%.2f', task_id, metrics[task_key])
+
+
 def _evaluate_env_tasks(
     env,
     dynamics_agent: DynamicsAgent,
@@ -1282,6 +1312,7 @@ def main(_):
     eval_task_ids = parse_int_list(FLAGS.eval_task_ids)
     eval_episodes_per_task = max(1, int(FLAGS.eval_episodes_per_task))
     final_eval_episodes_per_task = max(0, int(FLAGS.final_eval_episodes_per_task))
+    final_eval_n_values = parse_int_list(str(FLAGS.final_eval_subgoal_eval_num_samples))
     eval_max_chunks = max(1, int(FLAGS.eval_max_chunks))
     run_logger.info(
         'shared_valid_starts=%d batch_size=%d steps_per_epoch=%d dyn_h=%d critic_h=%d actor_h=%d',
@@ -1332,10 +1363,11 @@ def main(_):
         bool(dynamics_config.get('subgoal_use_mean_for_actor_goal', True)),
     )
     run_logger.info(
-        'subgoal_flow noise_scale=%.4g eval_selection=%s eval_num_samples=%d eval_include_zero_candidate=%s',
+        'subgoal_flow noise_scale=%.4g eval_selection=%s eval_num_samples=%d final_eval_n_values=%s eval_include_zero_candidate=%s',
         float(dynamics_config.get('subgoal_flow_noise_scale', 1.0)),
         str(dynamics_config.get('subgoal_eval_selection', 'zero_noise')),
         int(dynamics_config.get('subgoal_eval_num_samples', 1)),
+        str(final_eval_n_values) if final_eval_n_values else 'off',
         bool(dynamics_config.get('subgoal_eval_include_zero_candidate', True)),
     )
     run_logger.info(
@@ -1511,30 +1543,110 @@ def main(_):
             _emit_metric_means(metrics, 'train/actor', actor_metric_sums, steps_done)
             _emit_metric_means(metrics, 'train/coupling', coupling_metric_sums, steps_done)
             metrics['train/epoch'] = float(epoch)
+            did_final_n_sweep = False
             if eval_freq > 0 and epoch % eval_freq == 0:
+                is_final_epoch = epoch == int(FLAGS.train_epochs)
                 eval_episode_count = (
                     final_eval_episodes_per_task
-                    if final_eval_episodes_per_task > 0 and epoch == int(FLAGS.train_epochs)
+                    if final_eval_episodes_per_task > 0 and is_final_epoch
                     else eval_episodes_per_task
                 )
-                metrics.update(
-                    _evaluate_env_tasks(
-                        env,
-                        dynamics_agent,
-                        actor_agent,
-                        actor_config,
-                        critic_config,
-                        critic_agent=critic_agent,
-                        task_ids=eval_task_ids,
-                        episodes_per_task=eval_episode_count,
-                        max_chunks=eval_max_chunks,
-                        video_episodes_per_task=int(FLAGS.eval_video_episodes_per_task),
-                        video_frame_skip=int(FLAGS.eval_video_frame_skip),
-                        video_fps=int(FLAGS.eval_video_fps),
-                        wandb_enabled=bool(FLAGS.use_wandb),
-                        subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
+                if is_final_epoch and final_eval_n_values:
+                    did_final_n_sweep = True
+                    with open(os.path.join(run_dir, 'flags.json'), encoding='utf-8') as f:
+                        flags_root = json.load(f)
+                    orig_eval_n = int(dynamics_config.get('subgoal_eval_num_samples', 1))
+                    last_eval_metrics: dict[str, Any] = {}
+                    for eval_n in final_eval_n_values:
+                        out_path = eval_result_path(run_dir, epoch=epoch, eval_n=eval_n)
+                        if out_path.is_file():
+                            run_logger.info('SKIP final N=%d eval (already saved %s)', eval_n, out_path)
+                            with open(out_path, encoding='utf-8') as f:
+                                saved = json.load(f)
+                            last_eval_metrics = {
+                                'eval/num_tasks': float(len(eval_task_ids)),
+                                'eval/episodes_per_task': float(eval_episode_count),
+                                'eval_idm/success_rate_mean': float(saved['idm_success_rate_mean']),
+                                'eval/success_rate_mean': float(saved['actor_success_rate_mean']),
+                            }
+                            for tid in eval_task_ids:
+                                idm_tasks = saved.get('idm_task_success_rates', {})
+                                actor_tasks = saved.get('actor_task_success_rates', {})
+                                if str(tid) in idm_tasks:
+                                    last_eval_metrics[f'eval_idm/task_{tid}/success_rate'] = float(idm_tasks[str(tid)])
+                                if str(tid) in actor_tasks:
+                                    last_eval_metrics[f'eval/task_{tid}/success_rate'] = float(actor_tasks[str(tid)])
+                            continue
+                        dynamics_config['subgoal_eval_num_samples'] = eval_n
+                        eval_dynamics_agent = dynamics_agent.replace(
+                            config=dynamics_agent.config.copy({'subgoal_eval_num_samples': eval_n}),
+                        )
+                        feval_metrics = _evaluate_env_tasks(
+                            env,
+                            eval_dynamics_agent,
+                            actor_agent,
+                            actor_config,
+                            critic_config,
+                            critic_agent=critic_agent,
+                            task_ids=eval_task_ids,
+                            episodes_per_task=eval_episode_count,
+                            max_chunks=eval_max_chunks,
+                            video_episodes_per_task=int(FLAGS.eval_video_episodes_per_task),
+                            video_frame_skip=int(FLAGS.eval_video_frame_skip),
+                            video_fps=int(FLAGS.eval_video_fps),
+                            wandb_enabled=bool(FLAGS.use_wandb),
+                            subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
+                        )
+                        saved_path = save_eval_results(
+                            run_dir,
+                            epoch=epoch,
+                            subgoal_eval_num_samples=eval_n,
+                            task_ids=eval_task_ids,
+                            episodes_per_task=eval_episode_count,
+                            metrics=feval_metrics,
+                            fg=flags_root['flags'],
+                            root=flags_root,
+                        )
+                        run_logger.info('=== FINAL EVAL START epoch=%d eval_n=%d ===', epoch, eval_n)
+                        _log_eval_run_logger(
+                            run_logger,
+                            epoch=epoch,
+                            eval_task_ids=eval_task_ids,
+                            metrics=feval_metrics,
+                            header='final_eval',
+                        )
+                        run_logger.info(
+                            '=== FINAL EVAL END epoch=%d eval_n=%d saved=%s ===',
+                            epoch,
+                            eval_n,
+                            saved_path,
+                        )
+                        last_eval_metrics = feval_metrics
+                        for key, val in feval_metrics.items():
+                            if key.startswith('eval') or key.startswith('evaluation'):
+                                metrics[f'feval_n{eval_n}/{key}'] = val
+                    dynamics_config['subgoal_eval_num_samples'] = orig_eval_n
+                    if last_eval_metrics:
+                        metrics.update(last_eval_metrics)
+                else:
+                    metrics.update(
+                        _evaluate_env_tasks(
+                            env,
+                            dynamics_agent,
+                            actor_agent,
+                            actor_config,
+                            critic_config,
+                            critic_agent=critic_agent,
+                            task_ids=eval_task_ids,
+                            episodes_per_task=eval_episode_count,
+                            max_chunks=eval_max_chunks,
+                            video_episodes_per_task=int(FLAGS.eval_video_episodes_per_task),
+                            video_frame_skip=int(FLAGS.eval_video_frame_skip),
+                            video_fps=int(FLAGS.eval_video_fps),
+                            wandb_enabled=bool(FLAGS.use_wandb),
+                            subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
+                        )
                     )
-                )
             if measure_timing:
                 metrics['time/data_epoch_sec'] = data_time
                 metrics['time/build_batches_epoch_sec'] = build_time
@@ -1561,7 +1673,7 @@ def main(_):
                 epoch,
                 _format_epoch_log(metrics),
             )
-            if eval_freq > 0 and epoch % eval_freq == 0:
+            if eval_freq > 0 and epoch % eval_freq == 0 and not did_final_n_sweep:
                 num_tasks = int(metrics.get('eval/num_tasks', 0.0))
                 episodes_per_task = int(metrics.get('eval/episodes_per_task', 0.0))
                 video_eps = int(metrics.get('eval/video_episodes_per_task', 0.0))
@@ -1572,24 +1684,13 @@ def main(_):
                     episodes_per_task,
                     video_eps,
                 )
-                run_logger.info('[IDM POLICY] primary_success=any_step_info_success')
-                run_logger.info(
-                    'idm env_success_rate_mean=%.2f',
-                    metrics.get('eval_idm/success_rate_mean', float('nan')),
+                _log_eval_run_logger(
+                    run_logger,
+                    epoch=epoch,
+                    eval_task_ids=eval_task_ids,
+                    metrics=metrics,
+                    header='eval',
                 )
-                for task_id in eval_task_ids:
-                    task_key = f'eval_idm/task_{task_id}/success_rate'
-                    if task_key in metrics:
-                        run_logger.info('idm task_%d env=%.2f', task_id, metrics[task_key])
-                run_logger.info('[ACTOR POLICY] (same success definition)')
-                run_logger.info(
-                    'actor env_success_rate_mean=%.2f',
-                    metrics.get('eval/success_rate_mean', float('nan')),
-                )
-                for task_id in eval_task_ids:
-                    task_key = f'eval/task_{task_id}/success_rate'
-                    if task_key in metrics:
-                        run_logger.info('actor task_%d env=%.2f', task_id, metrics[task_key])
                 run_logger.info('=== EVAL END epoch=%d ===', epoch)
 
         if epoch % FLAGS.save_every_n_epochs == 0:
