@@ -16,7 +16,7 @@ WITH_CUDA="${ROOT}/scripts/with_jax_cuda.sh"
 LOG_DIR="${ROOT}/nohup_logs"
 LOG_TAG="flow_trl_eval_temp_p3_cd_ct"
 MASTER_LOG="${LOG_DIR}/${LOG_TAG}_master.log"
-DOC_LOG="${ROOT}/docs/flow_trl_eval_temp_p3_cd_ct.log"
+DOC_LOG="${LOG_DIR}/${LOG_TAG}_summary.log"
 
 # run_dir|label|eval_n
 JOBS=(

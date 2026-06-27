@@ -23,7 +23,7 @@ WITH_CUDA="${ROOT}/scripts/with_jax_cuda.sh"
 LOG_DIR="${ROOT}/nohup_logs"
 LOG_TAG="flow_trl_eval_giant_cap4000"
 MASTER_LOG="${LOG_DIR}/${LOG_TAG}_master.log"
-DOC_LOG="${ROOT}/docs/${LOG_TAG}.log"
+DOC_LOG="${LOG_DIR}/${LOG_TAG}_summary.log"
 
 TEMPS=(1.0 0.5)
 EVAL_NS=(2 8 16 32)
