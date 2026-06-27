@@ -124,7 +124,7 @@ flags.DEFINE_string('run_group', 'Debug', 'W&B group.')
 flags.DEFINE_integer('seed', 0, 'Seed.')
 flags.DEFINE_string('env_name', 'antmaze-medium-navigate-v0', 'OGBench env / dataset name.')
 flags.DEFINE_integer('train_steps', 0, 'Total gradient steps. If <= 0, use train_epochs * steps_per_epoch.')
-flags.DEFINE_integer('log_every_n_steps', 0, 'Log interval in gradient steps. If <= 0, use log_every_n_epochs * steps_per_epoch.')
+flags.DEFINE_integer('log_every_n_steps', 10000, 'Log interval in gradient steps. If <= 0, use log_every_n_epochs * steps_per_epoch.')
 flags.DEFINE_integer('save_every_n_steps', 0, 'Checkpoint interval in gradient steps. If <= 0, use save_every_n_epochs * steps_per_epoch.')
 flags.DEFINE_integer('eval_every_n_steps', 0, 'Non-final eval interval in gradient steps. If <= 0, use eval_freq * steps_per_epoch.')
 flags.DEFINE_integer('train_epochs', 600, 'Deprecated: converted to train_steps when train_steps <= 0.')
@@ -286,6 +286,10 @@ def _apply_yaml_to_flags(data: dict) -> tuple[dict, dict, dict]:
         dynamics_updates.setdefault('forward_bridge', data.pop('forward_bridge'))
     # Deprecated: eval now always runs to the environment's max episode length.
     data.pop('eval_max_chunks', None)
+    # When the step-based eval interval is explicitly configured, do not let
+    # the legacy default eval_freq=100 re-enable intermediate eval.
+    if 'eval_every_n_steps' in data and 'eval_freq' not in data and not _argv_sets_flag('eval_freq'):
+        data['eval_freq'] = 0
 
     # Flatten ``dynamics.forward_bridge: { mode, noise_scale, ... }`` into the
     # individual ``forward_bridge_*`` keys recognised by the dynamics config.
@@ -1594,7 +1598,6 @@ def main(_):
             _emit_metric_means(metrics, 'train/actor', actor_metric_sums, steps_since_log)
             _emit_metric_means(metrics, 'train/coupling', coupling_metric_sums, steps_since_log)
             metrics['train/step'] = float(step)
-            metrics['train/epoch_equiv'] = float(step) / float(spe)
             metrics['train/steps_per_epoch'] = float(spe)
 
             did_final_n_sweep = False
@@ -1719,9 +1722,8 @@ def main(_):
                 wandb.log(metrics, step=step)
             train_logger.log(metrics, step=step)
             run_logger.info(
-                'step=%d epoch_equiv=%.3f %s',
+                'step=%d %s',
                 step,
-                float(step) / float(spe),
                 _format_step_log(metrics),
             )
             if do_regular_eval and not did_final_n_sweep:
