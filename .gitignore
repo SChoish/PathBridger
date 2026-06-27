@@ -9,6 +9,7 @@ checkpoints/
 runs/
 prev_runs/
 nohup_logs/
+local_reports/
 docs/*.log
 docs/*.zip
 docs/renders/

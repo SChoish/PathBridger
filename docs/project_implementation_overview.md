@@ -164,7 +164,7 @@ Success 판정은 OGBench env의 `info["success"]`를 기준으로 합니다.
 
 - `scripts/docs_output_paths.py`가 output naming을 중앙에서 관리합니다.
 - `summarize_feval_results.py` → `docs/flow_trl_feval_results_choi.csv/.md`
-- `summarize_runs.py` → `docs/runs_results_total_choi.csv`, `docs/runs_results_summary_choi.md`, douri 대응 파일
+- `summarize_runs.py` → `local_reports/*runs_results*_choi.csv/.md` (docs 밖의 로컬 보조 리포트)
 - `export_trl_completed_results.py` → `docs/trl_completed_results_choi.csv`
 
 suffix 없는 generated CSV/MD는 stale artifact로 취급합니다.

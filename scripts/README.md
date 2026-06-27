@@ -44,7 +44,7 @@
 | 파일 | 출력 |
 | --- | --- |
 | `summarize_feval_results.py` | `docs/flow_trl_feval_results_choi.csv/.md` |
-| `summarize_runs.py` | `docs/*runs_results*_choi.csv/.md` |
+| `summarize_runs.py` | `local_reports/*runs_results*_choi.csv/.md` |
 | `export_trl_completed_results.py` | `docs/trl_completed_results_choi.csv` |
 
 ## 제거된 Legacy 범위

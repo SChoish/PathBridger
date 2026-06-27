@@ -7,11 +7,12 @@ import glob
 import os
 from datetime import datetime
 
-from docs_output_paths import docs_output_path
+from docs_output_paths import DOCS_SUFFIX
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.join(SCRIPT_DIR, "..")
 DOURI_ROOT = os.path.normpath(os.path.join(PROJECT_ROOT, "..", "douri"))
+LOCAL_REPORTS_DIR = os.path.join(PROJECT_ROOT, "local_reports")
 
 CSV_COLUMNS = [
     "run_dir", "algo", "env", "ep", "gap", "maxgap", "N", "gamma",
@@ -23,14 +24,14 @@ RUN_TARGETS = [
     {
         "name": "Pathbridger",
         "runs_dir": os.path.join(PROJECT_ROOT, "runs"),
-        "out_md": docs_output_path(PROJECT_ROOT, "runs_results_summary", "md"),
-        "out_csv": docs_output_path(PROJECT_ROOT, "runs_results_total", "csv"),
+        "out_md": os.path.join(LOCAL_REPORTS_DIR, f"runs_results_summary_{DOCS_SUFFIX}.md"),
+        "out_csv": os.path.join(LOCAL_REPORTS_DIR, f"runs_results_total_{DOCS_SUFFIX}.csv"),
     },
     {
         "name": "douri",
         "runs_dir": os.path.join(DOURI_ROOT, "runs"),
-        "out_md": docs_output_path(PROJECT_ROOT, "douri_runs_results_summary", "md"),
-        "out_csv": docs_output_path(PROJECT_ROOT, "douri_runs_results_total", "csv"),
+        "out_md": os.path.join(LOCAL_REPORTS_DIR, f"douri_runs_results_summary_{DOCS_SUFFIX}.md"),
+        "out_csv": os.path.join(LOCAL_REPORTS_DIR, f"douri_runs_results_total_{DOCS_SUFFIX}.csv"),
     },
 ]
 

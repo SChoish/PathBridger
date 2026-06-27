@@ -4,7 +4,7 @@ OGBench 기반 오프라인 goal-conditioned control 실험 코드입니다. 현
 
 - Dynamics는 `forward_bridge_residual` planner를 중심으로, closed-form forward bridge mean 위에 endpoint-preserving `PathResidualNet` residual을 얹습니다. Flow subgoal은 `subgoal_distribution: flow`, `subgoal_eval_selection: best_of_n_value`로 eval-time BoN을 지원합니다.
 - Critic은 현재 sweep에서 `critic_type: trl`을 사용합니다. `CriticSequenceDataset`이 same-trajectory value/TRL targets를 만들고, policy/value goal sampling ratio는 환경별 config preset으로 관리합니다.
-- `docs/`에 생성되는 CSV/MD artifact는 이 로컬에서 `_choi` suffix를 붙입니다. 예: `flow_trl_feval_results_choi.csv`, `runs_results_total_choi.csv`.
+- `docs/`에는 현재 설명 문서와 `_choi` suffix 핵심 결과만 둡니다. run/douri 전체 요약처럼 보조적인 로컬 리포트는 `local_reports/`로 생성합니다.
 
 [^goub]: Generalized Ornstein-Uhlenbeck Bridge.
 [^dqc]: Decoupled Q Chunking.
@@ -328,7 +328,8 @@ PYTHONPATH=. MUJOCO_GL=egl python -m rollout.manip_play_state_rollout --run_dir=
 | `run_flow_trl_*_sweep.sh` | Flow+TRL sweep 실행 |
 | `run_flow_trl_eval_giant_cap4000.sh` | antmaze-giant full-cap final eval |
 | `run_flow_k_sweep*.sh`, `run_flow_h25_ha10.sh` | K/horizon follow-up 실행 |
-| `summarize_feval_results.py`, `summarize_runs.py` | `_choi` suffix docs CSV/MD 생성 |
+| `summarize_feval_results.py` | `docs/flow_trl_feval_results_choi.csv/.md` 생성 |
+| `summarize_runs.py` | `local_reports/*_choi.csv/.md` 생성 |
 | `docs_output_paths.py` | generated docs output naming helper |
 
 예시:
@@ -337,8 +338,10 @@ PYTHONPATH=. MUJOCO_GL=egl python -m rollout.manip_play_state_rollout --run_dir=
 # Flow+TRL humanoidmaze distance-weight sweep
 GPU_ID=0 nohup bash scripts/run_flow_trl_humanoidmaze_dw_sweep.sh > nohup_logs/flow_trl_humanoidmaze_dw.out 2>&1 &
 
-# Regenerate local generated docs artifacts with _choi suffix
+# Regenerate core docs artifacts with _choi suffix
 PYTHONPATH=.:scripts python scripts/summarize_feval_results.py
+
+# Optional local run summaries (not under docs/)
 PYTHONPATH=.:scripts python scripts/summarize_runs.py
 ```
 
