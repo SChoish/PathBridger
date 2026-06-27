@@ -13,6 +13,20 @@ import numpy as np
 from utils.ogbench_eval_helpers import append_ogbench_render, update_episode_env_success
 
 
+def _env_max_episode_steps(env: Any) -> int:
+    """Return the Gym/Gymnasium episode cap used as the eval rollout budget."""
+    spec = getattr(env, 'spec', None)
+    max_steps = getattr(spec, 'max_episode_steps', None) if spec is not None else None
+    if max_steps is None:
+        max_steps = getattr(env, '_max_episode_steps', None)
+    if max_steps is None:
+        raise ValueError('Evaluation env must expose max_episode_steps.')
+    max_steps = int(max_steps)
+    if max_steps < 1:
+        raise ValueError(f'env max_episode_steps must be >= 1, got {max_steps}.')
+    return max_steps
+
+
 def execute_action_chunk_eval(
     env: Any,
     obs: np.ndarray,
@@ -25,6 +39,7 @@ def execute_action_chunk_eval(
     should_render: bool = False,
     video_frame_skip: int = 4,
     step_counter: list[int] | None = None,
+    max_episode_steps: int | None = None,
 ) -> tuple[np.ndarray, bool, bool, bool]:
     """Advance env for one action chunk; stop stepping only on ``terminated`` or ``truncated``.
 
@@ -37,6 +52,9 @@ def execute_action_chunk_eval(
     for action in np.asarray(action_chunk, dtype=np.float32):
         if terminated or truncated:
             break
+        if step_counter is not None and max_episode_steps is not None and int(step_counter[0]) >= int(max_episode_steps):
+            truncated = True
+            break
         clipped = np.clip(action, low, high)
         step_ix = int(step_counter[0]) if step_counter is not None else 0
         _ob, _reward, term, trunc, info = env.step(clipped)
@@ -44,17 +62,18 @@ def execute_action_chunk_eval(
         terminated = bool(term)
         truncated = bool(trunc)
         saw_env_success = update_episode_env_success(saw_env_success, info)
-        if step_counter is not None and render_buf is not None:
+        if step_counter is not None:
             done = bool(terminated or truncated)
-            append_ogbench_render(
-                render_buf,
-                env,
-                goal_frame,
-                should_render=bool(should_render),
-                step=step_ix,
-                done=done,
-                video_frame_skip=int(video_frame_skip),
-            )
+            if render_buf is not None:
+                append_ogbench_render(
+                    render_buf,
+                    env,
+                    goal_frame,
+                    should_render=bool(should_render),
+                    step=step_ix,
+                    done=done,
+                    video_frame_skip=int(video_frame_skip),
+                )
             step_counter[0] = step_ix + 1
     return obs, saw_env_success, terminated, truncated
 
@@ -65,7 +84,6 @@ def rollout_chunked_eval_episode(
     goal0: np.ndarray,
     low: np.ndarray,
     high: np.ndarray,
-    max_chunks: int,
     *,
     sample_action_chunk: Callable[[np.ndarray, np.ndarray], np.ndarray],
     render_buf: list[np.ndarray] | None = None,
@@ -73,19 +91,18 @@ def rollout_chunked_eval_episode(
     should_render: bool = False,
     video_frame_skip: int = 4,
 ) -> bool:
-    """Replanning rollout until ``terminated``/``truncated`` or chunk budget.
+    """Replanning rollout until the environment reaches its max episode length.
 
     Returns ``True`` iff the env reported ``info['success']`` at any step.
     """
     obs = np.asarray(obs0, dtype=np.float32).reshape(-1)
     goal = np.asarray(goal0, dtype=np.float32).reshape(-1)
-    step_counter = [0] if (should_render and render_buf is not None) else None
+    max_episode_steps = _env_max_episode_steps(env)
+    step_counter = [0]
     cum_env = False
     terminated = False
     truncated = False
-    for _ in range(max(1, int(max_chunks))):
-        if terminated or truncated:
-            break
+    while not (terminated or truncated) and int(step_counter[0]) < max_episode_steps:
         chunk = sample_action_chunk(obs, goal)
         obs, saw_e, term, trunc = execute_action_chunk_eval(
             env,
@@ -98,6 +115,7 @@ def rollout_chunked_eval_episode(
             should_render=bool(should_render and render_buf is not None),
             video_frame_skip=video_frame_skip,
             step_counter=step_counter,
+            max_episode_steps=max_episode_steps,
         )
         cum_env = cum_env or saw_e
         terminated = terminated or term

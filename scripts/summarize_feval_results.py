@@ -44,7 +44,6 @@ CSV_COLUMNS = [
     'vdist_pow',
     'subgoal_eval_selection',
     'temperature',
-    'eval_max_chunks',
     'eval_episodes_per_task',
     'final_eval_episodes_per_task',
     'epoch',
@@ -94,19 +93,18 @@ def _eval_n_from_path(path: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def _parse_eval_json_name(path: str) -> tuple[int, int, float, int]:
-    """Return (epoch, eval_n, temperature, eval_max_chunks)."""
+def _parse_eval_json_name(path: str) -> tuple[int, int, float]:
+    """Return (epoch, eval_n, temperature)."""
     bn = os.path.basename(path)
     m = re.match(r'epoch(\d+)(?:_t([\dp]+))?(?:_m(\d+))?_n(\d+)\.json$', bn)
     if not m:
-        return 600, _eval_n_from_path(path), 1.0, 200
+        return 600, _eval_n_from_path(path), 1.0
     epoch = int(m.group(1))
     temp = 1.0
     if m.group(2):
         temp = float(m.group(2).replace('p', '.'))
     eval_n = int(m.group(4))
-    max_chunks = int(m.group(3)) if m.group(3) else 200
-    return epoch, eval_n, temp, max_chunks
+    return epoch, eval_n, temp
 
 
 def _row_key(row: dict) -> tuple:
@@ -115,7 +113,6 @@ def _row_key(row: dict) -> tuple:
         int(row.get('epoch', 600)),
         int(row['eval_n']),
         float(row.get('temperature', 1.0) or 1.0),
-        int(row.get('eval_max_chunks', 200) or 200),
     )
 
 
@@ -152,18 +149,15 @@ def _append_row(
     run_uid = f'{run_group}|{run_start_ts}' if run_start_ts else run_group
     idm_tasks = rec.get('idm_task_success_rates', {}) or {}
     actor_tasks = rec.get('actor_task_success_rates', {}) or {}
-    _, eval_n, temp, max_chunks = _parse_eval_json_name(json_path) if json_path else (
+    _, eval_n, temp = _parse_eval_json_name(json_path) if json_path else (
         int(rec.get('epoch', final_epoch)),
         int(rec.get('subgoal_eval_num_samples', rec.get('eval_n', 0))),
         float(rec.get('subgoal_temperature', 1.0)),
-        int(rec.get('eval_max_chunks', 200)),
     )
     if 'subgoal_eval_num_samples' in rec:
         eval_n = int(rec['subgoal_eval_num_samples'])
     if 'subgoal_temperature' in rec:
         temp = float(rec['subgoal_temperature'])
-    if 'eval_max_chunks' in rec:
-        max_chunks = int(rec['eval_max_chunks'])
     config_name = params.get('config', run_group.replace('flow_trl_feval_', ''))
     horizon_val = params.get('horizon', rec.get('horizon', ''))
     rows.append({
@@ -184,7 +178,6 @@ def _append_row(
         'vdist_pow': params.get('vdist_pow', ''),
         'subgoal_eval_selection': params.get('subgoal_eval_selection', ''),
         'temperature': temp,
-        'eval_max_chunks': max_chunks,
         'eval_episodes_per_task': params.get('eval_episodes_per_task', rec.get('eval_episodes_per_task', '')),
         'final_eval_episodes_per_task': params.get(
             'final_eval_episodes_per_task', rec.get('eval_episodes_per_task', ''),

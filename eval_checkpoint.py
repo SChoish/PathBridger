@@ -78,7 +78,6 @@ def main() -> None:
     p.add_argument('--seed', type=int, default=-1, help='Agent RNG seed; -1 uses flags.json flags.seed.')
     p.add_argument('--eval_task_ids', type=str, default='', help='Override e.g. "1,2,3,4,5" (empty = flags).')
     p.add_argument('--eval_episodes_per_task', type=int, default=-1, help='-1 = use flags.')
-    p.add_argument('--eval_max_chunks', type=int, default=-1, help='-1 = use flags.')
     p.add_argument(
         '--subgoal_eval_num_samples',
         type=int,
@@ -178,7 +177,6 @@ def main() -> None:
         str(fg.get('eval_task_ids', '1'))
     )
     ep_task = int(fg['eval_episodes_per_task']) if int(args.eval_episodes_per_task) < 0 else int(args.eval_episodes_per_task)
-    max_chunks = int(fg['eval_max_chunks']) if int(args.eval_max_chunks) < 0 else int(args.eval_max_chunks)
 
     critic_eval = copy.deepcopy(critic_config)
     idm_h = int(args.idm_action_chunk_horizon)
@@ -192,7 +190,6 @@ def main() -> None:
         epoch=int(args.epoch),
         eval_n=eval_n,
         subgoal_temperature=eval_temperature,
-        eval_max_chunks=max_chunks,
     )
     if bool(args.skip_if_saved) and saved_path.is_file():
         with open(saved_path, encoding='utf-8') as f:
@@ -204,7 +201,7 @@ def main() -> None:
 
     print(f'Loaded epoch={ep} from {run_dir}')
     print(
-        f'eval task_ids={task_ids} episodes_per_task={ep_task} max_chunks={max_chunks} '
+        f'eval task_ids={task_ids} episodes_per_task={ep_task} budget=env_max_episode_steps '
         f'idm_action_chunk_horizon={idm_h} '
         f'subgoal_eval_num_samples={dynamics_config.get("subgoal_eval_num_samples", "")} '
         f'subgoal_temperature={dynamics_config.get("subgoal_temperature", "")} '
@@ -221,7 +218,6 @@ def main() -> None:
         critic_agent=critic_agent,
         task_ids=task_ids,
         episodes_per_task=ep_task,
-        max_chunks=max_chunks,
         video_episodes_per_task=0,
         video_frame_skip=4,
         video_fps=15,
@@ -251,7 +247,6 @@ def main() -> None:
         fg=fg,
         root=root,
         subgoal_temperature=eval_temperature,
-        eval_max_chunks=max_chunks,
     )
     print(f'Saved eval results: {out_path}')
 

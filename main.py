@@ -153,7 +153,6 @@ flags.DEFINE_string(
     'Comma-separated subgoal_eval_num_samples for final-epoch env eval only (e.g. "1,2,4,8,16"). '
     'Empty = single eval using dynamics.subgoal_eval_num_samples.',
 )
-flags.DEFINE_integer('eval_max_chunks', 200, 'Maximum action chunks to execute per evaluation episode.')
 flags.DEFINE_integer(
     'eval_video_episodes_per_task',
     0,
@@ -258,6 +257,8 @@ def _apply_yaml_to_flags(data: dict) -> tuple[dict, dict, dict]:
     if 'forward_bridge' in data:
         dynamics_updates = dynamics_updates or {}
         dynamics_updates.setdefault('forward_bridge', data.pop('forward_bridge'))
+    # Deprecated: eval now always runs to the environment's max episode length.
+    data.pop('eval_max_chunks', None)
 
     # Flatten ``dynamics.forward_bridge: { mode, noise_scale, ... }`` into the
     # individual ``forward_bridge_*`` keys recognised by the dynamics config.
@@ -1003,7 +1004,6 @@ def _evaluate_env_tasks(
     critic_agent: Any | None = None,
     task_ids: tuple[int, ...],
     episodes_per_task: int,
-    max_chunks: int,
     video_episodes_per_task: int = 0,
     video_frame_skip: int = 4,
     video_fps: int = 15,
@@ -1093,7 +1093,6 @@ def _evaluate_env_tasks(
                 goal,
                 low,
                 high,
-                max_chunks,
                 sample_action_chunk=lambda o, g: _actor_chunk(o, g, ep_ix=ep_ix),
                 render_buf=actor_buf if record_wb else None,
                 goal_frame=goal_frame,
@@ -1121,7 +1120,6 @@ def _evaluate_env_tasks(
                 goal,
                 low,
                 high,
-                max_chunks,
                 sample_action_chunk=lambda o, g: _idm_chunk(o, g, ep_ix=ep_ix),
                 render_buf=idm_buf if record_wb else None,
                 goal_frame=goal_frame,
@@ -1313,7 +1311,6 @@ def main(_):
     eval_episodes_per_task = max(1, int(FLAGS.eval_episodes_per_task))
     final_eval_episodes_per_task = max(0, int(FLAGS.final_eval_episodes_per_task))
     final_eval_n_values = parse_int_list(str(FLAGS.final_eval_subgoal_eval_num_samples))
-    eval_max_chunks = max(1, int(FLAGS.eval_max_chunks))
     run_logger.info(
         'shared_valid_starts=%d batch_size=%d steps_per_epoch=%d dyn_h=%d critic_h=%d actor_h=%d',
         len(common_valid_starts),
@@ -1396,13 +1393,13 @@ def main(_):
         float(critic_config.get('discount', 0.0)),
     )
     run_logger.info(
-        'eval eval_freq=%d eval_tasks=%s eval_episodes=%d final_eval_episodes=%d eval_max_chunks=%d '
-        'video_episodes_per_task=%d video_frame_skip=%d primary_success=any_step_info_success',
+        'eval eval_freq=%d eval_tasks=%s eval_episodes=%d final_eval_episodes=%d '
+        'env_max_episode_steps=%d video_episodes_per_task=%d video_frame_skip=%d primary_success=any_step_info_success',
         eval_freq,
         ','.join(str(x) for x in eval_task_ids),
         eval_episodes_per_task,
         final_eval_episodes_per_task,
-        eval_max_chunks,
+        _env_max_episode_steps(env),
         int(FLAGS.eval_video_episodes_per_task),
         int(FLAGS.eval_video_frame_skip),
     )
@@ -1590,7 +1587,6 @@ def main(_):
                             critic_agent=critic_agent,
                             task_ids=eval_task_ids,
                             episodes_per_task=eval_episode_count,
-                            max_chunks=eval_max_chunks,
                             video_episodes_per_task=int(FLAGS.eval_video_episodes_per_task),
                             video_frame_skip=int(FLAGS.eval_video_frame_skip),
                             video_fps=int(FLAGS.eval_video_fps),
@@ -1639,7 +1635,6 @@ def main(_):
                             critic_agent=critic_agent,
                             task_ids=eval_task_ids,
                             episodes_per_task=eval_episode_count,
-                            max_chunks=eval_max_chunks,
                             video_episodes_per_task=int(FLAGS.eval_video_episodes_per_task),
                             video_frame_skip=int(FLAGS.eval_video_frame_skip),
                             video_fps=int(FLAGS.eval_video_fps),

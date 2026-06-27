@@ -43,8 +43,8 @@ GPU_ID=0 nohup bash scripts/run_flow_trl_puzzle_45_46.sh > nohup_logs/flow_trl_p
 
 | 파일 | 역할 |
 |------|------|
-| `run_amg_m800_eval.sh` | antmaze-giant checkpoint를 `eval_max_chunks=800`으로 재평가 |
-| `run_amg_m800_then_p456.sh` | giant m800 eval 후 puzzle 4x5/4x6 sweep 이어서 실행 |
+| `run_amg_m800_eval.sh` | antmaze-giant checkpoint를 env max episode budget으로 재평가 |
+| `run_amg_m800_then_p456.sh` | giant env-max eval 후 puzzle 4x5/4x6 sweep 이어서 실행 |
 
 완료된 일회성 temp/gamma/N rerun helper는 제거했습니다. 필요하면 `eval_checkpoint.py`와 `summarize_feval_results.py` 조합으로 새 runner를 짧게 작성합니다.
 

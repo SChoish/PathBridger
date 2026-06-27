@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Re-eval antmaze-giant checkpoints at max_chunks=800 (4000 env steps), temp=1.0 and 0.5.
-# JSON: eval_results/epoch600[_t0p5]_m800_n<N>.json
+# Re-eval antmaze-giant checkpoints to the env max episode length, temp=1.0 and 0.5.
+# JSON: eval_results/epoch600[_t0p5]_n<N>.json
 
 set -euo pipefail
 
@@ -13,27 +13,26 @@ export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 GPU_ID="${GPU_ID:-0}"
 SEED="${SEED:-0}"
 FINAL_EPOCH="${FINAL_EPOCH:-600}"
-EVAL_MAX_CHUNKS="${EVAL_MAX_CHUNKS:-800}"
 PYTHON_BIN="${PYTHON_BIN:-/home/svcho/anaconda3/bin/python}"
 WITH_CUDA="${ROOT}/scripts/with_jax_cuda.sh"
 LOG_DIR="${ROOT}/nohup_logs"
-LOG_TAG="amg_m800_eval"
+LOG_TAG="amg_envmax_eval"
 TEMPS=(1.0 0.5)
 EVAL_NS=(2 8 16 32)
-FORCE_RERUN="${FORCE_RERUN:-1}"
+FORCE_RERUN="${FORCE_RERUN:-0}"
 
 mkdir -p "${LOG_DIR}"
 MASTER_LOG="${LOG_DIR}/${LOG_TAG}_master.log"
 
-echo "[$(date -Is)] ${LOG_TAG} start GPU=${GPU_ID} max_chunks=${EVAL_MAX_CHUNKS} temps=${TEMPS[*]} N=${EVAL_NS[*]} force=${FORCE_RERUN}" | tee -a "${MASTER_LOG}"
+echo "[$(date -Is)] ${LOG_TAG} start GPU=${GPU_ID} budget=env_max_episode_steps temps=${TEMPS[*]} N=${EVAL_NS[*]} force=${FORCE_RERUN}" | tee -a "${MASTER_LOG}"
 
 if [[ "${FORCE_RERUN}" == "1" ]]; then
-  echo "[$(date -Is)] remove prior m${EVAL_MAX_CHUNKS} giant eval JSONs" | tee -a "${MASTER_LOG}"
-  rm -f runs/*antmaze-giant*/eval_results/epoch*_m${EVAL_MAX_CHUNKS}_n*.json
+  echo "[$(date -Is)] remove prior env-max giant eval JSONs" | tee -a "${MASTER_LOG}"
+  rm -f runs/*antmaze-giant*/eval_results/epoch*_n*.json
 fi
 
 mapfile -t jobs < <(
-  TEMPS="${TEMPS[*]}" EVAL_NS="${EVAL_NS[*]}" FINAL_EPOCH="${FINAL_EPOCH}" EVAL_MAX_CHUNKS="${EVAL_MAX_CHUNKS}" FORCE_RERUN="${FORCE_RERUN}" \
+  TEMPS="${TEMPS[*]}" EVAL_NS="${EVAL_NS[*]}" FINAL_EPOCH="${FINAL_EPOCH}" FORCE_RERUN="${FORCE_RERUN}" \
     "${PYTHON_BIN}" - <<'PY'
 import json
 import os
@@ -42,7 +41,6 @@ from pathlib import Path
 temps = [float(x) for x in os.environ['TEMPS'].split()]
 eval_ns = [int(x) for x in os.environ['EVAL_NS'].split()]
 final_epoch = int(os.environ['FINAL_EPOCH'])
-max_chunks = int(os.environ['EVAL_MAX_CHUNKS'])
 force = os.environ.get('FORCE_RERUN', '0') == '1'
 
 SPECS = [
@@ -82,7 +80,7 @@ def out_path(run_dir: Path, *, temp: float, n: int) -> Path:
     base = f'epoch{final_epoch}'
     if temp != 1.0:
         base += f'_t{temp_tag(temp)}'
-    base += f'_m{max_chunks}_n{n}.json'
+    base += f'_n{n}.json'
     return run_dir / 'eval_results' / base
 
 
@@ -100,20 +98,19 @@ PY
 )
 
 if ((${#jobs[@]} == 0)); then
-  echo "[$(date -Is)] nothing to run (all m${EVAL_MAX_CHUNKS} eval JSONs exist)" | tee -a "${MASTER_LOG}"
+  echo "[$(date -Is)] nothing to run (all env-max eval JSONs exist)" | tee -a "${MASTER_LOG}"
 else
   for job in "${jobs[@]}"; do
     [[ "${job}" == \#* ]] && continue
     IFS=$'\t' read -r label run_dir eval_n temp <<< "${job}"
     temp_tag="${temp/./p}"
     eval_log="${LOG_DIR}/${LOG_TAG}_${label}.t${temp_tag}.n${eval_n}.log"
-    echo "[$(date -Is)] START ${label} eval_n=${eval_n} temp=${temp} max_chunks=${EVAL_MAX_CHUNKS} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
+    echo "[$(date -Is)] START ${label} eval_n=${eval_n} temp=${temp} budget=env_max_episode_steps run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
     CUDA_VISIBLE_DEVICES="${GPU_ID}" bash "${WITH_CUDA}" "${PYTHON_BIN}" -u eval_checkpoint.py \
       --run_dir "${run_dir}" \
       --epoch "${FINAL_EPOCH}" \
       --seed "${SEED}" \
       --eval_episodes_per_task 25 \
-      --eval_max_chunks "${EVAL_MAX_CHUNKS}" \
       --subgoal_eval_num_samples "${eval_n}" \
       --subgoal_temperature "${temp}" \
       --mujoco_gl "${MUJOCO_GL}" \

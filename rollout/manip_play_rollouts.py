@@ -96,27 +96,24 @@ def _predict_subgoal_for_rollout(
     return np.asarray(agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
 
 
-def _chunk_budget_for_full_episode(env, chunk_h: int, flags_max_chunks: int) -> int:
+def _chunk_budget_for_full_episode(env, chunk_h: int) -> int:
     ms = max_episode_steps_from_wrappers(env)
     ch = max(1, int(chunk_h))
-    fm = max(1, int(flags_max_chunks))
     if ms is None:
-        return fm
+        raise ValueError('Rollout env must expose max_episode_steps.')
     need = (int(ms) + ch - 1) // ch
-    return max(fm, int(need) + 2)
+    return max(1, int(need))
 
 
-def _load_eval_rollout_limits(run_dir: Path) -> tuple[int, int, int]:
+def _load_eval_rollout_limits(run_dir: Path) -> tuple[int, int]:
     flags_path = run_dir / 'flags.json'
     with open(flags_path, 'r', encoding='utf-8') as f:
         root = json.load(f)
-    fg = root.get('flags') if isinstance(root.get('flags'), dict) else root
-    max_chunks = max(1, int(fg.get('eval_max_chunks', 200)))
     critic = root.get('critic_agent') if isinstance(root.get('critic_agent'), dict) else {}
     actor = root.get('actor') if isinstance(root.get('actor'), dict) else {}
     idm_h = max(1, int(critic.get('action_chunk_horizon', 5)))
     act_h = max(1, int(actor.get('actor_chunk_horizon', idm_h)))
-    return max_chunks, idm_h, act_h
+    return idm_h, act_h
 
 
 def _load_actor_cfg(flags_path: Path) -> dict:
@@ -187,7 +184,7 @@ _ROLLOUT_SUMMARY_FIELDS: tuple[str, ...] = (
     'family',
     'checkpoint_epoch',
     'actor_checkpoint_epoch',
-    'eval_max_chunks',
+    'eval_budget',
     'idm_horizon',
     'actor_horizon',
     'eval_ep_ix',
@@ -407,7 +404,7 @@ def _run_one_task(
     if int(subgoal_eval_num_samples) > 0:
         cfg['subgoal_eval_num_samples'] = int(subgoal_eval_num_samples)
     family = manip_play_family(env_name)
-    em, idm_h, act_h = _load_eval_rollout_limits(run_dir)
+    idm_h, act_h = _load_eval_rollout_limits(run_dir)
     if idm_horizon is not None and int(idm_horizon) > 0:
         idm_h = int(idm_horizon)
 
@@ -511,7 +508,7 @@ def _run_one_task(
                 print(
                     f'[task {task_id}] wrote {mp4_idm}  raw_frames={idm_outcome.rgb_frames.shape[0]} '
                     f'mp4_frames={idm_mp4_frames} chunks={idm_outcome.n_chunks} idm_horizon={idm_h} '
-                    f'eval_ep_ix={ep_ix} eval_max_chunks={em} env_info_success={idm_outcome.ok_env}'
+                    f'eval_ep_ix={ep_ix} eval_budget=env_max_episode_steps env_info_success={idm_outcome.ok_env}'
                 )
             else:
                 print(f'[task {task_id}] IDM: no RGB frames states={idm_outcome.states.shape[0]} eval_ep_ix={ep_ix}')
@@ -523,7 +520,7 @@ def _run_one_task(
                     'family': str(family),
                     'checkpoint_epoch': int(ckpt_epoch),
                     'actor_checkpoint_epoch': int(act_ep),
-                    'eval_max_chunks': int(em),
+                    'eval_budget': 'env_max_episode_steps',
                     'idm_horizon': int(idm_h),
                     'actor_horizon': int(act_h),
                     'eval_ep_ix': int(ep_ix),
@@ -555,7 +552,7 @@ def _run_one_task(
             actor_chunks = (
                 int(actor_max_chunks)
                 if int(actor_max_chunks) >= 0
-                else _chunk_budget_for_full_episode(env, int(act_h), int(em))
+                else _chunk_budget_for_full_episode(env, int(act_h))
             )
             s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
             actor_subgoals_per_step: list[np.ndarray] = []
@@ -617,7 +614,7 @@ def _run_one_task(
                 print(
                     f'[task {task_id}] wrote {mp4_ac}  raw_frames={actor_outcome.rgb_frames.shape[0]} '
                     f'mp4_frames={actor_mp4_frames} chunks={actor_outcome.n_chunks} actor_horizon={act_h} '
-                    f'eval_ep_ix={ep_ix} eval_max_chunks={em} env_info_success={actor_outcome.ok_env}'
+                    f'eval_ep_ix={ep_ix} eval_budget=env_max_episode_steps env_info_success={actor_outcome.ok_env}'
                 )
             else:
                 print(f'[task {task_id}] actor: no RGB frames states={actor_outcome.states.shape[0]} eval_ep_ix={ep_ix}')
@@ -629,7 +626,7 @@ def _run_one_task(
                     'family': str(family),
                     'checkpoint_epoch': int(ckpt_epoch),
                     'actor_checkpoint_epoch': int(act_ep),
-                    'eval_max_chunks': int(em),
+                    'eval_budget': 'env_max_episode_steps',
                     'idm_horizon': int(idm_h),
                     'actor_horizon': int(act_h),
                     'eval_ep_ix': int(ep_ix),
@@ -650,7 +647,7 @@ def _run_one_task(
             'family': str(family),
             'checkpoint_epoch': int(ckpt_epoch),
             'actor_checkpoint_epoch': int(act_ep),
-            'eval_max_chunks': int(em),
+            'eval_budget': 'env_max_episode_steps',
             'idm_horizon': int(idm_h),
             'actor_horizon': int(act_h),
             'eval_ep_ix': int(ep_ix),
@@ -667,7 +664,7 @@ def _run_one_task(
     idm_chunks = (
         int(idm_max_chunks)
         if int(idm_max_chunks) >= 0
-        else _chunk_budget_for_full_episode(env, int(idm_h), int(em))
+        else _chunk_budget_for_full_episode(env, int(idm_h))
     )
 
     if bool(until_success):
@@ -736,13 +733,13 @@ def main() -> None:
         '--idm_max_chunks',
         type=int,
         default=-1,
-        help='Outer replans; -1 → max(flags.eval_max_chunks, ceil(TimeLimit/chunk)).',
+        help='Outer replans; -1 -> ceil(env max episode steps / IDM horizon).',
     )
     p.add_argument(
         '--actor_max_chunks',
         type=int,
         default=-1,
-        help='Outer replans; -1 → max(flags.eval_max_chunks, ceil(TimeLimit/chunk)).',
+        help='Outer replans; -1 -> ceil(env max episode steps / actor horizon).',
     )
     p.add_argument(
         '--min_mp4_seconds',

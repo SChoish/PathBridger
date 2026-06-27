@@ -102,7 +102,7 @@ runs/<YYYYMMDD_HHMMSS>_seed<seed>_<env_name>/
     actor/params_<epoch>.pkl
   eval_results/
     epoch600_n<N>.json
-    epoch600_t0p5_m800_n<N>.json
+    epoch600_t0p5_n<N>.json
 ```
 
 ## Config 핵심 옵션
@@ -122,7 +122,6 @@ Top-level:
 | `eval_episodes_per_task` | `10` | 일반 eval episode 수 |
 | `final_eval_episodes_per_task` | `25` | final epoch eval episode 수 |
 | `final_eval_subgoal_eval_num_samples` | `1,2,4,8,16` | final epoch N sweep |
-| `eval_max_chunks` | `200` | episode당 action chunk 수 |
 
 Flow subgoal:
 
@@ -191,7 +190,7 @@ GPU_ID=0 nohup bash scripts/run_flow_trl_puzzle_45_46.sh > nohup_logs/flow_trl_p
 - envs: `puzzle-4x5-play-v0`, `puzzle-4x6-play-v0`
 - gamma: `0.999`
 - `value_distance_weight_power: 0.0`
-- `eval_max_chunks: 200` = 1000 env steps with action chunk horizon 5
+- eval budget: 환경 max episode length
 
 ### K=40 best follow-up
 
@@ -204,21 +203,19 @@ GPU_ID=0 nohup bash scripts/run_flow_trl_k40_best.sh > nohup_logs/flow_trl_k40_b
 - horizon/full chunk: `40`
 - selected params from prior K=25 best settings
 
-### Antmaze-giant m800 eval
+### Antmaze-giant env-max eval
 
 ```bash
-GPU_ID=0 nohup bash scripts/run_amg_m800_eval.sh > nohup_logs/amg_m800_eval.nohup.log 2>&1 &
+GPU_ID=0 nohup bash scripts/run_amg_m800_eval.sh > nohup_logs/amg_envmax_eval.nohup.log 2>&1 &
 ```
 
-- `eval_max_chunks=800` = 4000 env steps
 - temp: `1.0`, `0.5`
 - eval N: `{2, 8, 16, 32}`
-- JSON name includes `_m800_`
 
 Chain giant eval then puzzle sweep:
 
 ```bash
-GPU_ID=0 nohup bash scripts/run_amg_m800_then_p456.sh > nohup_logs/amg_m800_then_p456.nohup.log 2>&1 &
+GPU_ID=0 nohup bash scripts/run_amg_m800_then_p456.sh > nohup_logs/amg_envmax_then_p456.nohup.log 2>&1 &
 ```
 
 ## Eval
@@ -235,7 +232,7 @@ PYTHONPATH=. MUJOCO_GL=egl python eval_checkpoint.py \
   --skip_if_saved
 ```
 
-Temp / max chunk override:
+Temp / N override:
 
 ```bash
 PYTHONPATH=. MUJOCO_GL=egl python eval_checkpoint.py \
@@ -244,7 +241,6 @@ PYTHONPATH=. MUJOCO_GL=egl python eval_checkpoint.py \
   --eval_episodes_per_task 25 \
   --subgoal_temperature 0.5 \
   --subgoal_eval_num_samples 32 \
-  --eval_max_chunks 800 \
   --skip_if_saved
 ```
 
