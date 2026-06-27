@@ -5,9 +5,13 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.pkl
+checkpoints/
 runs/
 prev_runs/
 nohup_logs/
+docs/*.log
+docs/*.zip
+docs/renders/
 scripts/sweep_generated/
 scripts/sweep_logs/
 .env

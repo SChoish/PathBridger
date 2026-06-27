@@ -1,9 +1,10 @@
 # PathBridger Experiment Guide
 
-OGBench 기반 오프라인 제어 실험 코드입니다. 메인 경로는 **linear-SDE dynamics + critic + SPI actor**의 동시 학습입니다.
+OGBench 기반 오프라인 goal-conditioned control 실험 코드입니다. 현재 메인 경로는 **Flow subgoal + forward bridge residual dynamics + TRL critic + SPI actor**입니다.
 
-- Dynamics 부분은 GOUB[^goub] 계열의 bridge 아이디어에서 시작했지만, 현재 메인 경로는 `forward_bridge_residual`입니다. Closed-form forward bridge mean 위에 endpoint-preserving `PathResidualNet` residual을 얹고, `bridge_gamma_inv: 0.0`이면 hard endpoint bridge입니다. Subgoal은 `diag_gaussian` + `subgoal_stochastic_loss: nll`, `subgoal_target_mode`, `residual_target_mode`, state normalization 등의 ablation을 지원합니다.
-- Critic 부분은 DQC[^dqc]의 chunk/action critic 구조와 SPI actor rescoring 경로를 유지합니다. 추가로 `direct_chunk_trl` critic mode는 action chunk goal-conditioned critic `Q_H(s, A_H, g)`를 직접 학습하고, value는 해당 chunk critic의 expectile readout으로만 학습합니다.
+- Dynamics는 `forward_bridge_residual` planner를 중심으로, closed-form forward bridge mean 위에 endpoint-preserving `PathResidualNet` residual을 얹습니다. Flow subgoal은 `subgoal_distribution: flow`, `subgoal_eval_selection: best_of_n_value`로 eval-time BoN을 지원합니다.
+- Critic은 현재 sweep에서 `critic_type: trl`을 사용합니다. `CriticSequenceDataset`이 same-trajectory value/TRL targets를 만들고, policy/value goal sampling ratio는 환경별 config preset으로 관리합니다.
+- `docs/`에 생성되는 CSV/MD artifact는 이 로컬에서 `_choi` suffix를 붙입니다. 예: `flow_trl_feval_results_choi.csv`, `runs_results_total_choi.csv`.
 
 [^goub]: Generalized Ornstein-Uhlenbeck Bridge.
 [^dqc]: Decoupled Q Chunking.
@@ -212,17 +213,20 @@ Resume 로그는 `run_resume_from<E>_<timestamp>.log`로 따로 저장됩니다.
 
 ## 현재 Config 레이아웃
 
-`config/`에는 baseline·ablation YAML과 sweep용 고정 config가 함께 있습니다. TRL tune sweep YAML은 `scripts/write_tune_sweep_yaml.py`로 재생성하고 (`config/sweep_tune_gap1/`, `sweep_tune_v2/`, `sweep_tune_gw_b/`), Flow 실험은 `scripts/generate_flow_gap5_by_env_configs.py` → `config/flow_gap5_by_env/`를 씁니다.
+`config/`에는 baseline YAML과 Flow+TRL sweep용 생성 config가 함께 있습니다. 현재 유지하는 generator는 Flow+TRL 실험군 중심입니다.
 
 | Config | 환경/용도 | 비고 |
 |--------|-----------|------|
 | `antmaze_medium_navigate.yaml` | `antmaze-medium-navigate-v0` baseline | 기본 학습 config |
 | `antmaze_medium_navigate_table_*.yaml` | medium goal-rep × target-mode table | full/phi × abs/disp |
 | `antmaze_large_trl_gap10_wmax5_alpha0_n1_600ep.yaml` | large TRL reference | hand-written TRL 템플릿 |
-| `sweep_tune_gap1/*.yaml` | TRL gap/wmax/gamma sweep | `write_tune_sweep_yaml.py --set gap1` |
-| `sweep_tune_v2/`, `sweep_tune_gw_b/` | TRL Set A / Set B sweep | `--set v2` / `--set gw_b` |
 | `grid_targetmode/*.yaml` | residual × subgoal target-mode grid | 고정 YAML (재생성 스크립트 없음) |
-| `flow_gap5_by_env/*.yaml` | plain Flow-BC + BoN (gap=5) | `generate_flow_gap5_by_env_configs.py` |
+| `sweep_flow_trl_gap_tune/*.yaml` | Flow+TRL gap tune | `generate_flow_trl_gap_tune_configs.py` |
+| `sweep_flow_trl_antmaze_dw/*.yaml` | antmaze distance-weight sweep | `generate_flow_trl_antmaze_dw_sweep_configs.py` |
+| `sweep_flow_trl_humanoidmaze_dw/*.yaml` | humanoidmaze distance-weight sweep | `generate_flow_trl_humanoidmaze_dw_sweep_configs.py` |
+| `flow_k_sweep/*.yaml` | K/horizon follow-up sweep | `generate_flow_k_sweep_configs.py` |
+| `flow_h25_ha10/*.yaml` | h=25, action horizon=10 follow-up | `generate_flow_h25_ha10_configs.py` |
+| `flow_gap10_w5_n1_cube/*.yaml` | cube gap10/w5/N1 follow-up | `generate_flow_gap10_n1_cube_configs.py` |
 
 ## Run Directory
 
@@ -313,29 +317,29 @@ PYTHONPATH=. MUJOCO_GL=egl python -m rollout.manip_play_state_rollout --run_dir=
 
 ## scripts/
 
-`scripts/`는 JAX/CUDA 래퍼, TRL tune sweep, Flow gap5 실험 실행에 쓰는 도구만 유지합니다. 로그는 `nohup_logs/`에 씁니다 (`scripts/sweep_logs/`는 더 이상 사용하지 않음).
+`scripts/`는 JAX/CUDA 래퍼, Flow+TRL sweep/eval, generated docs summary 도구만 유지합니다. 로그는 `nohup_logs/`에 씁니다 (`scripts/sweep_logs/`는 더 이상 사용하지 않음).
 
 | 스크립트 | 역할 |
 |----------|------|
 | `with_jax_cuda.sh`, `jax_cuda_env.sh` | CUDA/JAX 환경 설정 후 명령 실행 |
 | `yaml_run_config.py` | TRL run config 빌더 (hand-written YAML 형식) |
-| `tune_sweep_common.py` | tune sweep env spec·variant grid·`build_tune_config()` |
-| `write_tune_sweep_yaml.py` | `config/sweep_tune_*` YAML 생성 (`--set gap1\|v2\|gw_b`) |
-| `run_tune_sweep.sh` | tune sweep 순차 실행 (YAML 재생성 포함) |
-| `run_tune_gap1_sweep.sh` | `run_tune_sweep.sh gap1` 래퍼 |
-| `run_tune_v2_sweep.sh` | `run_tune_sweep.sh v2` 래퍼 (Set A) |
-| `run_tune_gw_b_sweep.sh` | `run_tune_sweep.sh gw_b` 래퍼 (Set B) |
-| `generate_flow_gap5_by_env_configs.py` | `config/flow_gap5_by_env/` YAML 생성 |
-| `run_flow_gap5_by_env.sh` | 환경별 Flow gap5 실험 순차 실행 |
+| `flow_trl_sweep_common.py` | Flow+TRL sweep config/run-dir helper |
+| `generate_flow_trl_*_configs.py` | gap/distance-weight/humanoid sweep YAML 생성 |
+| `run_flow_trl_*_sweep.sh` | Flow+TRL sweep 실행 |
+| `run_flow_trl_eval_giant_cap4000.sh` | antmaze-giant full-cap final eval |
+| `run_flow_k_sweep*.sh`, `run_flow_h25_ha10.sh` | K/horizon follow-up 실행 |
+| `summarize_feval_results.py`, `summarize_runs.py` | `_choi` suffix docs CSV/MD 생성 |
+| `docs_output_paths.py` | generated docs output naming helper |
 
 예시:
 
 ```bash
-# TRL gap1 sweep (gap=1, wmax∈{5,10}, gamma∈{0.995,0.999})
-GPU_ID=0 nohup bash scripts/run_tune_gap1_sweep.sh > nohup_logs/tune_g1_master.log 2>&1 &
+# Flow+TRL humanoidmaze distance-weight sweep
+GPU_ID=0 nohup bash scripts/run_flow_trl_humanoidmaze_dw_sweep.sh > nohup_logs/flow_trl_humanoidmaze_dw.out 2>&1 &
 
-# Flow gap5 by env
-GPU_ID=0 bash scripts/run_flow_gap5_by_env.sh
+# Regenerate local generated docs artifacts with _choi suffix
+PYTHONPATH=.:scripts python scripts/summarize_feval_results.py
+PYTHONPATH=.:scripts python scripts/summarize_runs.py
 ```
 
 ## 테스트

@@ -1,0 +1,65 @@
+{
+  "final_eval_n_values": [
+    2,
+    8,
+    16,
+    32
+  ],
+  "runs": [
+    {
+      "env": "puzzle-3x3-play-v0",
+      "env_prefix": "p3",
+      "config": "p3_g0p5_w5_n1",
+      "best_gap": 1.0,
+      "tune_gap": 0.5,
+      "best_eval_n": 32,
+      "baseline_config": "p3_g1_w5_n1",
+      "baseline_idm": 0.6719999999999999,
+      "baseline_actor": 0.392
+    },
+    {
+      "env": "cube-single-play-v0",
+      "env_prefix": "cs",
+      "config": "cs_g20_w5_n1",
+      "best_gap": 10.0,
+      "tune_gap": 20.0,
+      "best_eval_n": 2,
+      "baseline_config": "cs_g10_w5_n1",
+      "baseline_idm": 0.768,
+      "baseline_actor": 0.6560000000000001
+    },
+    {
+      "env": "cube-double-play-v0",
+      "env_prefix": "cd",
+      "config": "cd_g20_w5_n1",
+      "best_gap": 10.0,
+      "tune_gap": 20.0,
+      "best_eval_n": 8,
+      "baseline_config": "cd_g10_w5_n1",
+      "baseline_idm": 0.68,
+      "baseline_actor": 0.648
+    },
+    {
+      "env": "cube-triple-play-v0",
+      "env_prefix": "ct",
+      "config": "ct_g20_w5_n1",
+      "best_gap": 10.0,
+      "tune_gap": 20.0,
+      "best_eval_n": 8,
+      "baseline_config": "ct_g10_w5_n1",
+      "baseline_idm": 0.328,
+      "baseline_actor": 0.20800000000000002
+    },
+    {
+      "env": "antmaze-large-navigate-v0",
+      "env_prefix": "aml",
+      "config": "aml_g20_w5_n1",
+      "best_gap": 10.0,
+      "tune_gap": 20.0,
+      "best_eval_n": 16,
+      "baseline_config": "aml_g10_w5_n1",
+      "baseline_idm": 0.768,
+      "baseline_actor": 0.728
+    }
+  ]
+}

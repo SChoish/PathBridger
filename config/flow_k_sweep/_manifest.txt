@@ -1,0 +1,17 @@
+# 16 Flow horizon-sweep configs (K=[5, 10])
+config/flow_k_sweep/flow_g5_w5_h5_trl_puzzle_3x3_rd_sd.yaml
+config/flow_k_sweep/flow_g5_w5_h10_trl_puzzle_3x3_rd_sd.yaml
+config/flow_k_sweep/flow_g5_w5_h5_trl_puzzle_4x4_rd_sd.yaml
+config/flow_k_sweep/flow_g5_w5_h10_trl_puzzle_4x4_rd_sd.yaml
+config/flow_k_sweep/flow_g10_w5_h5_trl_cube_single_rd_sd.yaml
+config/flow_k_sweep/flow_g10_w5_h10_trl_cube_single_rd_sd.yaml
+config/flow_k_sweep/flow_g10_w5_h5_trl_cube_double_rd_sd.yaml
+config/flow_k_sweep/flow_g10_w5_h10_trl_cube_double_rd_sd.yaml
+config/flow_k_sweep/flow_g10_w5_h5_trl_cube_triple_rd_sd.yaml
+config/flow_k_sweep/flow_g10_w5_h10_trl_cube_triple_rd_sd.yaml
+config/flow_k_sweep/flow_g5_w5_h5_trl_antmaze_medium_rd_sd.yaml
+config/flow_k_sweep/flow_g5_w5_h10_trl_antmaze_medium_rd_sd.yaml
+config/flow_k_sweep/flow_g5_w5_h5_trl_antmaze_large_rd_sd.yaml
+config/flow_k_sweep/flow_g5_w5_h10_trl_antmaze_large_rd_sd.yaml
+config/flow_k_sweep/flow_g5_w5_h5_trl_antmaze_giant_rd_sd.yaml
+config/flow_k_sweep/flow_g5_w5_h10_trl_antmaze_giant_rd_sd.yaml

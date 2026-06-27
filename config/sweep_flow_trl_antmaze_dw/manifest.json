@@ -1,0 +1,74 @@
+{
+  "final_eval_n_values": [
+    2,
+    8,
+    16,
+    32
+  ],
+  "gaps": [
+    5.0,
+    10.0
+  ],
+  "distance_weights": [
+    0.0,
+    0.1
+  ],
+  "runs": [
+    {
+      "config": "amm_g5_w5_n1_dwp0",
+      "env_prefix": "amm",
+      "env": "antmaze-medium-navigate-v0",
+      "gap": 5.0,
+      "distance_weight": 0.0
+    },
+    {
+      "config": "amm_g5_w5_n1_dwp0p1",
+      "env_prefix": "amm",
+      "env": "antmaze-medium-navigate-v0",
+      "gap": 5.0,
+      "distance_weight": 0.1
+    },
+    {
+      "config": "amm_g10_w5_n1_dwp0",
+      "env_prefix": "amm",
+      "env": "antmaze-medium-navigate-v0",
+      "gap": 10.0,
+      "distance_weight": 0.0
+    },
+    {
+      "config": "amm_g10_w5_n1_dwp0p1",
+      "env_prefix": "amm",
+      "env": "antmaze-medium-navigate-v0",
+      "gap": 10.0,
+      "distance_weight": 0.1
+    },
+    {
+      "config": "aml_g5_w5_n1_dwp0",
+      "env_prefix": "aml",
+      "env": "antmaze-large-navigate-v0",
+      "gap": 5.0,
+      "distance_weight": 0.0
+    },
+    {
+      "config": "aml_g5_w5_n1_dwp0p1",
+      "env_prefix": "aml",
+      "env": "antmaze-large-navigate-v0",
+      "gap": 5.0,
+      "distance_weight": 0.1
+    },
+    {
+      "config": "aml_g10_w5_n1_dwp0",
+      "env_prefix": "aml",
+      "env": "antmaze-large-navigate-v0",
+      "gap": 10.0,
+      "distance_weight": 0.0
+    },
+    {
+      "config": "aml_g10_w5_n1_dwp0p1",
+      "env_prefix": "aml",
+      "env": "antmaze-large-navigate-v0",
+      "gap": 10.0,
+      "distance_weight": 0.1
+    }
+  ]
+}

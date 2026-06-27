@@ -479,15 +479,22 @@ class CriticAgent(flax.struct.PyTreeNode):
         qs = jax.nn.sigmoid(logits).reshape(logits.shape[0], obs.shape[0], num_candidates)
         return self.aggregate_ensemble_q(qs).reshape(obs.shape[0], num_candidates)
 
-    @partial(jax.jit, static_argnames=())
-    def score_transitive_subgoals(
+    @partial(jax.jit, static_argnames=('score_type',))
+    def score_subgoals_for_eval(
         self,
         observations: jnp.ndarray,
         subgoals: jnp.ndarray,
         goals: jnp.ndarray,
         network_params: dict | None = None,
+        *,
+        score_type: str = 'transitive_ratio',
     ) -> jnp.ndarray:
-        eps = jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-6)), dtype=jnp.float32)
+        """Score candidate subgoals ``z`` for best-of-N eval selection.
+
+        ``transitive_ratio`` (default): ``V(s,z) * V(z,g) / (V(s,g) + eps)``.
+        ``goal_value``: ``V(z, g)`` only.
+        """
+        score_type = str(score_type).lower()
         obs = jnp.asarray(observations, dtype=jnp.float32)
         z = jnp.asarray(subgoals, dtype=jnp.float32)
         g = jnp.asarray(goals, dtype=jnp.float32)
@@ -502,11 +509,34 @@ class CriticAgent(flax.struct.PyTreeNode):
         else:
             g_flat = jnp.repeat(g[:, None, :], num_candidates, axis=1).reshape(obs.shape[0] * num_candidates, -1)
 
-        v_s_z = jax.nn.sigmoid(self.network.select('value')(obs_rep, z_flat, params=network_params))
         v_z_g = jax.nn.sigmoid(self.network.select('value')(z_flat, g_flat, params=network_params))
-        v_s_g = jax.nn.sigmoid(self.network.select('value')(obs_rep, g_flat, params=network_params))
-        ratio = (v_s_z * v_z_g) / (v_s_g + eps)
-        return ratio.reshape(obs.shape[0], num_candidates)
+        if score_type in ('goal_value', 'v_z_g', 'vzg'):
+            return v_z_g.reshape(obs.shape[0], num_candidates)
+        if score_type in ('transitive_ratio', 'transitive', 'v_v_v', 'ratio'):
+            eps = jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-6)), dtype=jnp.float32)
+            v_s_z = jax.nn.sigmoid(self.network.select('value')(obs_rep, z_flat, params=network_params))
+            v_s_g = jax.nn.sigmoid(self.network.select('value')(obs_rep, g_flat, params=network_params))
+            ratio = (v_s_z * v_z_g) / (v_s_g + eps)
+            return ratio.reshape(obs.shape[0], num_candidates)
+        raise ValueError(
+            "subgoal_eval_score_type must be one of 'transitive_ratio', 'goal_value', "
+            f"got {score_type!r}."
+        )
+
+    def score_transitive_subgoals(
+        self,
+        observations: jnp.ndarray,
+        subgoals: jnp.ndarray,
+        goals: jnp.ndarray,
+        network_params: dict | None = None,
+    ) -> jnp.ndarray:
+        return self.score_subgoals_for_eval(
+            observations,
+            subgoals,
+            goals,
+            network_params=network_params,
+            score_type='transitive_ratio',
+        )
 
     @jax.jit
     def total_loss(self, batch: dict, grad_params: dict, rng=None):

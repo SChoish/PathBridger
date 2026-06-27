@@ -7,6 +7,8 @@ import glob
 import os
 from datetime import datetime
 
+from docs_output_paths import docs_output_path
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.join(SCRIPT_DIR, "..")
 DOURI_ROOT = os.path.normpath(os.path.join(PROJECT_ROOT, "..", "douri"))
@@ -21,14 +23,14 @@ RUN_TARGETS = [
     {
         "name": "Pathbridger",
         "runs_dir": os.path.join(PROJECT_ROOT, "runs"),
-        "out_md": os.path.join(PROJECT_ROOT, "docs", "runs_results_summary.md"),
-        "out_csv": os.path.join(PROJECT_ROOT, "docs", "runs_results_total.csv"),
+        "out_md": docs_output_path(PROJECT_ROOT, "runs_results_summary", "md"),
+        "out_csv": docs_output_path(PROJECT_ROOT, "runs_results_total", "csv"),
     },
     {
         "name": "douri",
         "runs_dir": os.path.join(DOURI_ROOT, "runs"),
-        "out_md": os.path.join(PROJECT_ROOT, "docs", "douri_runs_results_summary.md"),
-        "out_csv": os.path.join(PROJECT_ROOT, "docs", "douri_runs_results_total.csv"),
+        "out_md": docs_output_path(PROJECT_ROOT, "douri_runs_results_summary", "md"),
+        "out_csv": docs_output_path(PROJECT_ROOT, "douri_runs_results_total", "csv"),
     },
 ]
 
@@ -99,7 +101,7 @@ def classify_algo(info):
     subgoal = info.get("subgoal", "").lower()
     critic = info.get("critic", "").lower()
     if subgoal == "flow":
-        return None
+        return "Flow"
     if critic == "dqc":
         return "DQC"
     if "trl" in critic:
@@ -147,6 +149,9 @@ def parse_logs(paths):
                         info["gap"] = kv["value_gap_scale"]
                     if kv.get("value_weight_max"):
                         info["maxgap"] = kv["value_weight_max"]
+                    n_val = kv.get("plan_candidates") or kv.get("plan_candidates_N")
+                    if n_val:
+                        info["N"] = n_val
                 elif " critic_actor " in line and "type=" in line:
                     kv = parse_kv(line)
                     info["critic"] = kv.get("type", info["critic"])
@@ -219,9 +224,8 @@ def write_best_table(lines, title, pairs):
 
 def collect_rows(runs_dir):
     rows = []
-    skipped_flow = []
     if not os.path.isdir(runs_dir):
-        return rows, skipped_flow
+        return rows
     for d in sorted(glob.glob(os.path.join(runs_dir, "*"))):
         if not os.path.isdir(d):
             continue
@@ -231,13 +235,9 @@ def collect_rows(runs_dir):
         info = parse_config(d)
         info.update(parse_logs(paths))
         info["run_dir"] = os.path.basename(d)
-        algo = classify_algo(info)
-        if algo is None:
-            skipped_flow.append(info["run_dir"])
-            continue
-        info["algo"] = algo
+        info["algo"] = classify_algo(info)
         rows.append(info)
-    return rows, skipped_flow
+    return rows
 
 
 def row_to_csv_record(r):
@@ -274,9 +274,10 @@ def write_csv(rows, path):
             writer.writerow(row_to_csv_record(r))
 
 
-def write_markdown(rows, skipped_flow, target):
+def write_markdown(rows, target):
     n_trl = sum(1 for r in rows if r["algo"] == "TRL")
     n_dqc = sum(1 for r in rows if r["algo"] == "DQC")
+    n_flow = sum(1 for r in rows if r["algo"] == "Flow")
     csv_name = os.path.basename(target["out_csv"])
 
     lines = [
@@ -285,10 +286,9 @@ def write_markdown(rows, skipped_flow, target):
         f"자동 생성: {datetime.now().strftime('%Y-%m-%d %H:%M')} · `scripts/summarize_runs.py`",
         f"소스: `{target['runs_dir']}`",
         "",
-        "**포함:** TRL + DQC (`subgoal=diag_gaussian`). **제외:** flow subgoal only.",
+        "**포함:** TRL + DQC + Flow (TRL+Flow).",
         "",
-        f"총 **{len(rows)}** runs — TRL **{n_trl}**, DQC **{n_dqc}**"
-        + (f" · flow 제외 **{len(skipped_flow)}**" if skipped_flow else "") + ".",
+        f"총 **{len(rows)}** runs — TRL **{n_trl}**, DQC **{n_dqc}**, Flow **{n_flow}**.",
         "",
         "파라미터: **gap**, **maxgap**, **N**, **γ** · 성공률 = 마지막 `EVAL END`.",
         f"resume 로그(`run_resume*.log`)가 있으면 `run.log`에 이어 붙여 읽습니다.",
@@ -297,19 +297,17 @@ def write_markdown(rows, skipped_flow, target):
         "## 환경별 best (IDM)",
         "",
     ]
-    trl_best = best_by_env(rows, "TRL")
-    dqc_best = best_by_env(rows, "DQC")
-    if trl_best:
-        write_best_table(lines, "TRL", trl_best)
-    if dqc_best:
-        write_best_table(lines, "DQC", dqc_best)
-    if not trl_best and not dqc_best:
+    for algo in ("Flow", "TRL", "DQC"):
+        pairs = best_by_env(rows, algo)
+        if pairs:
+            write_best_table(lines, algo, pairs)
+    if not any(best_by_env(rows, a) for a in ("Flow", "TRL", "DQC")):
         lines.append("_해당 runs 없음._")
         lines.append("")
 
     header = ["run_dir", "algo", "env", "ep", "gap", "maxgap", "N", "γ",
               "eval_ep", "IDM", "ACTOR", "done"]
-    for algo in ("TRL", "DQC"):
+    for algo in ("Flow", "TRL", "DQC"):
         subset = [r for r in rows if r["algo"] == algo]
         if not subset:
             continue
@@ -335,19 +333,13 @@ def write_markdown(rows, skipped_flow, target):
         lines += [f"### {env}", ""]
         lines += ["| " + " | ".join(detail_hdr) + " |"]
         lines += ["| " + " | ".join(["---"] * len(detail_hdr)) + " |"]
-        for r in envs[env]:
+        for r in sorted(envs[env], key=lambda x: (-to_f(x["idm_mean"]), x["run_dir"])):
             lines.append("| " + " | ".join([
                 r["run_dir"], r["algo"],
                 fmt_num(r["gap"]), fmt_num(r["maxgap"]), fmt_num(r["N"]), fmt_num(r["gamma"]),
                 r["final_eval_epoch"], r["idm_mean"], fmt_actor(r["actor_mean"]),
                 r["idm_tasks"], r["actor_tasks"],
             ]) + " |")
-        lines.append("")
-
-    if skipped_flow:
-        lines += ["## 제외 (flow subgoal)", ""]
-        for name in skipped_flow:
-            lines.append(f"- `{name}`")
         lines.append("")
 
     os.makedirs(os.path.dirname(target["out_md"]), exist_ok=True)
@@ -359,14 +351,15 @@ def summarize_target(target):
     if not os.path.isdir(target["runs_dir"]):
         print(f"skip {target['name']}: missing {target['runs_dir']}")
         return
-    rows, skipped_flow = collect_rows(target["runs_dir"])
-    write_markdown(rows, skipped_flow, target)
+    rows = collect_rows(target["runs_dir"])
+    write_markdown(rows, target)
     write_csv(rows, target["out_csv"])
     n_trl = sum(1 for r in rows if r["algo"] == "TRL")
     n_dqc = sum(1 for r in rows if r["algo"] == "DQC")
+    n_flow = sum(1 for r in rows if r["algo"] == "Flow")
     print(
         f"{target['name']}: wrote {target['out_md']} + {target['out_csv']} "
-        f"({len(rows)} runs: TRL={n_trl} DQC={n_dqc}, flow excluded={len(skipped_flow)})"
+        f"({len(rows)} runs: TRL={n_trl} DQC={n_dqc} Flow={n_flow})"
     )
 
 

@@ -720,6 +720,31 @@ def test_dqc_subgoal_value_bonus_uses_single_value_form():
     np.testing.assert_allclose(np.asarray(v_sg_g), np.asarray(pred_value), rtol=1e-5, atol=1e-6)
 
 
+def test_subgoal_eval_score_goal_value_uses_v_z_g_only():
+    critic = _make_trl_critic_agent()
+    rng = np.random.default_rng(31)
+    obs = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    z = jnp.asarray(rng.standard_normal((BATCH, 3, STATE_DIM)).astype(np.float32))
+    g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    params = critic.network.params
+
+    ratio_scores = critic.score_subgoals_for_eval(
+        obs, z, g, network_params=params, score_type='transitive_ratio',
+    )
+    goal_scores = critic.score_subgoals_for_eval(
+        obs, z, g, network_params=params, score_type='goal_value',
+    )
+    assert ratio_scores.shape == (BATCH, 3)
+    assert goal_scores.shape == (BATCH, 3)
+    assert not np.allclose(np.asarray(ratio_scores), np.asarray(goal_scores))
+
+    z_flat = z.reshape(BATCH * 3, -1)
+    g_flat = jnp.repeat(g[:, None, :], 3, axis=1).reshape(BATCH * 3, -1)
+    v_z_g = jax.nn.sigmoid(critic.network.select('value')(z_flat, g_flat, params=params))
+    expected = v_z_g.reshape(BATCH, 3)
+    np.testing.assert_allclose(np.asarray(goal_scores), np.asarray(expected), rtol=1e-5, atol=1e-6)
+
+
 if __name__ == '__main__':
     failures = []
     for name, fn in list(globals().items()):

@@ -803,7 +803,8 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
           zero-noise flow endpoint (backward-compatible pseudo-mean).
         - ``'sample'``: a single random flow endpoint (no scoring).
         - ``'best_of_n_value'``: best of ``subgoal_eval_num_samples`` endpoints
-          under the critic transitive-value score. Requires ``critic_agent``.
+          under critic value scoring (see ``subgoal_eval_score_type``).
+          Requires ``critic_agent``.
         - ``'best_of_n_goal_l2'``: best of N endpoints under negative L2 distance
           to ``high_actor_goals`` (no critic needed).
         """
@@ -850,11 +851,13 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                     "subgoal_eval_selection='best_of_n_value' requires a critic "
                     'agent providing value params (score_transitive_subgoals).'
                 )
-            scores = critic_agent.score_transitive_subgoals(
+            score_type = str(self.config.get('subgoal_eval_score_type', 'transitive_ratio')).lower()
+            scores = critic_agent.score_subgoals_for_eval(
                 observations,
                 candidates,
                 high_actor_goals,
                 network_params=critic_agent.network.params,
+                score_type=score_type,
             )
         else:
             return self.predict_subgoal(
@@ -2144,6 +2147,7 @@ def _get_common_config():
             subgoal_flow_velocity_reg=0.0,
             subgoal_eval_selection='zero_noise',
             subgoal_eval_num_samples=4,
+            subgoal_eval_score_type='transitive_ratio',
             subgoal_eval_include_zero_candidate=True,
             subgoal_eval_seed=0,
             discount=0.99,

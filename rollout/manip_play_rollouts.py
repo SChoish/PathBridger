@@ -269,6 +269,7 @@ def _write_state_subgoal_mp4(
     s_g: np.ndarray | None = None,
     goal_rendered: np.ndarray | None = None,
     show_goal_panel: bool = False,
+    overlay_caption: bool = True,
 ) -> int:
     """Write left=actual env, right=predicted-subgoal env MP4 and return frame count."""
     # ``run_chunked_episode`` records one initial frame plus one frame per executed env step.
@@ -315,9 +316,11 @@ def _write_state_subgoal_mp4(
         label_goal='goal' if goal_frames is not None else None,
     )
     frames = _pad_rgb_frames_min_duration(composed, float(fps), float(min_mp4_seconds))
-    caption_lines = ['left: env state', 'middle: env @ predicted subgoal']
-    if goal_frames is not None:
-        caption_lines.append('right: task goal (target configuration)')
+    caption_lines = None
+    if overlay_caption:
+        caption_lines = ['left: env state', 'middle: env @ predicted subgoal']
+        if goal_frames is not None:
+            caption_lines.append('right: task goal (target configuration)')
     write_rgb_array_mp4(
         frames,
         path,
@@ -358,6 +361,7 @@ def _run_one_task(
     fps: float,
     min_mp4_seconds: float,
     show_goal_panel: bool = True,
+    overlay_caption: bool = True,
     idm_horizon: int | None = None,
     idm_only: bool = False,
 ) -> dict[str, Any]:
@@ -446,6 +450,7 @@ def _run_one_task(
             s_g=s_g,
             goal_rendered=goal_rendered,
             show_goal_panel=show_goal_panel,
+            overlay_caption=overlay_caption,
         )
         idm_mp4_rel = _path_rel_to(out_dir, mp4_idm)
         print(
@@ -544,6 +549,7 @@ def _run_one_task(
             s_g=s_g,
             goal_rendered=goal_rendered,
             show_goal_panel=show_goal_panel,
+            overlay_caption=overlay_caption,
         )
         actor_mp4_rel = _path_rel_to(out_dir, mp4_ac)
         print(
@@ -624,6 +630,11 @@ def main() -> None:
         help='Append a third MP4 panel showing the task goal configuration (default: on).',
     )
     p.add_argument(
+        '--no_overlay_text',
+        action='store_true',
+        help='Omit bottom caption strip on MP4s (panel labels at top are kept).',
+    )
+    p.add_argument(
         '--no_exclusive_lock',
         action='store_true',
         help='기본 배타 락(out_dir/.manip_play_rollouts.lock)을 쓰지 않음 (디버그용; 중복 실행 주의).',
@@ -665,6 +676,7 @@ def main() -> None:
                     fps=float(args.fps),
                     min_mp4_seconds=float(args.min_mp4_seconds),
                     show_goal_panel=bool(args.show_goal_panel),
+                    overlay_caption=not bool(args.no_overlay_text),
                     idm_horizon=int(args.idm_horizon) if int(args.idm_horizon) > 0 else None,
                     idm_only=bool(args.idm_only),
                 )

@@ -1558,7 +1558,12 @@ def main(_):
                     orig_eval_n = int(dynamics_config.get('subgoal_eval_num_samples', 1))
                     last_eval_metrics: dict[str, Any] = {}
                     for eval_n in final_eval_n_values:
-                        out_path = eval_result_path(run_dir, epoch=epoch, eval_n=eval_n)
+                        out_path = eval_result_path(
+                            run_dir,
+                            epoch=epoch,
+                            eval_n=eval_n,
+                            score_type=str(dynamics_config.get('subgoal_eval_score_type', 'transitive_ratio')),
+                        )
                         if out_path.is_file():
                             run_logger.info('SKIP final N=%d eval (already saved %s)', eval_n, out_path)
                             with open(out_path, encoding='utf-8') as f:

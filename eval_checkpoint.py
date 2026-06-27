@@ -86,6 +86,37 @@ def main() -> None:
         help='Override dynamics.subgoal_eval_num_samples for eval only; -1 = checkpoint config.',
     )
     p.add_argument(
+        '--subgoal_eval_score_type',
+        type=str,
+        default='',
+        help="Override dynamics.subgoal_eval_score_type for eval only. "
+        "e.g. transitive_ratio (V*V/V) or goal_value (V(z,g)). Empty = checkpoint config.",
+    )
+    p.add_argument(
+        '--subgoal_eval_selection',
+        type=str,
+        default='',
+        help="Override dynamics.subgoal_eval_selection (e.g. best_of_n_value). Empty = checkpoint config.",
+    )
+    p.add_argument(
+        '--subgoal_flow_steps',
+        type=int,
+        default=-1,
+        help='Override dynamics.subgoal_flow_steps for eval only; -1 = checkpoint config.',
+    )
+    p.add_argument(
+        '--subgoal_temperature',
+        type=float,
+        default=-1.0,
+        help='Override dynamics.subgoal_temperature for eval only; <0 = checkpoint config.',
+    )
+    p.add_argument(
+        '--eval_result_suffix',
+        type=str,
+        default='',
+        help='Optional suffix for eval_results filename, e.g. fs10 → epoch600_n32_fs10.json.',
+    )
+    p.add_argument(
         '--idm_action_chunk_horizon',
         type=int,
         default=5,
@@ -121,6 +152,16 @@ def main() -> None:
     dynamics_config, critic_config, actor_config = _build_configs(root, fg)
     if int(args.subgoal_eval_num_samples) > 0:
         dynamics_config['subgoal_eval_num_samples'] = int(args.subgoal_eval_num_samples)
+    if str(args.subgoal_eval_score_type).strip():
+        dynamics_config['subgoal_eval_score_type'] = str(args.subgoal_eval_score_type).strip()
+    if str(args.subgoal_eval_selection).strip():
+        dynamics_config['subgoal_eval_selection'] = str(args.subgoal_eval_selection).strip()
+    if int(args.subgoal_flow_steps) > 0:
+        dynamics_config['subgoal_flow_steps'] = int(args.subgoal_flow_steps)
+        root.setdefault('dynamics', {})['subgoal_flow_steps'] = int(args.subgoal_flow_steps)
+    if float(args.subgoal_temperature) >= 0.0:
+        dynamics_config['subgoal_temperature'] = float(args.subgoal_temperature)
+        root.setdefault('dynamics', {})['subgoal_temperature'] = float(args.subgoal_temperature)
     env_name = fg['env_name']
     dataset_dir = fg.get('dataset_dir', '')
     env, train_plain, _ = make_env_and_datasets(
@@ -177,7 +218,15 @@ def main() -> None:
     critic_eval['action_chunk_horizon'] = idm_h
 
     eval_n = int(dynamics_config.get('subgoal_eval_num_samples', 1))
-    saved_path = eval_result_path(run_dir, epoch=int(args.epoch), eval_n=eval_n)
+    score_type = str(dynamics_config.get('subgoal_eval_score_type', 'transitive_ratio'))
+    result_suffix = str(args.eval_result_suffix).strip()
+    saved_path = eval_result_path(
+        run_dir,
+        epoch=int(args.epoch),
+        eval_n=eval_n,
+        score_type=score_type,
+        suffix=result_suffix,
+    )
     if bool(args.skip_if_saved) and saved_path.is_file():
         with open(saved_path, encoding='utf-8') as f:
             record = json.load(f)
@@ -191,6 +240,10 @@ def main() -> None:
         f'eval task_ids={task_ids} episodes_per_task={ep_task} max_chunks={max_chunks} '
         f'idm_action_chunk_horizon={idm_h} '
         f'subgoal_eval_num_samples={dynamics_config.get("subgoal_eval_num_samples", "")} '
+        f'subgoal_eval_score_type={dynamics_config.get("subgoal_eval_score_type", "")} '
+        f'subgoal_eval_selection={dynamics_config.get("subgoal_eval_selection", "")} '
+        f'subgoal_flow_steps={dynamics_config.get("subgoal_flow_steps", "")} '
+        f'subgoal_temperature={dynamics_config.get("subgoal_temperature", "")} '
         f'subgoal_override_goal={bool(args.subgoal_override_goal)} '
         f'(training critic had {int(critic_config["action_chunk_horizon"])})'
     )
@@ -233,6 +286,7 @@ def main() -> None:
         metrics=metrics,
         fg=fg,
         root=root,
+        result_suffix=result_suffix,
     )
     print(f'Saved eval results: {out_path}')
 

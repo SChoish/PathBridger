@@ -1,10 +1,10 @@
-# DOURI 구현 개요와 아이디어
+# PathBridger Flow+TRL 구현 개요
 
 이 문서는 `README.md`와 현재 코드를 함께 읽고 정리한 프로젝트 설명입니다. 실행법이나 config 표는 README가 이미 잘 담당하고 있으므로, 여기서는 **왜 이런 구조인지**, **각 모듈이 어떤 역할을 하는지**, **구현상 어떤 선택이 들어갔는지**, **앞으로 정리하면 좋을 부분**에 초점을 둡니다.
 
 ## 한 줄 요약
 
-DOURI는 OGBench의 long-horizon offline control 문제를 풀기 위해, 최종 goal로 바로 action을 예측하지 않고 다음 세 단계를 함께 학습합니다.
+PathBridger는 OGBench의 long-horizon offline control 문제를 풀기 위해, 최종 goal로 바로 action을 예측하지 않고 다음 세 단계를 함께 학습합니다. 현재 실험의 중심은 **Flow subgoal + `forward_bridge_residual` + TRL critic**입니다.
 
 1. 현재 상태와 최종 goal로부터 도달할 만한 **subgoal**을 예측합니다.
 2. 현재 상태에서 subgoal까지 이어지는 **linear-SDE bridge trajectory**를 생성합니다.
@@ -18,14 +18,14 @@ DOURI는 OGBench의 long-horizon offline control 문제를 풀기 위해, 최종
 
 AntMaze, HumanoidMaze, Cube/Puzzle 계열 task는 최종 goal까지의 horizon이 길고 reward가 sparse합니다. 이 프로젝트는 actor가 `pi(a | s, g_final)`을 바로 학습하는 대신, 먼저 dynamics agent가 `s`와 `g_final`을 보고 `g_sub`를 예측하게 합니다.
 
-기본 subgoal estimator는 deterministic point predictor입니다. `diag_gaussian` 모드에서는 `(mu, log_std)`를 예측해 여러 endpoint 후보를 뽑을 수도 있습니다. 이 분포형 subgoal은 uncertainty-aware proposal ablation을 위한 확장으로 보입니다.
+기본 subgoal estimator는 deterministic point predictor입니다. 현재 Flow+TRL sweep은 `subgoal_distribution: flow`를 사용해 flow-matching subgoal sampler를 학습하고, eval에서는 `subgoal_eval_selection: best_of_n_value`로 critic-ranked best-of-N endpoint를 고릅니다. 과거 `diag_gaussian` 모드는 분포형 subgoal ablation으로 남아 있습니다.
 
 ### 2. Bridge로 상태 경로를 만들고 IDM으로 action화하기
 
-Subgoal이 정해지면 dynamics는 현재 상태에서 subgoal까지의 상태 trajectory를 만듭니다. 기본 planner는 `exact_residual_chain`입니다.
+Subgoal이 정해지면 dynamics는 현재 상태에서 subgoal까지의 상태 trajectory를 만듭니다. 현재 기본 planner는 `forward_bridge_residual`입니다.
 
-- exact bridge posterior mean을 base transition으로 사용합니다.
-- residual network가 dataset trajectory에 맞는 보정항을 예측합니다.
+- closed-form forward bridge mean을 base transition으로 사용합니다.
+- endpoint-preserving `PathResidualNet`이 dataset trajectory에 맞는 보정항을 예측합니다.
 - `bridge_gamma_inv=0.0`인 hard endpoint bridge가 현재 기본 sweep의 중심입니다.
 - `theta_schedule=prefix_progress`는 actor/IDM이 실제로 사용하는 짧은 prefix가 subgoal 방향으로 충분히 진행되도록 설계된 schedule입니다.
 
@@ -33,7 +33,7 @@ Subgoal이 정해지면 dynamics는 현재 상태에서 subgoal까지의 상태 
 
 ### 3. Critic으로 proposal을 고르고 actor를 SPI로 학습하기
 
-Dynamics proposal은 가능한 action chunk 후보일 뿐이므로, critic이 후보를 평가합니다. Critic은 DQC 스타일의 full chunk critic, partial action critic, scalar value를 같이 갖습니다.
+Dynamics proposal은 가능한 action chunk 후보일 뿐이므로, critic이 후보를 평가합니다. 현재 sweep의 critic은 TRL mode입니다. `CriticSequenceDataset`이 same-trajectory value/TRL target을 구성하고, TRL value sampling ratio는 humanoidmaze에서 `(p_cur, p_geom, p_traj, p_rand)=(0,0,1,0)`로 고정합니다.
 
 Actor는 proposal을 단순 behavior cloning하지 않습니다. Critic score로 proposal distribution을 만들고, actor가 높은 Q를 유지하면서 좋은 proposal 근처로 이동하도록 SPI-style objective를 사용합니다. 코드상 actor loss는 critic Q 항과 proposal proximity 항을 함께 씁니다.
 
@@ -73,8 +73,9 @@ Critic 학습용 dataset입니다. 같은 start state에서 다음 정보를 만
 - action chunk action: actor horizon과 맞는 partial action critic용
 - value goal과 next observation
 - horizon별 reward, mask, backup horizon
+- TRL midpoint/value goals and masks
 
-`clip_chunk_to_goal=True`이면 value goal이 chunk 안에 있을 때 backup horizon을 줄이고 mask를 0으로 둡니다. Goal-conditioned value backup에서 goal 도달을 terminal처럼 처리하는 셈입니다.
+`clip_chunk_to_goal=True`이면 value goal이 chunk 안에 있을 때 backup horizon을 줄이고 mask를 0으로 둡니다. Goal-conditioned value backup에서 goal 도달을 terminal처럼 처리하는 셈입니다. TRL mode에서는 strictly-future same-trajectory goal sampling이 핵심이라 `value_geom_sample`과 `value_p_*` ratio가 결과에 직접 영향을 줍니다.
 
 ## 주요 모듈
 
@@ -90,7 +91,7 @@ Critic 학습용 dataset입니다. 같은 start state에서 다음 정보를 만
 - dynamics phase-1 loss 전체
 - embedded IDM loss와 inference
 
-현재 기본값은 `exact_residual_chain + deterministic subgoal + prefix_progress + hard bridge`입니다.
+현재 주요 sweep 기본값은 `forward_bridge_residual + flow subgoal + prefix_progress + hard bridge`입니다.
 
 ### `agents/critic.py`
 
@@ -98,8 +99,8 @@ Goal-conditioned critic stack입니다.
 
 - `BinaryChunkCritic`: full action chunk 또는 partial action chunk 평가
 - `ScalarValueNet`: value/subgoal value bonus에 사용
-- DQC 모드에서는 chunk critic으로 긴 horizon을 평가하고 partial action critic으로 actor horizon action을 평가합니다.
-- IQL 모드도 남아 있으며, 이 경우 chunk critic을 끄고 action critic/value 중심으로 동작합니다.
+- TRL 모드는 `critic_type: trl`, `use_chunk_critic: false`로 action chunk goal-conditioned critic과 transitive value target을 사용합니다.
+- DQC/IQL 모드도 남아 있지만 현재 Flow+TRL sweep의 메인 경로는 아닙니다.
 
 ### `agents/actor.py`
 
@@ -156,6 +157,17 @@ Success 판정은 OGBench env의 `info["success"]`를 기준으로 합니다.
 - Metric accumulation에서 매 step마다 host sync하지 않고 epoch 말에 모아서 device-to-host transfer를 합니다.
 - `PathHGCDataset.validate_sample_batch`처럼 trajectory alignment를 검사할 수 있는 hook이 있어 bridge supervision 관련 버그를 잡기 좋습니다.
 - `eval_checkpoint.py`가 `flags.json`을 읽어 config를 복원하므로, 오래된 run도 같은 hyperparameter로 평가하기 쉽습니다.
+
+## Generated Docs 규칙
+
+이 로컬에서는 `docs/`에 생성되는 CSV/MD artifact에 `_choi` suffix를 붙입니다.
+
+- `scripts/docs_output_paths.py`가 output naming을 중앙에서 관리합니다.
+- `summarize_feval_results.py` → `docs/flow_trl_feval_results_choi.csv/.md`
+- `summarize_runs.py` → `docs/runs_results_total_choi.csv`, `docs/runs_results_summary_choi.md`, douri 대응 파일
+- `export_trl_completed_results.py` → `docs/trl_completed_results_choi.csv`
+
+suffix 없는 generated CSV/MD는 stale artifact로 취급합니다.
 
 ## 수정 또는 정리 추천
 
