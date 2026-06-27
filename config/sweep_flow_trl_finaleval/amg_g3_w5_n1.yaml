@@ -1,5 +1,5 @@
 # Flow subgoal + TRL sweep: train N=1, final eval N sweep
-# env=antmaze-giant-navigate-v0 gap=3.0 wmax=5.0 train_N=1 gamma=0.99 vdist_pow=0.0
+# env=antmaze-giant-navigate-v0 gap=3.0 wmax=5.0 train_N=1 gamma=0.999 vdist_pow=0.0
 # final_eval_subgoal_eval_num_samples=[1, 2, 4, 8, 16]; episodes_per_task=25
 env_name: antmaze-giant-navigate-v0
 run_group: flow_trl_feval_amg_g3_w5_n1
@@ -50,7 +50,7 @@ critic_agent:
   use_chunk_critic: false
   action_chunk_horizon: 5
   full_chunk_horizon: 25
-  discount: 0.99
+  discount: 0.999
   tau_v: 0.7
   lambda_v_self: 1.0
   lambda_v_base: 1.0
