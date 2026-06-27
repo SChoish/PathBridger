@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate available feval eval JSONs → docs/flow_trl_feval_results.csv (+ .md).
+"""Aggregate available feval eval JSONs → docs/flow_trl_feval_results_7ch.csv (+ .md).
 
 All available eval_results/epoch600_n*.json files are included, so follow-up
 evals such as N=32 and duplicate reruns are reflected.
@@ -17,10 +17,14 @@ import sys
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 PROJECT_ROOT = os.path.join(SCRIPT_DIR, '..')
 RUNS_DIR = os.path.join(PROJECT_ROOT, 'runs')
-OUT_CSV = os.path.join(PROJECT_ROOT, 'docs', 'flow_trl_feval_results.csv')
-OUT_MD = os.path.join(PROJECT_ROOT, 'docs', 'flow_trl_feval_results.md')
+
+from docs_output_paths import docs_7ch_name, docs_7ch_path
+
+OUT_CSV = str(docs_7ch_path(PROJECT_ROOT, 'flow_trl_feval_results.csv'))
+OUT_MD = str(docs_7ch_path(PROJECT_ROOT, 'flow_trl_feval_results.md'))
 
 CSV_COLUMNS = [
     'run_uid',
@@ -331,9 +335,12 @@ def write_markdown(rows: list[dict], path: str) -> None:
         '',
         f'run **{n_runs}**개 · eval record **{len(rows)}**개 · eval_N={eval_ns}',
         f'sweep_tag counts: {tag_counts}',
-        f'CSV: [`flow_trl_feval_results.csv`](flow_trl_feval_results.csv)',
+        f'CSV: [`{docs_7ch_name("flow_trl_feval_results.csv")}`]({docs_7ch_name("flow_trl_feval_results.csv")})',
         '',
-        '별도 pivot CSV (`flow_trl_k40_multi_n_results.csv`, `flow_trl_temp0.5_k25_k40_results.csv`)는 같은 데이터의 요약 view입니다.',
+        '별도 pivot CSV ('
+        f'`{docs_7ch_name("flow_trl_k40_multi_n_results.csv")}`, '
+        f'`{docs_7ch_name("flow_trl_temp0.5_k25_k40_results.csv")}`'
+        ')는 같은 데이터의 요약 view입니다.',
         '',
         '중복 run_group은 `run_start_ts` / `run_uid`로 구분합니다.',
         '',

@@ -1,5 +1,5 @@
 # Plain Flow-BC on top of TRL + displacement baseline.
-# Defaults in agents/dynamics.py + agents/critic.py match tune_sweep_common.
+# Defaults come from agents/dynamics.py + agents/critic.py.
 env_name: puzzle-3x3-play-v0
 run_group: flow_plain_bon4_example
 seed: 0

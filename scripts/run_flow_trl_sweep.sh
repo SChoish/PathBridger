@@ -122,6 +122,22 @@ print('1' if eval_results_complete(os.environ['RUN_DIR'], epoch=int(os.environ['
 PY
 }
 
+run_gamma_matches_config() {
+  CONFIG_PATH="$1" RUN_DIR="$2" \
+    "${PYTHON_BIN}" - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))
+from flow_trl_sweep_common import run_gamma_matches_config
+
+print('1' if run_gamma_matches_config(
+    config_path=os.environ['CONFIG_PATH'],
+    run_dir=os.environ['RUN_DIR'],
+) else '0')
+PY
+}
+
 if ((${#configs[@]} == 0)); then
   echo "No configs in ${CONFIG_DIR}" | tee -a "${MASTER_LOG}"
   exit 1
@@ -133,9 +149,15 @@ for cfg in "${configs[@]}"; do
   run_dir="$(resolve_run_dir "${cfg}")"
 
   if [[ "${EVAL_ONLY}" != "1" ]]; then
-    if [[ -n "${run_dir}" ]] && [[ "$(eval_results_complete "${run_dir}")" == "1" ]]; then
+    if [[ -n "${run_dir}" ]] && [[ "$(eval_results_complete "${run_dir}")" == "1" ]] \
+        && [[ "$(run_gamma_matches_config "${cfg}" "${run_dir}")" == "1" ]]; then
       echo "[$(date -Is)] SKIP_COMPLETE ${base} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
       continue
+    fi
+    if [[ -n "${run_dir}" ]] && [[ "$(eval_results_complete "${run_dir}")" == "1" ]] \
+        && [[ "$(run_gamma_matches_config "${cfg}" "${run_dir}")" != "1" ]]; then
+      echo "[$(date -Is)] GAMMA_MISMATCH_RETRAIN ${base} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
+      run_dir=""
     fi
     if [[ -n "${run_dir}" ]]; then
       echo "[$(date -Is)] SKIP_TRAIN_INCOMPLETE_EVAL ${base} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"

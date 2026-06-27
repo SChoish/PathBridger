@@ -20,7 +20,7 @@ HORIZON = 40
 TRAIN_N = 1
 WMAX = 5.0
 
-# IDM-best params from docs/flow_trl_feval_results.csv (2026-06-22).
+# IDM-best params from docs/flow_trl_feval_results_7ch.csv (2026-06-22).
 BEST_SPECS: list[dict[str, Any]] = [
     {'env_prefix': 'p3', 'gap': 1.0, 'eval_n': 32, 'source_idm': 0.672, 'source_actor': 0.392},
     {'env_prefix': 'p4', 'gap': 5.0, 'eval_n': 16, 'source_idm': 0.800, 'source_actor': 0.688},

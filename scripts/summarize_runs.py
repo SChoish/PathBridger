@@ -5,11 +5,15 @@ import json
 import re
 import glob
 import os
+import sys
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 PROJECT_ROOT = os.path.join(SCRIPT_DIR, "..")
 DOURI_ROOT = os.path.normpath(os.path.join(PROJECT_ROOT, "..", "douri"))
+
+from docs_output_paths import docs_7ch_path
 
 CSV_COLUMNS = [
     "run_dir", "algo", "env", "ep", "gap", "maxgap", "N", "gamma",
@@ -21,14 +25,14 @@ RUN_TARGETS = [
     {
         "name": "Pathbridger",
         "runs_dir": os.path.join(PROJECT_ROOT, "runs"),
-        "out_md": os.path.join(PROJECT_ROOT, "docs", "runs_results_summary.md"),
-        "out_csv": os.path.join(PROJECT_ROOT, "docs", "runs_results_total.csv"),
+        "out_md": str(docs_7ch_path(PROJECT_ROOT, "runs_results_summary.md")),
+        "out_csv": str(docs_7ch_path(PROJECT_ROOT, "runs_results_total.csv")),
     },
     {
         "name": "douri",
         "runs_dir": os.path.join(DOURI_ROOT, "runs"),
-        "out_md": os.path.join(PROJECT_ROOT, "docs", "douri_runs_results_summary.md"),
-        "out_csv": os.path.join(PROJECT_ROOT, "docs", "douri_runs_results_total.csv"),
+        "out_md": str(docs_7ch_path(PROJECT_ROOT, "douri_runs_results_summary.md")),
+        "out_csv": str(docs_7ch_path(PROJECT_ROOT, "douri_runs_results_total.csv")),
     },
 ]
 
