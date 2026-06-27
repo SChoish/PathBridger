@@ -86,6 +86,12 @@ def main() -> None:
         help='Override dynamics.subgoal_eval_num_samples for eval only; -1 = checkpoint config.',
     )
     p.add_argument(
+        '--subgoal_temperature',
+        type=float,
+        default=-1.0,
+        help='Override dynamics.subgoal_temperature for eval only; -1 = checkpoint config.',
+    )
+    p.add_argument(
         '--idm_action_chunk_horizon',
         type=int,
         default=5,
@@ -121,6 +127,10 @@ def main() -> None:
     dynamics_config, critic_config, actor_config = _build_configs(root, fg)
     if int(args.subgoal_eval_num_samples) > 0:
         dynamics_config['subgoal_eval_num_samples'] = int(args.subgoal_eval_num_samples)
+    eval_temperature: float | None = None
+    if float(args.subgoal_temperature) >= 0.0:
+        eval_temperature = float(args.subgoal_temperature)
+        dynamics_config['subgoal_temperature'] = eval_temperature
     env_name = fg['env_name']
     dataset_dir = fg.get('dataset_dir', '')
     env, train_plain, _ = make_env_and_datasets(
@@ -177,7 +187,13 @@ def main() -> None:
     critic_eval['action_chunk_horizon'] = idm_h
 
     eval_n = int(dynamics_config.get('subgoal_eval_num_samples', 1))
-    saved_path = eval_result_path(run_dir, epoch=int(args.epoch), eval_n=eval_n)
+    saved_path = eval_result_path(
+        run_dir,
+        epoch=int(args.epoch),
+        eval_n=eval_n,
+        subgoal_temperature=eval_temperature,
+        eval_max_chunks=max_chunks,
+    )
     if bool(args.skip_if_saved) and saved_path.is_file():
         with open(saved_path, encoding='utf-8') as f:
             record = json.load(f)
@@ -191,6 +207,7 @@ def main() -> None:
         f'eval task_ids={task_ids} episodes_per_task={ep_task} max_chunks={max_chunks} '
         f'idm_action_chunk_horizon={idm_h} '
         f'subgoal_eval_num_samples={dynamics_config.get("subgoal_eval_num_samples", "")} '
+        f'subgoal_temperature={dynamics_config.get("subgoal_temperature", "")} '
         f'subgoal_override_goal={bool(args.subgoal_override_goal)} '
         f'(training critic had {int(critic_config["action_chunk_horizon"])})'
     )
@@ -233,6 +250,8 @@ def main() -> None:
         metrics=metrics,
         fg=fg,
         root=root,
+        subgoal_temperature=eval_temperature,
+        eval_max_chunks=max_chunks,
     )
     print(f'Saved eval results: {out_path}')
 

@@ -9,8 +9,27 @@ from pathlib import Path
 from typing import Any
 
 
-def eval_result_path(run_dir: Path | str, *, epoch: int, eval_n: int) -> Path:
-    return Path(run_dir) / 'eval_results' / f'epoch{int(epoch)}_n{int(eval_n)}.json'
+def eval_result_path(
+    run_dir: Path | str,
+    *,
+    epoch: int,
+    eval_n: int,
+    subgoal_temperature: float | None = None,
+    eval_max_chunks: int | None = None,
+) -> Path:
+    chunks_tag = ''
+    if eval_max_chunks is not None and int(eval_max_chunks) != 200:
+        chunks_tag = f'_m{int(eval_max_chunks)}'
+    if subgoal_temperature is None:
+        return Path(run_dir) / 'eval_results' / f'epoch{int(epoch)}{chunks_tag}_n{int(eval_n)}.json'
+    temp_tag = _temp_tag(float(subgoal_temperature))
+    return Path(run_dir) / 'eval_results' / f'epoch{int(epoch)}_t{temp_tag}{chunks_tag}_n{int(eval_n)}.json'
+
+
+def _temp_tag(temperature: float) -> str:
+    if abs(temperature - round(temperature)) < 1e-9:
+        return str(int(round(temperature)))
+    return format(temperature, 'g').replace('.', 'p')
 
 
 def save_eval_results(
@@ -23,6 +42,8 @@ def save_eval_results(
     metrics: dict[str, Any],
     fg: dict[str, Any],
     root: dict[str, Any],
+    subgoal_temperature: float | None = None,
+    eval_max_chunks: int | None = None,
 ) -> Path:
     run_dir = Path(run_dir)
     eval_n = int(subgoal_eval_num_samples)
@@ -47,7 +68,11 @@ def save_eval_results(
         'subgoal_num_samples_train': int(dyn.get('subgoal_num_samples', 0)),
         'subgoal_value_gap_scale': float(dyn.get('subgoal_value_gap_scale', 0.0)),
         'subgoal_value_weight_max': float(dyn.get('subgoal_value_weight_max', 0.0)),
+        'subgoal_temperature': float(
+            subgoal_temperature if subgoal_temperature is not None else dyn.get('subgoal_temperature', 1.0)
+        ),
         'eval_episodes_per_task': int(episodes_per_task),
+        'eval_max_chunks': int(eval_max_chunks if eval_max_chunks is not None else fg.get('eval_max_chunks', 200)),
         'eval_task_ids': [int(t) for t in task_ids],
         'idm_success_rate_mean': float(metrics.get('eval_idm/success_rate_mean', float('nan'))),
         'actor_success_rate_mean': float(metrics.get('eval/success_rate_mean', float('nan'))),
@@ -56,7 +81,13 @@ def save_eval_results(
     }
     out_dir = run_dir / 'eval_results'
     out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = eval_result_path(run_dir, epoch=epoch, eval_n=eval_n)
+    json_path = eval_result_path(
+        run_dir,
+        epoch=epoch,
+        eval_n=eval_n,
+        subgoal_temperature=subgoal_temperature,
+        eval_max_chunks=eval_max_chunks,
+    )
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(record, f, indent=2)
         f.write('\n')

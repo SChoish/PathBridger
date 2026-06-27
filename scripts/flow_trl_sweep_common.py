@@ -14,7 +14,7 @@ TRAIN_N = 1
 FINAL_EVAL_N_VALUES = [1, 2, 4, 8, 16]
 
 # Run order: puzzle -> cube -> antmaze.
-ENV_ORDER = ['p3', 'p4', 'cs', 'cd', 'ct', 'amm', 'aml', 'amg']
+ENV_ORDER = ['p3', 'p4', 'p45', 'p46', 'cs', 'cd', 'ct', 'amm', 'aml', 'amg']
 
 FLOW_DYNAMICS_BASE: dict[str, Any] = {
     'subgoal_distribution': 'flow',
@@ -149,6 +149,34 @@ def resolve_run_dir(
     if not candidates:
         return ''
     return max(candidates, key=os.path.getmtime)
+
+
+def run_gamma_matches_config(
+    *,
+    config_path: str,
+    run_dir: str,
+    tol: float = 1e-6,
+) -> bool:
+    """True if saved run critic discount matches the YAML config."""
+    import json
+    import os
+
+    import yaml
+
+    if not run_dir:
+        return False
+    flags_path = os.path.join(run_dir, 'flags.json')
+    if not os.path.isfile(flags_path):
+        return False
+    with open(config_path, encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    want = float(cfg.get('critic_agent', {}).get('discount', float('nan')))
+    with open(flags_path, encoding='utf-8') as f:
+        root = json.load(f)
+    got = float(root.get('critic_agent', {}).get('discount', float('nan')))
+    if not (want == want and got == got):  # NaN guard
+        return False
+    return abs(want - got) <= tol
 
 
 def eval_results_complete(
