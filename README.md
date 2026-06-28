@@ -1,6 +1,9 @@
 # PathBridger Experiment Guide
 
-OGBench 기반 offline long-horizon goal-conditioned control 실험 코드입니다. 현재 코드스페이스의 주 경로는 **Flow subgoal + forward-bridge residual dynamics + TRL critic + SPI actor**입니다.
+OGBench 기반 long-horizon goal-conditioned control 실험 코드입니다. 두 가지 학습 경로를 지원합니다.
+
+- **Standard (single-run)**: Flow subgoal + forward-bridge residual dynamics + TRL critic + SPI actor를 한 번에 같이 학습합니다.
+- **State-only Offline + Online Hybrid (`hybrid_phase`)**: offline에서 action 없이 dynamics(path) / value V / flow subgoal / deterministic subgoal-spi net을 학습하고, online에서 환경 rollout으로 IDM / action critic Q / SPI actor를 학습합니다. ([State-only Offline + Online Hybrid](#state-only-offline--online-hybrid-hybrid_phase) 참고)
 
 자세한 구현 설명은 `docs/project_implementation_overview.md`, script 운영 정리는 `scripts/README.md`를 참고하세요.
 
@@ -30,14 +33,79 @@ critic_agent:
   q_target_from_value: true
 ```
 
+## State-only Offline + Online Hybrid (`hybrid_phase`)
+
+`--hybrid_phase {standard,offline,online}` 플래그로 동작을 전환합니다. offline과 online은 **별도 run**으로 실행하고, online이 offline 체크포인트를 불러옵니다.
+
+### 핵심 아이디어
+
+- **Offline (action-free)**: action 정보를 전혀 쓰지 않고 학습합니다.
+  - `DynamicsAgent`: path-residual planner + flow subgoal net 학습 (IDM은 `idm_loss_weight=0`으로 비활성).
+  - `CriticAgent`: value head V만 학습 (`trl_value_only=True`, action critic Q는 0).
+  - `SubgoalSpiAgent`(`agents/subgoal_spi.py`): flow subgoal 후보를 critic의 transitive value `V(s,z)·V(z,g)/V(s,g)`로 점수화해, SPI objective로 **deterministic subgoal net**을 distill합니다 (SPI actor와 동일한 `-V/scale + prox/(2·tau)` 형태).
+- **Online**: offline 체크포인트(dynamics, V, flow subgoal, subgoal-spi)를 불러와 frozen으로 두고, 실제 환경 rollout `(s, a, s')`로 다음을 학습합니다.
+  - `DynamicsAgent`: IDM만 (path/flow subgoal은 frozen).
+  - `CriticAgent`: action critic Q만 (offline V는 frozen, `lambda_v_*=0`).
+  - `ActorAgent`: SPI actor.
+  - subgoal policy는 deterministic subgoal-spi net을 사용합니다. eval은 subgoal-spi와 flow best-of-N(`--online_eval_flow_n_samples`)을 함께 측정해 비교합니다.
+
+> 기존 600에포크 flow 체크포인트처럼 subgoal-spi net이 없는 경우, online에서 `--online_train_subgoal_spi=True`(기본값)로 frozen flow + frozen V로부터 subgoal-spi를 같이 distill합니다.
+
+### Offline run
+
+```bash
+PYTHONPATH=. MUJOCO_GL=egl python main.py \
+  --run_config config/hybrid_offline_antmaze_large.yaml \
+  --hybrid_phase offline \
+  --seed 0
+```
+
+### Online run
+
+offline run 디렉토리(또는 위 구조의 flow 체크포인트 디렉토리)를 `--offline_run_dir`로 지정합니다.
+
+```bash
+PYTHONPATH=. MUJOCO_GL=egl python main.py \
+  --run_config config/hybrid_online_antmaze_large.yaml \
+  --hybrid_phase online \
+  --offline_run_dir runs/<offline_run_dir> \
+  --offline_load_step 600 \
+  --seed 0
+```
+
+`--offline_run_dir`는 `checkpoints/{dynamics,critic}/params_<step>.pkl` 구조를 가진 디렉토리여야 하며, `subgoal_spi/params_<step>.pkl`이 있으면 함께 로드합니다.
+
+### 주요 hybrid 플래그
+
+| 플래그 | 기본 | 설명 |
+|--------|------|------|
+| `hybrid_phase` | `standard` | `standard` / `offline` / `online` |
+| `offline_run_dir` | `""` | online에서 불러올 offline(또는 flow) 체크포인트 디렉토리 |
+| `offline_load_step` | `-1` | 로드 step. `<0`이면 최신 step 자동 탐색 |
+| `online_freeze_offline` | `True` | online에서 path/flow subgoal/V를 frozen으로 둠 |
+| `online_train_subgoal_spi` | `True` | online에서 subgoal-spi net을 distill (subgoal-spi 체크포인트가 없을 때 필수) |
+| `online_eval_flow_n_samples` | `8` | online eval 시 flow best-of-N 비교 (`<=0`이면 비활성) |
+| `online_warmup_env_steps` | - | 학습 시작 전 수집할 warmup env step |
+| `online_random_env_steps` | - | 초기 랜덤 행동 수집 step |
+| `online_env_steps_per_update` | `1` | gradient step당 env step 수 |
+| `online_rebuild_every_env_steps` | - | replay 데이터셋 재구축 주기 |
+| `online_replay_capacity` | - | replay buffer 용량(step) |
+| `online_collect_policy` | `actor` | 수집 정책 (`actor` / `idm`) |
+| `online_explore_noise` | - | 수집 시 action gaussian noise scale |
+
+학습/eval 주기는 step 기준 플래그(`train_steps`, `log_every_n_steps`, `save_every_n_steps`, `eval_every_n_steps`)로 제어합니다. 예: `train_steps=300000`, `eval_every_n_steps=100000`.
+
+예시 config: `config/hybrid_offline_antmaze_large.yaml`, `config/hybrid_online_antmaze_large.yaml`.
+
 ## 프로젝트 구조
 
 | 경로 | 역할 |
 |------|------|
-| `main.py` | 학습 entry point. dynamics, critic, actor 동시 학습 |
+| `main.py` | 학습 entry point. standard 단일 학습 + `hybrid_phase` offline/online 오케스트레이션 |
 | `agents/dynamics.py` | flow/gaussian/deterministic subgoal, bridge planner, IDM, proposal builder |
-| `agents/critic.py` | DQC/IQL legacy path와 TRL critic |
+| `agents/critic.py` | DQC/IQL legacy path와 TRL critic (`trl_value_only`로 value-only 학습 지원) |
 | `agents/actor.py` | SPI-style action chunk actor |
+| `agents/subgoal_spi.py` | flow subgoal을 critic value로 SPI distill하는 deterministic subgoal net |
 | `utils/critic_sequence_dataset.py` | TRL critic batch와 transitive value fields 생성 |
 | `utils/dynamics.py` | bridge schedule, posterior/model mean, residual helper |
 | `utils/theta_schedules.py` | `linear_beta`, `prefix_progress` schedule |

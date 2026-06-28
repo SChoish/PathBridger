@@ -361,23 +361,35 @@ class CriticAgent(flax.struct.PyTreeNode):
             tri_weights = tri_valid
         loss_v_tri = self._weighted_mean(loss_v_tri_per, tri_weights)
 
-        q_goals = batch.get('q_goals', goals)
-        q_logits = self.network.select('action_critic')(
-            observations, q_goals, batch['action_chunk_actions'], params=grad_params,
-        )
-        q_pred = jnp.clip(jax.nn.sigmoid(q_logits), eps, 1.0)
-        q_offsets = jnp.asarray(batch.get('q_goal_offsets', batch['value_offsets']), dtype=jnp.float32)
-        h = jnp.asarray(float(self.config['action_chunk_horizon']), dtype=jnp.float32)
-        target_v_logits = self.network.select('target_value')(
-            batch['action_chunk_next_observations'], q_goals,
-        )
-        target_v_next = jnp.clip(jax.nn.sigmoid(target_v_logits), eps, 1.0)
-        reached = (q_offsets >= 1.0) & (q_offsets <= h)
-        reached_target = jnp.power(discount, q_offsets)
-        bootstrap_target = jnp.power(discount, h) * target_v_next
-        target_q = jax.lax.stop_gradient(jnp.clip(jnp.where(reached, reached_target, bootstrap_target), eps, 1.0))
-        loss_q_per = jnp.mean(optax.sigmoid_binary_cross_entropy(q_logits, target_q[None, :]), axis=0)
-        loss_q = self._weighted_mean(loss_q_per, valid_mask)
+        # ``trl_value_only`` (state-only offline phase) skips the action-conditioned
+        # local Q term entirely so the value head can be trained without ever
+        # consuming actions. The action critic is left untouched (frozen).
+        value_only = bool(self.config.get('trl_value_only', False))
+        if value_only:
+            zero = jnp.zeros((), dtype=jnp.float32)
+            q_agg = jnp.zeros((observations.shape[0],), dtype=jnp.float32)
+            target_q = jnp.zeros((observations.shape[0],), dtype=jnp.float32)
+            target_v_next = jnp.zeros((observations.shape[0],), dtype=jnp.float32)
+            loss_q = zero
+        else:
+            q_goals = batch.get('q_goals', goals)
+            q_logits = self.network.select('action_critic')(
+                observations, q_goals, batch['action_chunk_actions'], params=grad_params,
+            )
+            q_pred = jnp.clip(jax.nn.sigmoid(q_logits), eps, 1.0)
+            q_offsets = jnp.asarray(batch.get('q_goal_offsets', batch['value_offsets']), dtype=jnp.float32)
+            h = jnp.asarray(float(self.config['action_chunk_horizon']), dtype=jnp.float32)
+            target_v_logits = self.network.select('target_value')(
+                batch['action_chunk_next_observations'], q_goals,
+            )
+            target_v_next = jnp.clip(jax.nn.sigmoid(target_v_logits), eps, 1.0)
+            reached = (q_offsets >= 1.0) & (q_offsets <= h)
+            reached_target = jnp.power(discount, q_offsets)
+            bootstrap_target = jnp.power(discount, h) * target_v_next
+            target_q = jax.lax.stop_gradient(jnp.clip(jnp.where(reached, reached_target, bootstrap_target), eps, 1.0))
+            loss_q_per = jnp.mean(optax.sigmoid_binary_cross_entropy(q_logits, target_q[None, :]), axis=0)
+            loss_q = self._weighted_mean(loss_q_per, valid_mask)
+            q_agg = self.aggregate_ensemble_q(q_pred)
 
         total = (
             lambda_v_self * loss_v_self
@@ -385,7 +397,6 @@ class CriticAgent(flax.struct.PyTreeNode):
             + lambda_v_tri * loss_v_tri
             + lambda_q_local * loss_q
         )
-        q_agg = self.aggregate_ensemble_q(q_pred)
         return total, {
             'loss/total': total,
             'value/loss': lambda_v_self * loss_v_self + lambda_v_base * loss_v_base + lambda_v_tri * loss_v_tri,
@@ -557,11 +568,9 @@ class CriticAgent(flax.struct.PyTreeNode):
     def _validate_trl_batch(self, batch: dict) -> None:
         if not self._is_trl():
             return
-        required = (
+        required = [
             'observations',
             'value_goals',
-            'action_chunk_actions',
-            'action_chunk_next_observations',
             'value_offsets',
             'value_base_goals',
             'value_base_offsets',
@@ -569,7 +578,12 @@ class CriticAgent(flax.struct.PyTreeNode):
             'trans_v_left_goals',
             'trans_v_right_goals',
             'trans_v_valid_mask',
-        )
+        ]
+        # Action-conditioned Q fields are only required when the local Q term is
+        # active (i.e. not the state-only ``trl_value_only`` offline phase).
+        if not bool(self.config.get('trl_value_only', False)):
+            required.extend(['action_chunk_actions', 'action_chunk_next_observations'])
+        required = tuple(required)
         missing = [key for key in required if key not in batch]
         if missing:
             raise KeyError(f"trl batch missing required keys: {missing}")
@@ -736,6 +750,9 @@ def get_config():
             lambda_v_base=1.0,
             lambda_v_tri=1.0,
             lambda_v_self=1.0,
+            # State-only offline phase: train the value head (self/base/transitive)
+            # without the action-conditioned local Q term, so V never sees actions.
+            trl_value_only=False,
             value_base_horizon=5,
             value_transitive_reweight=True,
             value_distance_weight_power=1.0,

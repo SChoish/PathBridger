@@ -31,6 +31,9 @@ class CriticSequenceDataset:
     dataset: Dataset
     config: Any
     preprocess_frame_stack: bool = True
+    # State-only offline phase: build value-head fields only and never read the
+    # dataset's actions (no action_chunk_actions / chunk backups).
+    value_only: bool = False
 
     def __post_init__(self):
         self.size = self.dataset.size
@@ -243,11 +246,34 @@ class CriticSequenceDataset:
         if np.any(bad):
             raise ValueError('CriticSequenceDataset sampled starts crossing episode boundaries.')
 
+    def _sample_value_only(self, idxs: np.ndarray) -> dict:
+        """Build only the TRL value-head fields (no actions, no Q backups).
+
+        Used by the state-only offline hybrid phase so the value head is trained
+        without ever consuming action information.
+        """
+        obs = np.asarray(self.get_observations(idxs), dtype=np.float32)
+        value_goal_idxs = self.sample_trl_goals(idxs)
+        value_goals = np.asarray(self.get_observations(value_goal_idxs), dtype=np.float32)
+        valids = np.repeat(self.valids_template[None, :], idxs.shape[0], axis=0).astype(np.float32)
+        trl_fields = self._sample_trl_fields(idxs, value_goal_idxs)
+        batch = {
+            'observations': obs,
+            'value_goals': value_goals,
+            'valids': valids,
+            'value_offsets': (value_goal_idxs - idxs).astype(np.float32),
+            **trl_fields,
+        }
+        return batch
+
     def sample(self, batch_size: int, idxs: np.ndarray | None = None, evaluation: bool = False) -> dict:
         if idxs is None:
             idxs = self.valid_starts[np.random.randint(len(self.valid_starts), size=batch_size)]
         idxs = np.asarray(idxs, dtype=np.int64)
         self._validate_starts(idxs)
+
+        if self.value_only:
+            return self._sample_value_only(idxs)
 
         obs = np.asarray(self.get_observations(idxs), dtype=np.float32)
         actions_step = np.asarray(self.dataset['actions'][idxs], dtype=np.float32)

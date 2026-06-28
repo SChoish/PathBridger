@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
+import glob as glob_module
 import json
 import logging
 import math
@@ -31,6 +32,7 @@ from agents.critic import (
 )
 from agents.actor import ActorAgent, get_actor_config
 from agents.dynamics import DynamicsAgent, get_dynamics_config
+from agents.subgoal_spi import SubgoalSpiAgent, get_subgoal_spi_config
 from utils.datasets import Dataset, PathHGCDataset
 from utils.critic_sequence_dataset import CriticSequenceDataset
 from utils.env_utils import make_env_and_datasets
@@ -184,6 +186,62 @@ flags.DEFINE_boolean(
     False,
     'If True, allow JAX to run on CPU when CUDA is unavailable. Default False: require GPU and exit '
     'with an error if jax.default_backend() is not gpu (no silent CPU fallback).',
+)
+
+# ---------------------------------------------------------------------------
+# State-only-offline + online hybrid (``hybrid_phase``).
+#
+#   offline : action-free. Trains the forward-bridge dynamics (path residual),
+#             the value head V (TRL value-only, no action Q), the flow subgoal
+#             net, and SPI-distills a deterministic subgoal net from the flow
+#             net using V. Saves dynamics/critic/subgoal_spi checkpoints.
+#   online  : loads the offline dynamics/V/flow-subgoal/subgoal-spi checkpoints,
+#             freezes them, collects fresh on-policy rollouts into a replay
+#             buffer, and trains the IDM, the action critic Q, and the SPI actor.
+#   standard: legacy single-loop joint training (default).
+# ---------------------------------------------------------------------------
+flags.DEFINE_string('hybrid_phase', 'standard', "One of 'standard', 'offline', 'online'.")
+flags.DEFINE_string(
+    'offline_run_dir',
+    '',
+    'For hybrid_phase=online: run dir of the completed offline phase to load '
+    'dynamics / critic (V) / subgoal_spi checkpoints from.',
+)
+flags.DEFINE_integer(
+    'offline_load_step',
+    -1,
+    'For hybrid_phase=online: checkpoint step to load from offline_run_dir. '
+    '-1 selects the latest saved step.',
+)
+flags.DEFINE_boolean(
+    'online_freeze_offline',
+    True,
+    'For hybrid_phase=online: freeze the offline-trained components (dynamics path '
+    'residual, flow subgoal net, value head V, deterministic subgoal-spi net). When '
+    'True only IDM, action critic Q, and the SPI actor are trained.',
+)
+flags.DEFINE_integer('online_warmup_env_steps', 5000, 'Env steps to collect before any online gradient step.')
+flags.DEFINE_integer('online_random_env_steps', 5000, 'Initial env steps that use uniform-random actions for exploration.')
+flags.DEFINE_integer('online_env_steps_per_update', 1, 'Env steps collected per online gradient step.')
+flags.DEFINE_integer('online_rebuild_every_env_steps', 2000, 'Rebuild replay-buffer dataset wrappers every N collected env steps.')
+flags.DEFINE_integer('online_replay_capacity', 1_000_000, 'Max transitions kept in the online replay buffer (episode-aligned).')
+flags.DEFINE_float('online_explore_noise', 0.1, 'Std of Gaussian exploration noise added to collected actions.')
+flags.DEFINE_string('online_collect_policy', 'actor', "Collection policy for online rollouts: 'actor' or 'idm'.")
+flags.DEFINE_integer('online_collect_max_chunks', 0, 'Max action chunks per collected episode. <=0 uses the env episode cap.')
+flags.DEFINE_integer(
+    'online_eval_flow_n_samples',
+    8,
+    'For hybrid_phase=online eval: additionally evaluate using the frozen flow subgoal net with '
+    'best-of-N value selection (N samples) for comparison against the deterministic subgoal-spi net. '
+    '<=0 disables the extra flow eval (subgoal-spi only).',
+)
+flags.DEFINE_boolean(
+    'online_train_subgoal_spi',
+    True,
+    'For hybrid_phase=online: SPI-distill the deterministic subgoal net online from the frozen flow '
+    'subgoal net + frozen value V. Enable this when starting from plain flow checkpoints that do not '
+    'contain a subgoal_spi net. When a subgoal_spi checkpoint is present in offline_run_dir it is '
+    'loaded first and then refined.',
 )
 
 _SPI_ACTOR_KEYS = {
@@ -1046,8 +1104,14 @@ def _evaluate_env_tasks(
     video_fps: int = 15,
     wandb_enabled: bool = False,
     subgoal_override_goal: bool = False,
+    subgoal_agent: Any | None = None,
 ) -> dict[str, Any]:
-    """OGBench-style eval: success is decided **only** by ``info['success']`` (any step). No tolerance diagnostic."""
+    """OGBench-style eval: success is decided **only** by ``info['success']`` (any step). No tolerance diagnostic.
+
+    When ``subgoal_agent`` is provided (state-only-offline + online hybrid), the
+    deterministic subgoal-spi net is used as the subgoal policy instead of the
+    dynamics flow/best-of-N subgoal selection.
+    """
     if not task_ids:
         return {}
 
@@ -1076,6 +1140,12 @@ def _evaluate_env_tasks(
     eval_seed_base = int(dynamics_agent.config.get('subgoal_eval_seed', 0))
 
     def _eval_subgoal(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
+        if subgoal_agent is not None:
+            pred = subgoal_agent.infer_subgoal(
+                jnp.asarray(obs, dtype=jnp.float32),
+                jnp.asarray(goal, dtype=jnp.float32),
+            )
+            return np.asarray(pred, dtype=np.float32).reshape(-1)
         if use_eval_bon:
             rng = jax.random.PRNGKey(eval_seed_base + int(ep_ix))
             pred = dynamics_agent.infer_subgoal_for_eval(
@@ -1198,6 +1268,491 @@ def _evaluate_env_tasks(
     return metrics
 
 
+def _apply_hybrid_phase_configs(phase: str, dynamics_config: Any, critic_config: Any) -> None:
+    """Mutate configs in place for the state-only-offline / online hybrid phases.
+
+    offline (action-free):
+        - dynamics: ``idm_loss_weight=0`` so the IDM term short-circuits before
+          reading actions; the path-residual + flow subgoal nets keep training.
+        - critic: ``trl_value_only=True`` so V is learned without the action Q.
+    online:
+        - dynamics: train only the IDM (``path_loss_weight``/``subgoal_loss_weight``
+          set to 0 when freezing the offline nets).
+        - critic: train only the action Q (value lambdas set to 0 to freeze the
+          offline V), ``trl_value_only=False``.
+    """
+    phase = str(phase).lower()
+    if phase == 'offline':
+        sub_mode = str(dynamics_config.get('subgoal_distribution', '')).lower()
+        if sub_mode != 'flow':
+            raise ValueError(
+                f"hybrid_phase=offline requires dynamics.subgoal_distribution='flow', got {sub_mode!r}."
+            )
+        dynamics_config['idm_loss_weight'] = 0.0
+        critic_config['trl_value_only'] = True
+    elif phase == 'online':
+        sub_mode = str(dynamics_config.get('subgoal_distribution', '')).lower()
+        if sub_mode != 'flow':
+            raise ValueError(
+                f"hybrid_phase=online requires dynamics.subgoal_distribution='flow' "
+                f"(to match the offline checkpoint), got {sub_mode!r}."
+            )
+        critic_config['trl_value_only'] = False
+        if float(dynamics_config.get('idm_loss_weight', 1.0)) <= 0.0:
+            dynamics_config['idm_loss_weight'] = 1.0
+        if bool(FLAGS.online_freeze_offline):
+            # Freeze the offline-trained components: zero their loss weights so
+            # gradients never touch the path residual / flow subgoal / value head.
+            dynamics_config['path_loss_weight'] = 0.0
+            dynamics_config['subgoal_loss_weight'] = 0.0
+            critic_config['lambda_v_self'] = 0.0
+            critic_config['lambda_v_base'] = 0.0
+            critic_config['lambda_v_tri'] = 0.0
+            if float(critic_config.get('lambda_q_local', 0.0)) <= 0.0:
+                critic_config['lambda_q_local'] = 1.0
+    elif phase != 'standard':
+        raise ValueError(f"hybrid_phase must be 'standard', 'offline', or 'online', got {phase!r}.")
+
+
+def _resolve_offline_ckpt_step(offline_run_dir: str, requested_step: int) -> int:
+    """Return the offline checkpoint step to load (latest when requested < 0)."""
+    dyn_dir = os.path.join(offline_run_dir, 'checkpoints', 'dynamics')
+    if int(requested_step) >= 0:
+        return int(requested_step)
+    steps = []
+    for path in glob_module.glob(os.path.join(dyn_dir, 'params_*.pkl')):
+        m = re.search(r'params_(\d+)\.pkl$', os.path.basename(path))
+        if m:
+            steps.append(int(m.group(1)))
+    if not steps:
+        raise FileNotFoundError(f'No offline dynamics checkpoints found under {dyn_dir}.')
+    return max(steps)
+
+
+def _build_subgoal_spi_batch(
+    dynamics_agent: DynamicsAgent,
+    critic_agent: Any,
+    dynamics_batch: dict,
+    num_candidates: int,
+    rng: Any,
+) -> tuple[dict, Any]:
+    """Sample flow subgoal candidates, score them with the critic's transitive
+    value ratio, and package an SPI batch for the deterministic subgoal net."""
+    obs = jnp.asarray(dynamics_batch['observations'], dtype=jnp.float32)
+    goals = jnp.asarray(dynamics_batch['high_actor_goals'], dtype=jnp.float32)
+    rng, cand_rng = jax.random.split(rng)
+    candidates, _mu = dynamics_agent.sample_subgoal_candidates(
+        obs, goals, cand_rng, num_candidates=int(num_candidates), include_mean=True,
+    )
+    scores = critic_agent.score_transitive_subgoals(
+        obs, candidates, goals, network_params=critic_agent.network.params,
+    )
+    batch = {
+        'observations': obs,
+        'high_actor_goals': goals,
+        'subgoal_candidates': candidates,
+        'subgoal_scores': scores,
+    }
+    return batch, rng
+
+
+def _run_offline_phase(
+    *,
+    env,
+    run_dir: str,
+    dynamics_ckpt_dir: str,
+    critic_ckpt_dir: str,
+    subgoal_spi_ckpt_dir: str,
+    run_logger: logging.Logger,
+    dynamics_agent: DynamicsAgent,
+    critic_agent: Any,
+    subgoal_spi_agent: SubgoalSpiAgent,
+    dynamics_dataset: PathHGCDataset,
+    critic_dataset,
+    common_valid_starts: np.ndarray,
+    dynamics_config: Any,
+    train_steps: int,
+    log_every_steps: int,
+    save_every_steps: int,
+) -> None:
+    """Action-free offline phase: dynamics (path) + V (value-only) + flow subgoal
+    + SPI-distilled deterministic subgoal net."""
+    batch_size = int(dynamics_config['batch_size'])
+    num_candidates = int(subgoal_spi_agent.config['subgoal_spi_num_samples'])
+    train_logger = CsvLogger(os.path.join(run_dir, 'train.csv'), resume=False, flush_every_n=1)
+    rng = jax.random.PRNGKey(int(FLAGS.seed) + 0x5B60A1)
+    run_logger.info('=== HYBRID OFFLINE PHASE start train_steps=%d num_candidates=%d ===', train_steps, num_candidates)
+    first_time = time.time()
+
+    for step in range(1, int(train_steps) + 1):
+        idxs = _sample_shared_idxs(common_valid_starts, batch_size)
+        dynamics_batch = dynamics_dataset.sample(batch_size, idxs=idxs)
+        critic_batch = critic_dataset.sample(batch_size, idxs=idxs)
+
+        dynamics_agent, dynamics_info = dynamics_agent.update(
+            dynamics_batch,
+            critic_value_params=_extract_critic_value_params(critic_agent),
+        )
+        critic_agent, critic_info = critic_agent.update(critic_batch)
+
+        sg_batch, rng = _build_subgoal_spi_batch(
+            dynamics_agent, critic_agent, dynamics_batch, num_candidates, rng,
+        )
+        subgoal_spi_agent, sg_info = subgoal_spi_agent.update(sg_batch, critic_agent)
+
+        is_final_step = step == int(train_steps)
+        if step % max(1, int(log_every_steps)) == 0 or is_final_step:
+            metrics = {}
+            metrics.update(_to_host_metrics('train/dynamics', dynamics_info))
+            metrics.update(_to_host_metrics('train/critic', critic_info))
+            metrics.update(_to_host_metrics('train/subgoal_spi', sg_info))
+            metrics['train/step'] = float(step)
+            metrics['time/total_sec'] = time.time() - first_time
+            train_logger.log(metrics, step=step)
+            run_logger.info(
+                'offline step=%d dyn=%.5f critic_value=%.5f subgoal_spi=%.5f sg_value=%.4f',
+                step,
+                float(metrics.get('train/dynamics/phase1/loss', float('nan'))),
+                float(metrics.get('train/critic/value/loss', float('nan'))),
+                float(metrics.get('train/subgoal_spi/subgoal_spi/loss', float('nan'))),
+                float(metrics.get('train/subgoal_spi/subgoal_spi/value_mean', float('nan'))),
+            )
+
+        if int(save_every_steps) > 0 and (step % int(save_every_steps) == 0 or is_final_step):
+            save_agent(dynamics_agent, dynamics_ckpt_dir, step)
+            save_agent(critic_agent, critic_ckpt_dir, step)
+            save_agent(subgoal_spi_agent, subgoal_spi_ckpt_dir, step)
+
+    train_logger.close()
+    run_logger.info('=== HYBRID OFFLINE PHASE done run_dir=%s ===', run_dir)
+
+
+class _OnlineReplayBuffer:
+    """Episode-aligned replay buffer that materializes a compact OGBench-style
+    dataset (observations / actions / terminals) for the existing wrappers."""
+
+    def __init__(self, capacity: int):
+        self.capacity = int(capacity)
+        self.episodes: list[dict[str, np.ndarray]] = []
+        self.total_steps = 0
+
+    def add_episode(self, states: np.ndarray, actions: np.ndarray) -> None:
+        states = np.asarray(states, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.float32)
+        # states: [L+1, D], actions: [L, A].  Compact format keeps one row per
+        # stored observation (incl. the terminal state) with a dummy last action.
+        n_trans = int(actions.shape[0])
+        if n_trans < 1:
+            return
+        obs = states[: n_trans + 1]
+        act = np.concatenate([actions, actions[-1:][:, :] * 0.0], axis=0)  # [L+1, A]
+        term = np.zeros((n_trans + 1,), dtype=np.float32)
+        term[-1] = 1.0
+        self.episodes.append({'observations': obs, 'actions': act, 'terminals': term})
+        self.total_steps += int(obs.shape[0])
+        while self.total_steps > self.capacity and len(self.episodes) > 1:
+            dropped = self.episodes.pop(0)
+            self.total_steps -= int(dropped['observations'].shape[0])
+
+    def as_compact_dataset(self) -> dict[str, np.ndarray]:
+        observations = np.concatenate([ep['observations'] for ep in self.episodes], axis=0)
+        actions = np.concatenate([ep['actions'] for ep in self.episodes], axis=0)
+        terminals = np.concatenate([ep['terminals'] for ep in self.episodes], axis=0)
+        return {'observations': observations, 'actions': actions, 'terminals': terminals}
+
+
+def _collect_online_episode(
+    env,
+    *,
+    task_id: int,
+    chunk_fn,
+    low: np.ndarray,
+    high: np.ndarray,
+    max_chunks: int,
+    explore_noise: float,
+    random_actions: bool,
+    rng_np: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Roll out one on-policy (or random) episode and return (states, actions)."""
+    ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=False))
+    if 'goal' not in info:
+        raise RuntimeError(f'Env reset(task_id={task_id}) did not provide info["goal"].')
+    obs = np.asarray(ob, dtype=np.float32).reshape(-1)
+    goal = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+    states = [obs.copy()]
+    actions: list[np.ndarray] = []
+    terminated = False
+    truncated = False
+    action_dim = int(low.shape[0])
+
+    for _ in range(max(1, int(max_chunks))):
+        if terminated or truncated:
+            break
+        if random_actions:
+            chunk = rng_np.uniform(low=low, high=high, size=(1, action_dim)).astype(np.float32)
+        else:
+            chunk = np.asarray(chunk_fn(obs, goal), dtype=np.float32)
+            if explore_noise > 0.0:
+                chunk = chunk + rng_np.normal(0.0, float(explore_noise), size=chunk.shape).astype(np.float32)
+        for action in chunk:
+            if terminated or truncated:
+                break
+            clipped = np.clip(action, low, high).astype(np.float32)
+            ob, _reward, term, trunc, _info = env.step(clipped)
+            obs = np.asarray(ob, dtype=np.float32).reshape(-1)
+            states.append(obs.copy())
+            actions.append(clipped.copy())
+            terminated = bool(term)
+            truncated = bool(trunc)
+
+    return np.stack(states, axis=0), (np.stack(actions, axis=0) if actions else np.zeros((0, action_dim), np.float32))
+
+
+def _run_online_phase(
+    *,
+    env,
+    run_dir: str,
+    dynamics_ckpt_dir: str,
+    critic_ckpt_dir: str,
+    actor_ckpt_dir: str,
+    subgoal_spi_ckpt_dir: str,
+    run_logger: logging.Logger,
+    dynamics_agent: DynamicsAgent,
+    critic_agent: Any,
+    actor_agent: Any,
+    subgoal_spi_agent: SubgoalSpiAgent,
+    dynamics_config: Any,
+    critic_config: Any,
+    actor_config: Any,
+    train_steps: int,
+    log_every_steps: int,
+    save_every_steps: int,
+    eval_every_steps: int,
+    eval_task_ids: tuple[int, ...],
+    eval_episodes_per_task: int,
+    train_subgoal_spi: bool = False,
+) -> None:
+    """Online phase: collect on-policy rollouts into a replay buffer and train the
+    IDM, action critic Q, and SPI actor against frozen offline components.  The
+    deterministic subgoal-spi net is the subgoal policy for both collection and
+    eval.
+
+    When ``train_subgoal_spi`` is set the deterministic subgoal-spi net is also
+    SPI-distilled online from the frozen flow subgoal net + frozen value V.  This
+    is required when starting from plain flow checkpoints that do not ship a
+    subgoal_spi net (see ``--online_train_subgoal_spi``)."""
+    batch_size = int(dynamics_config['batch_size'])
+    subgoal_spi_samples = max(1, int(subgoal_spi_agent.config['subgoal_spi_num_samples']))
+    spi_rng = jax.random.PRNGKey(int(FLAGS.seed) + 13)
+    action_dim = int(critic_config['action_dim'])
+    actor_horizon = int(actor_config['actor_chunk_horizon'])
+    idm_horizon = int(critic_config['action_chunk_horizon'])
+    low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
+    high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
+    collect_policy = str(FLAGS.online_collect_policy).lower()
+    explore_noise = float(FLAGS.online_explore_noise)
+    env_steps_per_update = max(1, int(FLAGS.online_env_steps_per_update))
+    warmup_steps = max(0, int(FLAGS.online_warmup_env_steps))
+    random_steps = max(0, int(FLAGS.online_random_env_steps))
+    rebuild_every = max(1, int(FLAGS.online_rebuild_every_env_steps))
+    max_chunks = int(FLAGS.online_collect_max_chunks)
+    if max_chunks <= 0:
+        try:
+            max_chunks = max(1, _env_max_episode_steps(env) // max(1, idm_horizon))
+        except ValueError:
+            max_chunks = 200
+    rng_np = np.random.default_rng(int(FLAGS.seed) + 7)
+    task_cycle = list(eval_task_ids) if eval_task_ids else [1]
+
+    train_logger = CsvLogger(os.path.join(run_dir, 'train.csv'), resume=False, flush_every_n=1)
+    buffer = _OnlineReplayBuffer(int(FLAGS.online_replay_capacity))
+    total_env_steps = 0
+    episodes_collected = 0
+
+    def _chunk_fn(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        s = jnp.asarray(obs, dtype=jnp.float32)
+        g = jnp.asarray(goal, dtype=jnp.float32)
+        det_sg = np.asarray(jax.device_get(subgoal_spi_agent.infer_subgoal(s, g)), dtype=np.float32).reshape(-1)
+        if collect_policy == 'idm':
+            return _idm_action_chunk(dynamics_agent, np.asarray(obs, np.float32).reshape(-1), det_sg, idm_horizon)
+        chunk = np.asarray(
+            jax.device_get(actor_agent.sample_actions(s, jnp.asarray(det_sg, dtype=jnp.float32))),
+            dtype=np.float32,
+        ).reshape(actor_horizon, -1)
+        return chunk
+
+    def _collect_until(target_total: int) -> None:
+        nonlocal total_env_steps, episodes_collected
+        while total_env_steps < target_total:
+            task_id = task_cycle[episodes_collected % len(task_cycle)]
+            random_actions = total_env_steps < random_steps
+            states, actions = _collect_online_episode(
+                env,
+                task_id=task_id,
+                chunk_fn=_chunk_fn,
+                low=low,
+                high=high,
+                max_chunks=max_chunks,
+                explore_noise=explore_noise,
+                random_actions=random_actions,
+                rng_np=rng_np,
+            )
+            buffer.add_episode(states, actions)
+            total_env_steps += int(actions.shape[0])
+            episodes_collected += 1
+
+    def _build_wrappers():
+        compact = buffer.as_compact_dataset()
+        pdata = PathHGCDataset(Dataset.create(**compact), dynamics_config)
+        cdata = CriticSequenceDataset(Dataset.create(**compact), critic_config)
+        common = _intersect_valid_starts(pdata, cdata)
+        return pdata, cdata, common
+
+    run_logger.info(
+        '=== HYBRID ONLINE PHASE start train_steps=%d warmup=%d random=%d collect_policy=%s max_chunks=%d ===',
+        train_steps, warmup_steps, random_steps, collect_policy, max_chunks,
+    )
+    _collect_until(max(warmup_steps, batch_size * 2))
+    pdataset, cdataset, common_valid_starts = _build_wrappers()
+    last_rebuild_steps = total_env_steps
+    first_time = time.time()
+
+    for step in range(1, int(train_steps) + 1):
+        _collect_until(warmup_steps + step * env_steps_per_update)
+        if total_env_steps - last_rebuild_steps >= rebuild_every:
+            pdataset, cdataset, common_valid_starts = _build_wrappers()
+            last_rebuild_steps = total_env_steps
+
+        idxs = _sample_shared_idxs(common_valid_starts, batch_size)
+        dynamics_batch = pdataset.sample(batch_size, idxs=idxs)
+        critic_batch = cdataset.sample(batch_size, idxs=idxs)
+
+        # IDM (and only IDM when frozen) updates from collected actions.
+        dynamics_agent, dynamics_info = dynamics_agent.update(
+            dynamics_batch,
+            critic_value_params=_extract_critic_value_params(critic_agent),
+        )
+        # Action critic Q (V frozen via zeroed value lambdas) updates from collected actions.
+        critic_agent, critic_info = critic_agent.update(critic_batch)
+
+        # Deterministic subgoal-spi net: SPI-distill it from the frozen flow subgoal
+        # net + frozen value V (no actions used here).
+        subgoal_spi_info = {}
+        if train_subgoal_spi:
+            spi_batch, spi_rng = _build_subgoal_spi_batch(
+                dynamics_agent, critic_agent, dynamics_batch, subgoal_spi_samples, spi_rng,
+            )
+            subgoal_spi_agent, subgoal_spi_info = subgoal_spi_agent.update(spi_batch, critic_agent)
+
+        # SPI actor: condition on the deterministic subgoal, plan + IDM-decode a
+        # single proposal, rescore with the fresh critic, then SPI update.
+        obs = jnp.asarray(dynamics_batch['observations'], dtype=jnp.float32)
+        high_goals = jnp.asarray(dynamics_batch['high_actor_goals'], dtype=jnp.float32)
+        det_subgoal = subgoal_spi_agent.predict_subgoal(obs, high_goals)
+        plan = dynamics_agent.plan(obs, det_subgoal)
+        traj = jnp.asarray(plan['trajectory'], dtype=jnp.float32)
+        proposal = dynamics_agent._idm_actions_from_trajectories(traj, actor_horizon)  # [B, ha, A]
+        proposal_chunks = proposal[:, None, :, :]  # [B, 1, ha, A]
+        proposal_scores = critic_agent.score_action_chunks(
+            obs, det_subgoal, proposal_chunks,
+            network_params=critic_agent.network.params,
+            use_partial_critic=True,
+        )
+        actor_batch = {
+            'observations': obs,
+            'spi_goals': det_subgoal,
+            'proposal_partial_chunks': proposal_chunks,
+            'proposal_scores': proposal_scores,
+            'valids': jnp.ones((obs.shape[0], actor_horizon), dtype=jnp.float32),
+        }
+        actor_agent, actor_info = actor_agent.update(actor_batch, critic_agent)
+
+        is_final_step = step == int(train_steps)
+        if step % max(1, int(log_every_steps)) == 0 or is_final_step:
+            metrics = {}
+            metrics.update(_to_host_metrics('train/dynamics', dynamics_info))
+            metrics.update(_to_host_metrics('train/critic', critic_info))
+            metrics.update(_to_host_metrics('train/actor', actor_info))
+            if subgoal_spi_info:
+                metrics.update(_to_host_metrics('train/subgoal_spi', subgoal_spi_info))
+            metrics['train/step'] = float(step)
+            metrics['online/total_env_steps'] = float(total_env_steps)
+            metrics['online/episodes'] = float(episodes_collected)
+            metrics['online/replay_steps'] = float(buffer.total_steps)
+            metrics['time/total_sec'] = time.time() - first_time
+            train_logger.log(metrics, step=step)
+            run_logger.info(
+                'online step=%d env_steps=%d eps=%d idm=%.5f q=%.5f actor=%.5f',
+                step, total_env_steps, episodes_collected,
+                float(metrics.get('train/dynamics/phase1/loss_idm', float('nan'))),
+                float(metrics.get('train/critic/local_q/loss', float('nan'))),
+                float(metrics.get('train/actor/spi_actor/actor_loss', float('nan'))),
+            )
+
+        if int(eval_every_steps) > 0 and (step % int(eval_every_steps) == 0 or is_final_step):
+            # Primary policy: deterministic subgoal-spi net (the eventual target).
+            spi_metrics = _evaluate_env_tasks(
+                env,
+                dynamics_agent,
+                actor_agent,
+                actor_config,
+                critic_config,
+                critic_agent=critic_agent,
+                task_ids=eval_task_ids,
+                episodes_per_task=max(1, int(eval_episodes_per_task)),
+                wandb_enabled=False,
+                subgoal_agent=subgoal_spi_agent,
+            )
+            run_logger.info(
+                'online EVAL[spi] step=%d actor_success=%.3f idm_success=%.3f',
+                step,
+                float(spi_metrics.get('eval/success_rate_mean', float('nan'))),
+                float(spi_metrics.get('eval_idm/success_rate_mean', float('nan'))),
+            )
+            eval_log = {f'eval_spi/{k}': v for k, v in spi_metrics.items() if isinstance(v, (int, float))}
+
+            # Comparison policy: frozen flow subgoal net with best-of-N value selection.
+            flow_n = int(FLAGS.online_eval_flow_n_samples)
+            if flow_n > 0:
+                flow_dyn = dynamics_agent.replace(
+                    config=dynamics_agent.config.copy(
+                        {'subgoal_eval_selection': 'best_of_n_value', 'subgoal_eval_num_samples': flow_n}
+                    )
+                )
+                flow_metrics = _evaluate_env_tasks(
+                    env,
+                    flow_dyn,
+                    actor_agent,
+                    actor_config,
+                    critic_config,
+                    critic_agent=critic_agent,
+                    task_ids=eval_task_ids,
+                    episodes_per_task=max(1, int(eval_episodes_per_task)),
+                    wandb_enabled=False,
+                    subgoal_agent=None,
+                )
+                run_logger.info(
+                    'online EVAL[flow N=%d] step=%d actor_success=%.3f idm_success=%.3f',
+                    flow_n,
+                    step,
+                    float(flow_metrics.get('eval/success_rate_mean', float('nan'))),
+                    float(flow_metrics.get('eval_idm/success_rate_mean', float('nan'))),
+                )
+                eval_log.update(
+                    {f'eval_flow_n{flow_n}/{k}': v for k, v in flow_metrics.items() if isinstance(v, (int, float))}
+                )
+            train_logger.log(eval_log, step=step)
+
+        if int(save_every_steps) > 0 and (step % int(save_every_steps) == 0 or is_final_step):
+            save_agent(dynamics_agent, dynamics_ckpt_dir, step)
+            save_agent(critic_agent, critic_ckpt_dir, step)
+            save_agent(actor_agent, actor_ckpt_dir, step)
+            save_agent(subgoal_spi_agent, subgoal_spi_ckpt_dir, step)
+
+    train_logger.close()
+    run_logger.info('=== HYBRID ONLINE PHASE done run_dir=%s ===', run_dir)
+
+
 def main(_):
     impl = _impl_dir()
     resume_run_dir = FLAGS.resume_run_dir.strip()
@@ -1240,6 +1795,16 @@ def main(_):
         critic_updates,
         actor_updates,
     )
+    hybrid_phase = str(FLAGS.hybrid_phase).lower()
+    _apply_hybrid_phase_configs(hybrid_phase, dynamics_config, critic_config)
+    # The deterministic subgoal-spi net mirrors the SPI actor's tau/beta knobs so
+    # it can be tuned via the same ``actor:`` YAML block.
+    subgoal_spi_config = get_subgoal_spi_config()
+    subgoal_spi_config['spi_tau'] = float(actor_config.get('spi_tau', subgoal_spi_config['spi_tau']))
+    subgoal_spi_config['spi_beta'] = float(actor_config.get('spi_beta', subgoal_spi_config['spi_beta']))
+    subgoal_spi_config['subgoal_spi_num_samples'] = int(
+        dynamics_config.get('subgoal_eval_num_samples', subgoal_spi_config['subgoal_spi_num_samples'])
+    )
 
     runs_root = FLAGS.runs_root.strip() or os.path.join(impl, 'runs')
     if resume_run_dir:
@@ -1255,9 +1820,12 @@ def main(_):
     dynamics_ckpt_dir = os.path.join(ckpt_root, 'dynamics')
     critic_ckpt_dir = os.path.join(ckpt_root, 'critic')
     actor_ckpt_dir = os.path.join(ckpt_root, 'actor')
+    subgoal_spi_ckpt_dir = os.path.join(ckpt_root, 'subgoal_spi')
     os.makedirs(dynamics_ckpt_dir, exist_ok=True)
     os.makedirs(critic_ckpt_dir, exist_ok=True)
     os.makedirs(actor_ckpt_dir, exist_ok=True)
+    if hybrid_phase in ('offline', 'online'):
+        os.makedirs(subgoal_spi_ckpt_dir, exist_ok=True)
     if os.path.isfile(cfg_path) and not resume_run_dir:
         shutil.copy2(cfg_path, os.path.join(run_dir, 'config_used.yaml'))
 
@@ -1303,17 +1871,16 @@ def main(_):
             critic_config.get('max_goal_steps', None),
         )
 
+    flags_json = dict(
+        flags=get_flag_dict(),
+        dynamics=dynamics_config.to_dict(),
+        critic_agent=critic_config.to_dict(),
+        actor=actor_config.to_dict(),
+    )
+    if hybrid_phase in ('offline', 'online'):
+        flags_json['subgoal_spi'] = subgoal_spi_config.to_dict()
     with open(os.path.join(run_dir, 'flags.json'), 'w', encoding='utf-8') as f:
-        json.dump(
-            dict(
-                flags=get_flag_dict(),
-                dynamics=dynamics_config.to_dict(),
-                critic_agent=critic_config.to_dict(),
-                actor=actor_config.to_dict(),
-            ),
-            f,
-            indent=2,
-        )
+        json.dump(flags_json, f, indent=2)
 
     dynamics_dataset = PathHGCDataset(Dataset.create(**train_plain), dynamics_config)
     critic_dataset = _make_critic_dataset(train_plain, critic_config)
@@ -1341,6 +1908,99 @@ def main(_):
         dynamics_agent = restore_agent(dynamics_agent, dynamics_ckpt_dir, resume_step)
         critic_agent = restore_agent(critic_agent, critic_ckpt_dir, resume_step)
         actor_agent = restore_agent(actor_agent, actor_ckpt_dir, resume_step)
+
+    # ---- State-only-offline + online hybrid phases -------------------------
+    if hybrid_phase in ('offline', 'online'):
+        subgoal_spi_agent = SubgoalSpiAgent.create(
+            FLAGS.seed,
+            ex_dynamics['observations'],
+            subgoal_spi_config,
+            ex_goals=ex_dynamics.get('high_actor_goals'),
+        )
+        hybrid_train_steps = _resolve_total_steps(_steps_per_epoch(len(common_valid_starts), int(dynamics_config['batch_size'])))
+        hybrid_spe = _steps_per_epoch(len(common_valid_starts), int(dynamics_config['batch_size']))
+        hybrid_log_every = _resolve_step_interval(int(FLAGS.log_every_n_steps), int(FLAGS.log_every_n_epochs), hybrid_spe)
+        hybrid_save_every = _resolve_step_interval(int(FLAGS.save_every_n_steps), int(FLAGS.save_every_n_epochs), hybrid_spe)
+        hybrid_eval_every = _resolve_step_interval(
+            int(FLAGS.eval_every_n_steps), int(FLAGS.eval_freq), hybrid_spe, allow_disable=True
+        )
+        hybrid_eval_task_ids = parse_int_list(FLAGS.eval_task_ids)
+
+        if hybrid_phase == 'offline':
+            offline_critic_dataset = CriticSequenceDataset(
+                Dataset.create(**train_plain), critic_config, value_only=True,
+            )
+            _run_offline_phase(
+                env=env,
+                run_dir=run_dir,
+                dynamics_ckpt_dir=dynamics_ckpt_dir,
+                critic_ckpt_dir=critic_ckpt_dir,
+                subgoal_spi_ckpt_dir=subgoal_spi_ckpt_dir,
+                run_logger=run_logger,
+                dynamics_agent=dynamics_agent,
+                critic_agent=critic_agent,
+                subgoal_spi_agent=subgoal_spi_agent,
+                dynamics_dataset=dynamics_dataset,
+                critic_dataset=offline_critic_dataset,
+                common_valid_starts=common_valid_starts,
+                dynamics_config=dynamics_config,
+                train_steps=hybrid_train_steps,
+                log_every_steps=hybrid_log_every,
+                save_every_steps=hybrid_save_every,
+            )
+            return
+
+        # hybrid_phase == 'online': load frozen offline components.
+        offline_run_dir = FLAGS.offline_run_dir.strip()
+        if not offline_run_dir or not os.path.isdir(offline_run_dir):
+            raise FileNotFoundError(
+                f'hybrid_phase=online requires --offline_run_dir to point at a completed offline run, '
+                f'got {offline_run_dir!r}.'
+            )
+        offline_step = _resolve_offline_ckpt_step(offline_run_dir, int(FLAGS.offline_load_step))
+        off_ckpt = os.path.join(offline_run_dir, 'checkpoints')
+        run_logger.info('online: loading offline checkpoints step=%d from %s', offline_step, offline_run_dir)
+        dynamics_agent = restore_agent(dynamics_agent, os.path.join(off_ckpt, 'dynamics'), offline_step)
+        critic_agent = restore_agent(critic_agent, os.path.join(off_ckpt, 'critic'), offline_step)
+        # The deterministic subgoal-spi net is optional in the source checkpoint:
+        #   - present (full offline phase) -> load it,
+        #   - absent (plain flow checkpoints) -> keep the fresh net and distill it
+        #     online (requires --online_train_subgoal_spi).
+        subgoal_spi_ckpt = os.path.join(off_ckpt, 'subgoal_spi', f'params_{offline_step}.pkl')
+        if os.path.isfile(subgoal_spi_ckpt):
+            subgoal_spi_agent = restore_agent(subgoal_spi_agent, os.path.join(off_ckpt, 'subgoal_spi'), offline_step)
+            run_logger.info('online: loaded subgoal_spi checkpoint.')
+        elif not bool(FLAGS.online_train_subgoal_spi):
+            raise FileNotFoundError(
+                f'No subgoal_spi checkpoint at {subgoal_spi_ckpt} and --online_train_subgoal_spi=False. '
+                'Either point --offline_run_dir at a full offline run or enable online_train_subgoal_spi.'
+            )
+        else:
+            run_logger.info('online: no subgoal_spi checkpoint found; distilling it online from frozen flow + V.')
+        _run_online_phase(
+            env=env,
+            run_dir=run_dir,
+            dynamics_ckpt_dir=dynamics_ckpt_dir,
+            critic_ckpt_dir=critic_ckpt_dir,
+            actor_ckpt_dir=actor_ckpt_dir,
+            subgoal_spi_ckpt_dir=subgoal_spi_ckpt_dir,
+            run_logger=run_logger,
+            dynamics_agent=dynamics_agent,
+            critic_agent=critic_agent,
+            actor_agent=actor_agent,
+            subgoal_spi_agent=subgoal_spi_agent,
+            dynamics_config=dynamics_config,
+            critic_config=critic_config,
+            actor_config=actor_config,
+            train_steps=hybrid_train_steps,
+            log_every_steps=hybrid_log_every,
+            save_every_steps=hybrid_save_every,
+            eval_every_steps=hybrid_eval_every,
+            eval_task_ids=hybrid_eval_task_ids,
+            eval_episodes_per_task=max(1, int(FLAGS.eval_episodes_per_task)),
+            train_subgoal_spi=bool(FLAGS.online_train_subgoal_spi),
+        )
+        return
 
     batch_size = int(dynamics_config['batch_size'])
     spe = _steps_per_epoch(len(common_valid_starts), batch_size)
