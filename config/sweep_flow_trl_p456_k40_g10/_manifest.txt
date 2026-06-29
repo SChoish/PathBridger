@@ -1,0 +1,5 @@
+# 2 configs: puzzle-4x5 + puzzle-4x6, K=40, gap10/wmax5/N1, 600k gradient steps.
+# eval_every_n_steps=0 means no intermediate eval; final N sweep still runs at the last step.
+# Eval budget is env max episode length.
+config/sweep_flow_trl_p456_k40_g10/p45_k40_g10_w5_n1.yaml
+config/sweep_flow_trl_p456_k40_g10/p46_k40_g10_w5_n1.yaml

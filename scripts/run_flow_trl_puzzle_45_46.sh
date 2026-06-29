@@ -1,14 +1,5 @@
 #!/usr/bin/env bash
-# Sequential Flow subgoal + TRL sweep.
-#
-# Trains with subgoal_num_samples=1 and wmax=5, sweeping gap={1,3,5,10}.
-# Final epoch (600) runs in-training N sweep via final_eval_subgoal_eval_num_samples.
-# Post-train eval_checkpoint.py remains as fallback for incomplete eval_results/.
-#
-# Env:
-#   GPU_ID, PYTHON_BIN, SEED (default 0)
-#   EVAL_ONLY=1  skip training; eval completed runs only (needs epoch checkpoint)
-#   FINAL_EPOCH  checkpoint + eval epoch (default 600)
+# Flow+TRL sweep: puzzle-4x5 and puzzle-4x6, gap={1,3,5,10}, vdist_pow=0.
 
 set -euo pipefail
 
@@ -21,13 +12,13 @@ export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 GPU_ID="${GPU_ID:-0}"
 SEED="${SEED:-0}"
 EVAL_ONLY="${EVAL_ONLY:-0}"
-PYTHON_BIN="${PYTHON_BIN:-/home/choi/miniconda3/envs/offrl/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/svcho/anaconda3/bin/python}"
 WITH_CUDA="${ROOT}/scripts/with_jax_cuda.sh"
 LOG_DIR="${ROOT}/nohup_logs"
 RUNS_ROOT="${ROOT}/runs"
-CONFIG_DIR="${ROOT}/config/sweep_flow_trl_finaleval"
-WRITER="${ROOT}/scripts/write_flow_trl_sweep_yaml.py"
-LOG_TAG="flow_trl_feval"
+CONFIG_DIR="${ROOT}/config/sweep_flow_trl_puzzle_45_46"
+WRITER="${ROOT}/scripts/write_flow_trl_puzzle_45_46_yaml.py"
+LOG_TAG="flow_trl_p456"
 FINAL_EPOCH="${FINAL_EPOCH:-600}"
 
 mkdir -p "${LOG_DIR}"
@@ -178,9 +169,9 @@ for cfg in "${configs[@]}"; do
 
   if [[ -z "${run_dir}" ]]; then
     if [[ "${EVAL_ONLY}" == "1" ]]; then
-      echo "[$(date -Is)] SKIP_EVAL_NO_RUNDIR ${base} (no epoch=${FINAL_EPOCH} checkpoint)" | tee -a "${MASTER_LOG}"
+      echo "[$(date -Is)] SKIP_EVAL_NO_RUNDIR ${base}" | tee -a "${MASTER_LOG}"
     else
-      echo "[$(date -Is)] TRAIN_DONE_NO_RUNDIR ${base}; skipping final eval" | tee -a "${MASTER_LOG}"
+      echo "[$(date -Is)] TRAIN_DONE_NO_RUNDIR ${base}" | tee -a "${MASTER_LOG}"
     fi
     continue
   fi
@@ -196,5 +187,4 @@ done
 
 echo "[$(date -Is)] SUMMARIZE feval results" | tee -a "${MASTER_LOG}"
 "${PYTHON_BIN}" "${ROOT}/scripts/summarize_feval_results.py" | tee -a "${MASTER_LOG}"
-
-echo "[$(date -Is)] ${LOG_TAG} sweep complete mode=${mode_label} (${#configs[@]} configs)" | tee -a "${MASTER_LOG}"
+echo "[$(date -Is)] ${LOG_TAG} sweep complete (${#configs[@]} configs)" | tee -a "${MASTER_LOG}"

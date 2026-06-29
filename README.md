@@ -1,234 +1,93 @@
 # PathBridger Experiment Guide
 
-OGBench 기반 오프라인 goal-conditioned control 실험 코드입니다. 현재 메인 경로는 **Flow subgoal + forward bridge residual dynamics + TRL critic + SPI actor**입니다.
+OGBench 기반 offline long-horizon goal-conditioned control 실험 코드입니다. 현재 코드스페이스의 주 경로는 **Flow subgoal + forward-bridge residual dynamics + TRL critic + SPI actor**입니다.
 
-- Dynamics는 `forward_bridge_residual` planner를 중심으로, closed-form forward bridge mean 위에 endpoint-preserving `PathResidualNet` residual을 얹습니다. Flow subgoal은 `subgoal_distribution: flow`, `subgoal_eval_selection: best_of_n_value`로 eval-time BoN을 지원합니다.
-- Critic은 현재 sweep에서 `critic_type: trl`을 사용합니다. `CriticSequenceDataset`이 same-trajectory value/TRL targets를 만들고, policy/value goal sampling ratio는 환경별 config preset으로 관리합니다.
-- `docs/`에는 현재 설명 문서와 `_choi` suffix 핵심 결과만 둡니다. run/douri 전체 요약처럼 보조적인 로컬 리포트는 `local_reports/`로 생성합니다.
+자세한 구현 설명은 `docs/project_implementation_overview.md`, script 운영 정리는 `scripts/README.md`를 참고하세요.
 
-[^goub]: Generalized Ornstein-Uhlenbeck Bridge.
-[^dqc]: Decoupled Q Chunking.
+## 현재 메인 경로
 
-## 프로젝트 구조
+학습 루프는 다음 구성요소를 함께 업데이트합니다.
 
-작업 디렉터리는 항상 저장소 루트(`PathBridger`)이며, 실행 전 `PYTHONPATH=.`을 설정합니다.
+1. `DynamicsAgent`가 현재 상태와 final goal에서 flow subgoal endpoint를 샘플링합니다.
+2. `forward_bridge_residual` planner가 현재 상태에서 subgoal까지의 state trajectory를 만듭니다.
+3. IDM이 trajectory prefix를 action chunk proposal로 변환합니다.
+4. TRL critic이 action chunk와 transitive value target을 학습합니다.
+5. Actor는 critic-ranked proposal을 따라가도록 SPI objective로 업데이트됩니다.
 
-| 경로 | 역할 |
-|------|------|
-| `main.py` | 학습 엔트리포인트 (dynamics + critic + actor 동시 학습) |
-| `agents/dynamics.py` | linear-SDE dynamics agent (`forward_bridge_residual`, subgoal/IDM/path 손실, planner API) |
-| `utils/dynamics.py` | bridge 스케줄, sampling, posterior/model mean, exact-residual 헬퍼 |
-| `utils/theta_schedules.py` | linear-SDE θ 스케줄 (`linear_beta`, `prefix_progress`) |
-| `agents/critic.py` | DQC/IQL/direct chunk TRL critic |
-| `agents/actor.py` | SPI actor |
-| `eval_checkpoint.py` | 체크포인트에서 환경 평가만 재실행 |
-| `rollout/run.py` | checkpoint rollout 통합 엔트리포인트 (`subgoal`/`idm`/`actor`, maze/manip 자동 분기) |
-| `rollout/episode_runner.py` | main eval과 rollout 스크립트가 공유하는 chunked episode loop |
-| `rollout/env.py`, `rollout/plot.py`, `rollout/common.py` | 환경 state sync, 렌더/plot, env-family 공통 헬퍼 |
-| `tests/` | 핵심 수치/분기 회귀 테스트 (`test_*.py`) |
-| `config/` | 실험 YAML |
-| `scripts/` | sweep / eval summary / heatmap 스크립트 |
-
-## JAX · GPU (CUDA 12)
-
-GPU 학습은 **CUDA용 JAX**와 **pip로 깔린 `nvidia-*-cu12` 공유 라이브러리 경로**가 잡혀 있어야 합니다.
-
-1. 환경에서 설치: `pip install -U "jax[cuda12]"` (`requirements.txt`의 `jax[cuda12]`와 동일 계열).
-2. `import jax` 전에 `site-packages/nvidia/*/lib`들이 `LD_LIBRARY_PATH` 앞쪽에 있어야 합니다. 그렇지 않으면 `cuSPARSE`를 못 찾거나 CPU로 폴백할 수 있습니다.
-3. **conda 예시** (`offrl` 등): `$CONDA_PREFIX/etc/conda/activate.d/jax_cuda_ld.sh`에서 위 경로를 붙이고, `deactivate.d/jax_cuda_ld.sh`에서 복원합니다. 스크립트는 **`chmod +x`** 해 두는 것이 안전합니다.
-4. 확인: `conda activate <env>` 후 `python -c "import jax; print(jax.default_backend(), jax.devices())"` → `gpu` / `CudaDevice`가 나와야 합니다.
-
-## 설정
-
-YAML은 agent default 위에 필요한 override만 적습니다. 기본값은 다음에서 옵니다.
-
-- `agents/dynamics.get_dynamics_config()`
-- `agents/critic.get_config()`
-- `agents/actor.get_actor_config()`
-
-### Top-level 옵션 (run/eval 공통)
-
-| 키 | 기본 | 설명 |
-|----|------|------|
-| `env_name`, `seed`, `train_epochs` | — | OGBench 환경, 시드, 학습 epoch 수 |
-| `batch_size` | `1024` | 학습 배치 크기 |
-| `horizon` | `25` | dataset segment 길이 (`dynamics_N` / `subgoal_steps`와 정합) |
-| `plan_candidates` | `1` | subgoal endpoint당 bridge/action 후보 수 `N`. SPI 전에 critic best-of-N으로 endpoint별 1개만 남김 |
-| `plan_noise_scale` | `1.0` | plan sampling 시 추가 노이즈 scale. 실제 sampling 여부는 planner/config의 후보 생성 경로에 따름 |
-| `eval_freq` | `100` | env 평가 주기(epoch) |
-| `eval_task_ids` | `"1,2,3,4,5"` | OGBench task id 목록 |
-| `eval_episodes_per_task` | `10` | task 당 epoch 평가 episode 수 |
-| `final_eval_episodes_per_task` | `50` | `>0`이면 **마지막 epoch**에서만 episode 수를 이 값으로 override |
-| `eval_max_chunks` | `200` | episode 당 최대 action chunk 수 |
-| `async_prefetch` | `true` | host-side 배치 샘플링을 GPU 학습과 오버랩 |
-
-### `dynamics:` 핵심 옵션
-
-YAML의 `dynamics:` 키 아래에 둡니다. 모든 옵션은 `get_dynamics_config()`에 default가 잡혀 있어 명시 안 해도 됩니다.
+현재 sweep의 핵심 config는 보통 다음 값을 가집니다.
 
 ```yaml
 dynamics:
-  # 모든 dynamics 키는 default가 잡혀 있어 yaml에 적지 않으면
-  # agents/dynamics.get_dynamics_config()의 값이 쓰입니다.
-  # 예시: 새 default와 다른 값만 명시.
-  bridge_gamma_inv: 1.0e-6      # default 0.0 (hard endpoint bridge)
-  subgoal_distribution: diag_gaussian   # default deterministic
-```
+  subgoal_distribution: flow
+  subgoal_stochastic_loss: mse
+  planner_type: forward_bridge_residual
+  subgoal_eval_selection: best_of_n_value
 
-#### Bridge / 스케줄
-
-| 키 | 기본 | 설명 |
-|----|------|------|
-| `dynamics_N` | `25` | linear-SDE 단계 수 (= subgoal까지의 forward step 수) |
-| `dynamics_beta_min`, `dynamics_beta_max` | `0.1`, `20.0` | `linear_beta` 스케줄의 β 범위 |
-| `dynamics_lambda` | `1.0` | OU stationary scale λ |
-| `bridge_gamma_inv` | `0.0` | bridge denominator offset. `0.0`이면 hard endpoint bridge |
-| `theta_schedule` | `prefix_progress` | `prefix_progress` 또는 `linear_beta` (아래 §Prefix-progress 스케줄 참조) |
-| `theta_total` | `1.0` | `prefix_progress` 모드의 누적 rate $\Theta_K$ |
-| `progress_alpha` | `0.8` | `prefix_progress` 모드의 진행 곡률, $c_i = (i/K)^\alpha$ |
-| `use_time_embedding` | `true` | `PathResidualNet` 시간 조건. `true`면 sinusoidal embedding, `false`면 raw scalar `i/K`를 그대로 concat |
-| `state_normalization` | `false` | dynamics 내부 state normalization 활성화. 외부 API는 항상 env-scale absolute state를 소비/반환 |
-| `path_loss_normalized` | `true` | path-supervised loss를 planner-normalized frame에서 계산. raw/norm diagnostics를 모두 로깅 |
-
-`state_normalization: true`일 때 `state_mean`, `state_std`는 full train dataset에서 계산되어야 합니다. `main.py`는 학습 dataset 로딩 직후 이를 자동으로 채워 넣고, `DynamicsAgent.create()`는 missing stats를 허용하지 않습니다. Absolute state는 `(x - mean) / std`, delta/displacement는 `d / std`를 사용하며, `plan()`, `sample_plan()`, `predict_subgoal()`, `infer_subgoal_distribution()`, `sample_subgoal_candidates()`, `build_actor_proposals()`는 모두 env-scale absolute state contract를 유지합니다.
-
-#### Subgoal 손실
-
-| 키 | 기본 | 설명 |
-|----|------|------|
-| `subgoal_distribution` | `deterministic` | 기본은 point subgoal. 분포 학습 ablation에서는 `diag_gaussian`으로 `(mu, log_std)`를 예측 |
-| `subgoal_stochastic_loss` | `mse` | `diag_gaussian` 학습 loss. `mse`는 PDF Eq. (51)에 가까운 reparameterized sample-MSE, `nll`은 일부 실험에서 의도적으로 쓰는 value-gap-weighted Gaussian NLL |
-| `subgoal_target_mode` | `absolute` | `absolute`: raw subgoal output/teacher가 $s_{t+K}$. `displacement`: raw output/teacher가 $\Delta=s_{t+K}-s_t$이고 bridge는 local frame에서 학습/계획 |
-| `subgoal_loss_weight` | `1.0` | subgoal regression/value loss 가중치 |
-| `subgoal_value_alpha` | `0.5` | subgoal loss의 critic value bonus 계수. DQC/IQL에서는 `alpha * V(\hat s_{t+K}, g)`. `direct_chunk_trl`에서는 `alpha * V(s_t, \hat s_{t+K}) * V(\hat s_{t+K}, g)`. `0`이면 비활성화 |
-| `subgoal_value_style` | `exponential` | subgoal regression/NLL value-gap weight 방식. `exponential`은 $\exp(c\Delta V)$, `expectile`은 $\Delta V>0$이면 `subgoal_value_expectile`, 아니면 `1-subgoal_value_expectile` |
-| `subgoal_value_expectile` | `0.7` | `subgoal_value_style=expectile`일 때 양의 value gap에 주는 weight |
-| `subgoal_value_gap_scale` | `1.0` | $\Delta V=V(s_{t+K}^{D}, g)-V(s_t, g)$에 곱하는 scale $c$ |
-| `subgoal_num_samples` | `1` | `diag_gaussian` planning에서 뽑을 subgoal endpoint 수 `U` |
-| `subgoal_log_std_min`, `subgoal_log_std_max` | `-5.0`, `1.0` | `diag_gaussian`의 log-std clamp 범위 |
-| `subgoal_temperature` | `1.0` | `diag_gaussian` subgoal sampling std multiplier |
-| `subgoal_steps` | `25` | subgoal 추정에 사용할 future horizon |
-| `clip_path_to_goal` | `true` | 가까운 goal에서 endpoint를 실제 goal로 clip/pad해 "도착 후 머물기"를 학습 |
-
-#### Displacement target mode
-
-`subgoal_target_mode: displacement`는 `docs/linear_displacement.pdf`의 translated displacement chart와 맞춘 모드입니다. 내부적으로는 현재 상태를 원점으로 빼서 `z0=0`, `zK=s_{t+K}-s_t`인 bridge/residual chain을 학습하고, subgoal net도 raw `Delta`를 예측합니다. 하지만 public API(`predict_subgoal`, `infer_subgoal_distribution`, `sample_subgoal_candidates`, `plan`, actor proposal 생성)는 항상 absolute state endpoint를 반환/소비합니다. 즉 downstream IDM/critic/actor는 기존처럼 absolute state를 보고, displacement frame은 dynamics 내부 표현으로만 쓰입니다.
-
-Stochastic subgoal의 경우 PDF는 sample-MSE 형태로 쓰여 있지만, 이 저장소는 실험 편의를 위해 `subgoal_stochastic_loss: nll`도 제공합니다. 이 차이는 의도된 구현 차이이며, NLL 모드에서도 value bonus는 reconstructed absolute sample `s_t + Delta`에 대해 계산합니다.
-
-#### Planner / model 모드
-
-| 키 | 기본 | 설명 |
-|----|------|------|
-| `planner_type` | `forward_bridge_residual` | closed-form forward bridge mean + endpoint-preserving 학습 residual `PathResidualNet` |
-| `forward_bridge_mode` | `mean` | `forward_bridge*` 모드의 inference (`mean` / `sample`) |
-| `forward_bridge_use_path_loss` | `true` | path-step 손실 활성화 |
-| `forward_bridge_path_loss_horizon` | `0` | `>0`이면 prefix path loss만 평가해 update 비용을 줄임 |
-| `dynamics_model_type` | `exact_residual` | 현재는 `forward_bridge_residual` 경로의 compatibility key |
-
-#### Prefix-progress θ 스케줄 (default)
-
-`linear_beta` 스케줄은 K=25 bridge의 초기 prefix를 매우 천천히 움직이지만, actor / IDM / SPI 재평가는 보통 첫 `rollout_horizon=5` proposal state만 소비하므로 짧은 prefix가 subgoal 변위의 의미 있는 비율을 차지하도록 보정할 필요가 있습니다. 그래서 default는 `prefix_progress`입니다.
-
-`theta_schedule: prefix_progress`는 desired progress curve $c_i = (i/K)^\alpha$를 두고
-
-$$\Theta_i = \mathrm{asinh}(c_i\, \sinh\Theta_K), \quad \theta_i = \Theta_{i+1} - \Theta_i$$
-
-로 역산해 hard bridge marginal interpolation $\beta_i = \sinh(\Theta_i)/\sinh(\Theta_K)$가 정확히 $c_i$가 되게 합니다. 예: `K=25, alpha=0.8`이면 $c_5 \approx 0.276$ (5스텝이면 약 28% 진행).
-
-- `prefix_progress`로 학습한 run은 `dynamics/theta_schedule_id`, `dynamics/prefix_progress_target_5`, `dynamics/prefix_progress_actual_5` 등 진단 로그가 찍힙니다.
-- diffusion-style 비교 ablation을 돌릴 때만 `theta_schedule: linear_beta`를 yaml에 명시합니다.
-
-### `critic_agent:` / `actor:` override
-
-Critic 옵션은 **환경별로 yaml에서 명시**합니다 (action_chunk_horizon, discount, kappa_b, kappa_d). actor는 default가 권장 baseline이라 보통 `spi_beta`만 명시합니다.
-
-```yaml
 critic_agent:
-  action_chunk_horizon: 5    # default 10. 모든 환경에서 5
-  discount: 0.995            # default 0.99 (long-horizon 환경)
-  kappa_b: 0.93              # default 0.7 (manip cube 계열)
-  kappa_d: 0.8               # default 0.7
-
-actor:
-  spi_beta: 1.0              # default 10.0
-  # spi_tau: 10.0 (default), spi_actor_layer_norm: true (default)
-```
-
-#### Critic modes
-
-| `critic_type` | 설명 |
-|---------------|------|
-| `dqc` | 기본값. full chunk critic + action chunk critic + value를 함께 학습 |
-| `iql` | DQC chunk critic 없이 action chunk critic + value만 사용 |
-| `direct_chunk_trl` / `chunk_trl` / `trl` | direct chunk-level Transitive RL. primary head는 `Q_H(s, A_H, g)`이며, `V(s,g)`는 in-sample expectile readout |
-
-Direct chunk TRL semantics (current implementation):
-
-- `Q_H(s, A_H, g)` is learned directly on `action_critic`.
-- `V(s, g)` is an expectile readout of target `Q_H`, not an independent Bellman TD value.
-- Default transitive target is `Q_H(s_i, A_i, s_k) * Q_H(s_k, A_k, s_j)` (`use_v_in_q_target=false`).
-- Valid split `k` must be after the committed chunk: `k >= i + H`, `k < j`, `k + H <= T`.
-- `use_v_in_q_target` exists only as an ablation and defaults to `false`.
-- Distance/offset reweighting (`trl_distance_reweight`) is enabled by default for `direct_chunk_trl`.
-
-Example config: `config/antmaze_large_direct_chunk_trl.yaml`.
-
-```yaml
-critic_agent:
-  critic_type: direct_chunk_trl
-  algorithm: direct_chunk_trl
+  algorithm: trl
+  critic_type: trl
   use_chunk_critic: false
-  tau_q: 0.7
-  tau_v: 0.9
-  lambda_q_base: 1.0
-  lambda_q_tri: 1.0
-  lambda_v: 1.0
-  use_v_in_q_target: false   # ablation only
-  trl_distance_reweight: true
-  target_tau: 0.005
-  q_value_eps: 1.0e-6
+  q_target_from_value: true
 ```
 
-Sampler는 같은 trajectory에서만 `i, j, k`를 뽑습니다. valid split이 없으면 `trl_valid_mask=0`으로 tri-Q loss에서 제외합니다.
+## 프로젝트 구조
 
-## 학습 실행
+| 경로 | 역할 |
+|------|------|
+| `main.py` | 학습 entry point. dynamics, critic, actor 동시 학습 |
+| `agents/dynamics.py` | flow/gaussian/deterministic subgoal, bridge planner, IDM, proposal builder |
+| `agents/critic.py` | DQC/IQL legacy path와 TRL critic |
+| `agents/actor.py` | SPI-style action chunk actor |
+| `utils/critic_sequence_dataset.py` | TRL critic batch와 transitive value fields 생성 |
+| `utils/dynamics.py` | bridge schedule, posterior/model mean, residual helper |
+| `utils/theta_schedules.py` | `linear_beta`, `prefix_progress` schedule |
+| `eval_checkpoint.py` | checkpoint에서 eval만 재실행 |
+| `rollout/` | checkpoint rollout/시각화 도구 |
+| `config/` | 실험 YAML |
+| `scripts/` | YAML 생성, sweep 실행, eval summary 도구 |
+| `docs/` | 구현 설명과 분석 산출물 |
+
+## 환경 설정
+
+저장소 루트에서 실행합니다.
 
 ```bash
-cd /path/to/PathBridger
+cd /home/svcho/Pathbridger_flow
 export PYTHONPATH=.
-python main.py --run_config=config/antmaze_medium_navigate.yaml
+export MUJOCO_GL=egl
+```
+
+GPU 학습은 CUDA용 JAX가 필요합니다. `scripts/with_jax_cuda.sh`는 pip/conda 환경의 CUDA shared library path를 잡은 뒤 명령을 실행하는 wrapper입니다.
+
+확인:
+
+```bash
+python - <<'PY'
+import jax
+print(jax.default_backend())
+print(jax.devices())
+PY
+```
+
+## 기본 학습
+
+```bash
+PYTHONPATH=. MUJOCO_GL=egl python main.py \
+  --run_config config/sweep_flow_trl_finaleval/p4_g5_w5_n1.yaml \
+  --seed 0 \
+  --async_prefetch
 ```
 
 Resume:
 
 ```bash
-python main.py \
-  --run_config=config/antmaze_medium_navigate.yaml \
-  --resume_run_dir=runs/<run_dir> \
-  --resume_epoch=200
+PYTHONPATH=. MUJOCO_GL=egl python main.py \
+  --run_config config/sweep_flow_trl_finaleval/p4_g5_w5_n1.yaml \
+  --resume_run_dir runs/<run_dir> \
+  --resume_epoch 200
 ```
 
-Resume 로그는 `run_resume_from<E>_<timestamp>.log`로 따로 저장됩니다. `flags.json`이 있으면 hyperparameter는 자동으로 그 스냅샷에서 불러옵니다. Resume 시 새 config로 override하면 epoch별 평가 episode 수 같은 값을 갈아끼울 수 있습니다 (예: `eval_episodes_per_task=10`, `final_eval_episodes_per_task=50`).
-
-## 현재 Config 레이아웃
-
-`config/`에는 baseline YAML과 Flow+TRL sweep용 생성 config가 함께 있습니다. 현재 유지하는 generator는 Flow+TRL 실험군 중심입니다.
-
-| Config | 환경/용도 | 비고 |
-|--------|-----------|------|
-| `antmaze_medium_navigate.yaml` | `antmaze-medium-navigate-v0` baseline | 기본 학습 config |
-| `antmaze_medium_navigate_table_*.yaml` | medium goal-rep × target-mode table | full/phi × abs/disp |
-| `antmaze_large_trl_gap10_wmax5_alpha0_n1_600ep.yaml` | large TRL reference | hand-written TRL 템플릿 |
-| `grid_targetmode/*.yaml` | residual × subgoal target-mode grid | 고정 YAML (재생성 스크립트 없음) |
-| `sweep_flow_trl_gap_tune/*.yaml` | Flow+TRL gap tune | `generate_flow_trl_gap_tune_configs.py` |
-| `sweep_flow_trl_antmaze_dw/*.yaml` | antmaze distance-weight sweep | `generate_flow_trl_antmaze_dw_sweep_configs.py` |
-| `sweep_flow_trl_humanoidmaze_dw/*.yaml` | humanoidmaze distance-weight sweep | `generate_flow_trl_humanoidmaze_dw_sweep_configs.py` |
-| `flow_k_sweep/*.yaml` | K/horizon follow-up sweep | `generate_flow_k_sweep_configs.py` |
-| `flow_h25_ha10/*.yaml` | h=25, action horizon=10 follow-up | `generate_flow_h25_ha10_configs.py` |
-| `flow_gap10_w5_n1_cube/*.yaml` | cube gap10/w5/N1 follow-up | `generate_flow_gap10_n1_cube_configs.py` |
-
-## Run Directory
+Run directory:
 
 ```text
 runs/<YYYYMMDD_HHMMSS>_seed<seed>_<env_name>/
@@ -241,116 +100,253 @@ runs/<YYYYMMDD_HHMMSS>_seed<seed>_<env_name>/
     dynamics/params_<epoch>.pkl
     critic/params_<epoch>.pkl
     actor/params_<epoch>.pkl
+  eval_results/
+    epoch600_n<N>.json
+    epoch600_t0p5_n<N>.json
 ```
 
-> 과거 학습된 디렉토리들은 `..._joint_dqc_seed<seed>_<env_name>/` prefix를 그대로 사용합니다 (data 호환). eval / heatmap glob은 두 prefix를 모두 매치합니다.
+## Config 핵심 옵션
 
-## 학습 구성
+Top-level:
 
-Dynamics agent는 다음 손실을 함께 학습합니다.
+| 키 | 기본/관례 | 설명 |
+|----|-----------|------|
+| `env_name` | required | OGBench env |
+| `run_group` | required | sweep/run 식별자 |
+| `train_epochs` | `600` | 학습 epoch |
+| `batch_size` | `1024` | shared batch size |
+| `horizon` | `25` 또는 `40` | `dynamics_N`, `subgoal_steps`, critic `full_chunk_horizon`에 동기화 |
+| `plan_candidates` | `1` | bridge/action proposal candidate 수 |
+| `eval_freq` | `100` | in-training eval 주기 |
+| `eval_task_ids` | `1,2,3,4,5` | OGBench eval task ids |
+| `eval_episodes_per_task` | `10` | 일반 eval episode 수 |
+| `final_eval_episodes_per_task` | `25` | final epoch eval episode 수 |
+| `final_eval_subgoal_eval_num_samples` | `1,2,4,8,16` | final epoch N sweep |
 
-- `phase1/loss_dynamics`: reverse mean matching (또는 `forward_bridge*` 모드의 forward bridge mean matching)
-- `phase1/loss_path_step`: dataset segment와 step-aligned path loss
-- `phase1/loss_roll`: short rollout consistency
-- `phase1/loss_subgoal`: deterministic은 target-value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 `subgoal_stochastic_loss=mse`이면 reparameterized sample에 대해 `stopgrad(w(Delta V)) * MSE(sample, target) - alpha * bonus`를 쓰고, `subgoal_stochastic_loss=nll`이면 `stopgrad(w(Delta V)) * NLL(target | mu, log_std) - alpha * bonus`를 씁니다. 기본 bonus는 `V(sample_abs, g)`이며, `direct_chunk_trl`일 때는 `V(s, sample_abs) * V(sample_abs, g)`입니다. `nll`은 PDF의 stochastic subgoal 식과 다른 의도적 구현 옵션입니다. `subgoal_value_style=exponential`이면 `w(Delta V)=exp(c * (V(target_abs, g) - V(s, g)))`, `expectile`이면 gap이 양수일 때 `subgoal_value_expectile`, 그 외에는 `1-subgoal_value_expectile`
-- `phase1/loss_idm`: embedded inverse dynamics MSE
+Flow subgoal:
 
-Critic + SPI actor:
+| 키 | 설명 |
+|----|------|
+| `subgoal_flow_steps` | flow endpoint Euler step 수. 현재 sweep은 8 |
+| `subgoal_flow_t_min` | flow time lower bound |
+| `subgoal_flow_noise_scale` | flow sampling noise scale |
+| `subgoal_temperature` | eval-time subgoal sampling temperature |
+| `subgoal_eval_num_samples` | eval-time best-of-N 후보 수 |
+| `subgoal_eval_selection` | 현재 주 경로는 `best_of_n_value` |
+| `subgoal_value_gap_scale` | value-gap weighting scale |
+| `subgoal_value_weight_max` | flow matching weight cap |
 
-- Critic은 후보 action chunk를 평가합니다. DQC는 full chunk/action heads를 함께 쓰고, direct chunk TRL은 action chunk goal-conditioned critic `Q_H(s,A_H,g)`를 직접 학습합니다.
-- SPI actor는 critic score로 만든 soft target distribution에 대해 W2-style proximal loss를 씁니다.
-- `spi_tau`가 작을수록 후보 chunk 쪽으로 더 강하게 당깁니다.
-- Actor와 critic SPI 경로는 항상 dynamics가 예측한 subgoal(`spi_goals`)에 condition됩니다.
+Subgoal SPI:
 
-주요 dynamics 로그:
+`subgoal_spi_enabled: true`는 기존 flow/gaussian subgoal을 대체하지 않습니다. 기존 `subgoal_net`은 그대로 proposal/teacher 역할을 하고, 별도의 deterministic `subgoal_spi_net`을 추가로 학습합니다.
 
-- `dynamics/bridge_gamma_inv`, `dynamics/gamma_inv`, `dynamics/subgoal_target_mode` (`0=absolute`, `1=displacement`)
-- `dynamics/theta_schedule_id`, `dynamics/theta_total`, `dynamics/progress_alpha`
-- `dynamics/use_time_embedding`, `dynamics/state_normalization`, `dynamics/path_loss_normalized`
-- `dynamics/prefix_progress_actual_5`, `dynamics/prefix_progress_target_5` (target은 `prefix_progress` 모드에서만)
-- `phase1/mu_true_norm`, `phase1/mu_pred_norm`, `phase1/bridge_step_mean`
+권장 config:
 
-## 평가
+```yaml
+dynamics:
+  subgoal_distribution: flow        # proposal/teacher subgoal net
+  subgoal_spi_enabled: true         # add deterministic subgoal_spi_net
+  subgoal_spi_num_samples: 16       # proposal candidates for SPI update
+  subgoal_spi_beta: 1.0             # Boltzmann weight temperature inverse
+  subgoal_spi_tau: 5.0              # proximal strength denominator
+  subgoal_spi_energy_norm_eps: 1.0e-6
+```
+
+학습 objective는 flow `subgoal_net`에서 N개 후보 `z_i`를 샘플링하고, critic product energy로 Boltzmann target을 만듭니다.
+
+```text
+E(s,z,g) = V(s,z) * V(z,g)
+rho_i = softmax(beta * E(s,z_i,g))
+L_spi = -E(s,z_theta,g) / scale
+        + sum_i rho_i * ||z_theta - stopgrad(z_i)||^2 / (2 * tau)
+scale = stopgrad(mean(abs(E(s,z_theta,g))) + eps)
+```
+
+여기서 `z_theta`는 deterministic `subgoal_spi_net(s,g)` 출력입니다. `scale`은 energy 항의 수치 크기 안정화용이고, `eps`는 `subgoal_spi_energy_norm_eps`입니다. flow proposal net은 기존 flow matching/value-guided loss로 계속 학습됩니다.
+
+eval에서 `subgoal_spi_enabled: true`이면 네 조합을 함께 기록합니다.
+
+| metric prefix | subgoal source | low-level policy |
+|---------------|----------------|------------------|
+| `eval_flow_idm` | flow `subgoal_net` best-of-N | IDM |
+| `eval_flow_actor` | flow `subgoal_net` best-of-N | actor |
+| `eval_spi_subgoal_idm` | deterministic `subgoal_spi_net` 1회 forward | IDM |
+| `eval_spi_subgoal_actor` | deterministic `subgoal_spi_net` 1회 forward | actor |
+
+기존 flow-only 학습을 하려면 `subgoal_spi_enabled`를 생략하거나 `false`로 둡니다. 이 경우 `subgoal_spi_net`은 생성되지 않고, 기존 `subgoal_distribution: flow` 경로만 사용합니다.
+
+TRL critic:
+
+| 키 | 설명 |
+|----|------|
+| `action_chunk_horizon` | actor/IDM chunk horizon. 현재 sweep은 5 |
+| `full_chunk_horizon` | critic full horizon. top-level `horizon`과 동기화 |
+| `discount` | env별 gamma |
+| `tau_v` | expectile/value 관련 coefficient |
+| `lambda_v_self`, `lambda_v_base`, `lambda_v_tri` | TRL value loss weights |
+| `value_base_horizon` | base value target horizon |
+| `value_distance_weight_power` | value distance reweight |
+| `subgoal_value_bonus_type` | 보통 `transitive_product` |
+
+Goal sampling notation:
+
+| 표기 | config field |
+|------|--------------|
+| `cur` | `value_p_curgoal` 또는 `actor_p_curgoal` |
+| `geom` | `value_geom_sample` 또는 `actor_geom_sample` |
+| `traj` | `value_p_trajgoal` 또는 `actor_p_trajgoal` |
+| `rand` | `value_p_randomgoal` 또는 `actor_p_randomgoal` |
+
+최근 puzzle 4x5/4x6 sweep은 다음 설정을 사용합니다.
+
+- policy `(cur, geom, traj, rand) = (0, 0.5, 0, 0.5)`
+- value TRL `(cur, geom, traj, rand) = (0, 0, 1, 0)`
+
+## 주요 Sweep
+
+### Flow+TRL final-eval sweep
+
+```bash
+python scripts/write_flow_trl_sweep_yaml.py
+GPU_ID=0 nohup bash scripts/run_flow_trl_sweep.sh > nohup_logs/flow_trl_sweep.nohup.log 2>&1 &
+```
+
+- configs: `config/sweep_flow_trl_finaleval/`
+- gap: `{1, 3, 5, 10}`
+- wmax: `5`
+- train N: `1`
+- final eval N: `{1, 2, 4, 8, 16}`
+
+### Puzzle 4x5 / 4x6
+
+```bash
+python scripts/write_flow_trl_puzzle_45_46_yaml.py
+GPU_ID=0 nohup bash scripts/run_flow_trl_puzzle_45_46.sh > nohup_logs/flow_trl_p456.nohup.log 2>&1 &
+```
+
+- configs: `config/sweep_flow_trl_puzzle_45_46/`
+- run group: `flow_trl_p456g999_*`
+- envs: `puzzle-4x5-play-v0`, `puzzle-4x6-play-v0`
+- gamma: `0.999`
+- `value_distance_weight_power: 0.0`
+- eval budget: 환경 max episode length
+
+### Puzzle 3x3 / 4x4 Subgoal SPI
+
+```bash
+GPU_ID=0 nohup bash scripts/run_flow_trl_spi_p33_p44_500k.sh > nohup_logs/flow_trl_spi_p33_p44_500k.nohup.log 2>&1 &
+```
+
+- configs: `config/sweep_flow_trl_spi_p33_p44_500k/`
+- subgoal: `subgoal_distribution: flow` + `subgoal_spi_enabled: true`
+- deterministic SPI net: `subgoal_spi_net`
+- proposal/teacher: flow `subgoal_net`
+- train steps: `250000`, `500000`
+- eval N: `{2, 16}`
+- eval temperature: `{1.0, 0.5}`
+- 250K eval uses `eval_episodes_per_task`; 500K eval uses `final_eval_episodes_per_task`
+
+### K=40 best follow-up
+
+```bash
+python scripts/write_flow_trl_k40_best_yaml.py
+GPU_ID=0 nohup bash scripts/run_flow_trl_k40_best.sh > nohup_logs/flow_trl_k40_best.nohup.log 2>&1 &
+```
+
+- configs: `config/sweep_flow_trl_k40_best/`
+- horizon/full chunk: `40`
+- selected params from prior K=25 best settings
+
+### Antmaze-giant env-max eval
+
+```bash
+GPU_ID=0 nohup bash scripts/run_amg_m800_eval.sh > nohup_logs/amg_envmax_eval.nohup.log 2>&1 &
+```
+
+- temp: `1.0`, `0.5`
+- eval N: `{2, 8, 16, 32}`
+
+Chain giant eval then puzzle sweep:
+
+```bash
+GPU_ID=0 nohup bash scripts/run_amg_m800_then_p456.sh > nohup_logs/amg_envmax_then_p456.nohup.log 2>&1 &
+```
+
+## Eval
 
 Checkpoint eval:
 
 ```bash
 PYTHONPATH=. MUJOCO_GL=egl python eval_checkpoint.py \
-  --run_dir=runs/<run_dir> \
-  --epoch=300 \
-  --eval_task_ids="1,2,3,4,5" \
-  --eval_episodes_per_task=10
+  --run_dir runs/<run_dir> \
+  --epoch 600 \
+  --eval_task_ids "1,2,3,4,5" \
+  --eval_episodes_per_task 25 \
+  --subgoal_eval_num_samples 16 \
+  --skip_if_saved
 ```
+
+Temp / N override:
+
+```bash
+PYTHONPATH=. MUJOCO_GL=egl python eval_checkpoint.py \
+  --run_dir runs/<run_dir> \
+  --epoch 600 \
+  --eval_episodes_per_task 25 \
+  --subgoal_temperature 0.5 \
+  --subgoal_eval_num_samples 32 \
+  --skip_if_saved
+```
+
+## Rollout
 
 통합 rollout:
 
 ```bash
 PYTHONPATH=. MUJOCO_GL=egl python -m rollout.run \
-  --run_dir=runs/<run_dir> \
-  --checkpoint_epoch=300 \
-  --task_ids=1,2,3,4,5 \
-  --mode=all
+  --run_dir runs/<run_dir> \
+  --checkpoint_epoch 600 \
+  --task_ids 1,2,3,4,5 \
+  --mode all
 ```
 
-`rollout.run`은 `flags.json`의 `env_name`으로 maze/navigate와 ManipSpace play(cube/puzzle)를 자동 판별합니다.
-
-- IDM/actor episode loop는 manip와 maze가 모두 `rollout.episode_runner.run_chunked_episode`를 공유합니다 (main eval과 동일한 `dynamics.infer_subgoal` + `_idm_action_chunk` / `actor.sample_actions` 경로).
-- maze 계열에서만 `--mode=subgoal` (state-space open-loop + xy plot)이 의미가 있습니다. manip은 `--mode=all|idm|actor`만 지원하고 state plot은 그리지 않습니다.
-- maze 시각화는 항상 navigator snap 모드입니다 (벽 통과 옵션은 더 이상 제공하지 않습니다).
-- maze 단일 모드는 `python -m rollout.subgoal|idm|actor`로, manip 통합 실행은 `python -m rollout.manip_play_rollouts`로도 직접 호출할 수 있습니다 (별도 cube/puzzle wrapper 스크립트는 더 이상 제공하지 않습니다).
-
-직접 호출 가능한 rollout 엔트리포인트:
+직접 호출 가능한 entry point:
 
 ```bash
-# Maze/manip 자동 분기 통합 실행
-PYTHONPATH=. MUJOCO_GL=egl python -m rollout.run --run_dir=runs/<run_dir> --checkpoint_epoch=300 --mode=all
-
-# Maze 단일 모드
-PYTHONPATH=. MUJOCO_GL=egl python -m rollout.subgoal --run_dir=runs/<run_dir> --checkpoint_epoch=300
-PYTHONPATH=. MUJOCO_GL=egl python -m rollout.idm --run_dir=runs/<run_dir> --checkpoint_epoch=300
-PYTHONPATH=. MUJOCO_GL=egl python -m rollout.actor --run_dir=runs/<run_dir> --checkpoint_epoch=300
-
-# Manip play 전용 상태/episode rollout
-PYTHONPATH=. MUJOCO_GL=egl python -m rollout.manip_play_rollouts --run_dir=runs/<run_dir> --checkpoint_epoch=300
-PYTHONPATH=. MUJOCO_GL=egl python -m rollout.manip_play_state_rollout --run_dir=runs/<run_dir> --checkpoint_epoch=300
+python -m rollout.subgoal --run_dir runs/<run_dir> --checkpoint_epoch 600
+python -m rollout.idm --run_dir runs/<run_dir> --checkpoint_epoch 600
+python -m rollout.actor --run_dir runs/<run_dir> --checkpoint_epoch 600
+python -m rollout.manip_play_rollouts --run_dir runs/<run_dir> --checkpoint_epoch 600
+python -m rollout.manip_play_state_rollout --run_dir runs/<run_dir> --checkpoint_epoch 600
 ```
 
-## scripts/
+Maze 계열은 state-space plot이 의미 있고, cube/puzzle ManipSpace 계열은 IDM/Actor MP4 중심입니다.
 
-`scripts/`는 JAX/CUDA 래퍼, Flow+TRL sweep/eval, generated docs summary 도구만 유지합니다. 로그는 `nohup_logs/`에 씁니다 (`scripts/sweep_logs/`는 더 이상 사용하지 않음).
+## 결과 요약
 
-| 스크립트 | 역할 |
-|----------|------|
-| `with_jax_cuda.sh`, `jax_cuda_env.sh` | CUDA/JAX 환경 설정 후 명령 실행 |
-| `yaml_run_config.py` | TRL run config 빌더 (hand-written YAML 형식) |
-| `flow_trl_sweep_common.py` | Flow+TRL sweep config/run-dir helper |
-| `generate_flow_trl_*_configs.py` | gap/distance-weight/humanoid sweep YAML 생성 |
-| `run_flow_trl_*_sweep.sh` | Flow+TRL sweep 실행 |
-| `run_flow_trl_eval_giant_cap4000.sh` | antmaze-giant full-cap final eval |
-| `run_flow_k_sweep*.sh`, `run_flow_h25_ha10.sh` | K/horizon follow-up 실행 |
-| `summarize_feval_results.py` | `docs/flow_trl_feval_results_choi.csv/.md` 생성 |
-| `summarize_runs.py` | `local_reports/*_choi.csv/.md` 생성 |
-| `docs_output_paths.py` | generated docs output naming helper |
-
-예시:
+Generated docs CSV/MD는 `_7ch` suffix를 붙입니다. helper는 `scripts/docs_output_paths.py`입니다.
 
 ```bash
-# Flow+TRL humanoidmaze distance-weight sweep
-GPU_ID=0 nohup bash scripts/run_flow_trl_humanoidmaze_dw_sweep.sh > nohup_logs/flow_trl_humanoidmaze_dw.out 2>&1 &
-
-# Regenerate core docs artifacts with _choi suffix
-PYTHONPATH=.:scripts python scripts/summarize_feval_results.py
-
-# Optional local run summaries (not under docs/)
-PYTHONPATH=.:scripts python scripts/summarize_runs.py
+python scripts/summarize_feval_results.py
+python scripts/summarize_runs.py
 ```
+
+대표 출력:
+
+- `docs/flow_trl_feval_results_7ch.csv`
+- `docs/flow_trl_feval_results_7ch.md`
+- `docs/runs_results_total_7ch.csv`
+- `docs/douri_runs_results_total_7ch.csv`
+
+`_7ch`가 없는 generated CSV/MD는 만들지 않는 규칙입니다. 수동 작성 문서와 figures는 별도입니다.
+
+자세한 script별 역할은 `scripts/README.md`를 참고하세요. 예전 tune/plain-flow ablation runner와 완료된 일회성 eval helper는 `scripts/`에서 제거했습니다.
 
 ## 테스트
 
-핵심 회귀 테스트는 `tests/`에 있습니다. JAX가 깔린 환경(`offrl` conda 등)에서 그냥 파일을 직접 실행합니다.
+핵심 회귀 테스트:
 
 ```bash
-cd /path/to/PathBridger
 PYTHONPATH=. python tests/test_exact_residual_dynamics.py
 PYTHONPATH=. python tests/test_distributional_subgoal.py
 PYTHONPATH=. python tests/test_forward_bridge_planner.py
@@ -358,14 +354,13 @@ PYTHONPATH=. python -m pytest tests/test_critic_modes.py -v
 PYTHONPATH=. python tests/test_prefix_progress_schedule.py
 ```
 
-각 테스트는 끝에 `OK: ...` 또는 `All tests passed.`를 찍거나 pytest summary를 출력합니다. dynamics 관련 변경(특히 schedule, planner, state normalization)을 한 뒤에는 forward bridge / distributional subgoal 테스트를, critic 변경 뒤에는 `tests/test_critic_modes.py`를 확인하세요.
+Dynamics/planner/schedule을 바꾸면 forward bridge와 prefix progress 테스트를, critic을 바꾸면 `tests/test_critic_modes.py`를 확인하세요.
 
-## 주의사항
+## 운영 주의사항
 
-- 저장소 루트에서 `PYTHONPATH=.` 없이 실행하면 import가 깨질 수 있습니다.
-- `MUJOCO_GL=egl`을 설정하면 headless rollout/영상 생성이 안정적입니다.
-- Hard bridge sweep에서는 `bridge_gamma_inv: 0.0`과 `subgoal_distribution: deterministic`을 같이 둡니다.
-- Finite-γ soft bridge를 엄밀히 비교할 때는 planner 차이에 주의하세요. `exact_residual_chain` schedule은 `bridge_gamma_inv`를 posterior와 marginal에 반영하지만, `forward_bridge_coefficients`는 finite-γ denominator를 쓰더라도 planner endpoint를 위해 마지막에 `b[-1]=1`, `std[-1]=0`으로 clamp합니다. Hard bridge(`bridge_gamma_inv: 0.0`) 실험에서는 문제가 없습니다.
-- `linear_beta`는 diffusion-style 기준 스케줄입니다. `make_dynamics_schedule`은 exact-residual chain의 diffusion index에 맞춰 forward-time theta를 뒤집어 쓰고, `forward_bridge_coefficients`는 raw ascending theta를 그대로 씁니다. planner 간 schedule 비교나 논문용 ablation은 `prefix_progress` 기준이 더 해석하기 쉽습니다.
-- `theta_schedule=prefix_progress`로 학습한 체크포인트는 평가/롤아웃 시에도 같은 schedule 인자가 자동으로 `flags.json`에서 복원됩니다. 명시적으로 override할 일이 거의 없습니다.
-- 새 학습 run은 `<ts>_seed<N>_<env>` prefix를 사용합니다.
+- 저장소 루트에서 실행하고 `PYTHONPATH=.`을 설정합니다.
+- headless eval/rollout은 `MUJOCO_GL=egl`이 안정적입니다.
+- 긴 sweep은 `nohup`으로 실행하고, 중복 process를 확인한 뒤 시작합니다.
+- Runner들은 기존 run, gamma match, eval JSON completeness를 기준으로 skip/retrain 여부를 결정합니다.
+- `flags.json`에는 `dynamics`, `critic_agent`, `actor` block이 모두 저장됩니다. TRL value sampling은 `critic_agent` block을 기준으로 봅니다.
+- Generated CSV/MD, zip, ad-hoc 결과표는 로컬 분석 산출물입니다. 커밋할 때는 의도적으로 stage했는지 확인하세요.

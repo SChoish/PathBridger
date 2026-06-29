@@ -33,6 +33,7 @@ import contextlib
 import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -51,6 +52,7 @@ from rollout.episode_runner import (
     run_chunked_episode,
 )
 from rollout.plot import compose_state_subgoal_env_frames, write_rgb_array_mp4
+from rollout.value_field import load_critic_for_run
 from main import _idm_action_chunk
 from utils.env_utils import make_env_and_datasets
 from utils.run_io import (
@@ -64,27 +66,54 @@ from utils.run_io import (
 )
 
 
-def _chunk_budget_for_full_episode(env, chunk_h: int, flags_max_chunks: int) -> int:
+def _eval_subgoal_selection(cfg: dict[str, Any]) -> str:
+    return str(cfg.get('subgoal_eval_selection', 'zero_noise')).lower()
+
+
+def _uses_eval_subgoal(cfg: dict[str, Any]) -> bool:
+    return _eval_subgoal_selection(cfg) in ('best_of_n_value', 'best_of_n_goal_l2', 'sample')
+
+
+def _predict_subgoal_for_rollout(
+    agent: DynamicsAgent,
+    obs: np.ndarray,
+    goal: np.ndarray,
+    *,
+    critic_agent: Any | None,
+    cfg: dict[str, Any],
+    ep_ix: int,
+) -> np.ndarray:
+    if _uses_eval_subgoal(cfg):
+        seed_base = int(cfg.get('subgoal_eval_seed', 0))
+        rng = jax.random.PRNGKey(seed_base + int(ep_ix))
+        pred = agent.infer_subgoal_for_eval(
+            jnp.asarray(obs, dtype=jnp.float32),
+            jnp.asarray(goal, dtype=jnp.float32),
+            critic_agent=critic_agent,
+            rng=rng,
+        )
+        return np.asarray(pred, dtype=np.float32).reshape(-1)
+    return np.asarray(agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+
+
+def _chunk_budget_for_full_episode(env, chunk_h: int) -> int:
     ms = max_episode_steps_from_wrappers(env)
     ch = max(1, int(chunk_h))
-    fm = max(1, int(flags_max_chunks))
     if ms is None:
-        return fm
+        raise ValueError('Rollout env must expose max_episode_steps.')
     need = (int(ms) + ch - 1) // ch
-    return max(fm, int(need) + 2)
+    return max(1, int(need))
 
 
-def _load_eval_rollout_limits(run_dir: Path) -> tuple[int, int, int]:
+def _load_eval_rollout_limits(run_dir: Path) -> tuple[int, int]:
     flags_path = run_dir / 'flags.json'
     with open(flags_path, 'r', encoding='utf-8') as f:
         root = json.load(f)
-    fg = root.get('flags') if isinstance(root.get('flags'), dict) else root
-    max_chunks = max(1, int(fg.get('eval_max_chunks', 200)))
     critic = root.get('critic_agent') if isinstance(root.get('critic_agent'), dict) else {}
     actor = root.get('actor') if isinstance(root.get('actor'), dict) else {}
     idm_h = max(1, int(critic.get('action_chunk_horizon', 5)))
     act_h = max(1, int(actor.get('actor_chunk_horizon', idm_h)))
-    return max_chunks, idm_h, act_h
+    return idm_h, act_h
 
 
 def _load_actor_cfg(flags_path: Path) -> dict:
@@ -155,9 +184,10 @@ _ROLLOUT_SUMMARY_FIELDS: tuple[str, ...] = (
     'family',
     'checkpoint_epoch',
     'actor_checkpoint_epoch',
-    'eval_max_chunks',
+    'eval_budget',
     'idm_horizon',
     'actor_horizon',
+    'eval_ep_ix',
     'idm_chunks',
     'actor_chunks',
     'idm_env_success',
@@ -269,7 +299,7 @@ def _write_state_subgoal_mp4(
     s_g: np.ndarray | None = None,
     goal_rendered: np.ndarray | None = None,
     show_goal_panel: bool = False,
-    overlay_caption: bool = True,
+    show_caption: bool = False,
 ) -> int:
     """Write left=actual env, right=predicted-subgoal env MP4 and return frame count."""
     # ``run_chunked_episode`` records one initial frame plus one frame per executed env step.
@@ -317,7 +347,7 @@ def _write_state_subgoal_mp4(
     )
     frames = _pad_rgb_frames_min_duration(composed, float(fps), float(min_mp4_seconds))
     caption_lines = None
-    if overlay_caption:
+    if show_caption:
         caption_lines = ['left: env state', 'middle: env @ predicted subgoal']
         if goal_frames is not None:
             caption_lines.append('right: task goal (target configuration)')
@@ -361,14 +391,20 @@ def _run_one_task(
     fps: float,
     min_mp4_seconds: float,
     show_goal_panel: bool = True,
-    overlay_caption: bool = True,
     idm_horizon: int | None = None,
     idm_only: bool = False,
+    subgoal_eval_num_samples: int = -1,
+    eval_ep_ix: int = 0,
+    until_success: bool = False,
+    max_eval_ep_ix: int = 25,
+    show_caption: bool = False,
 ) -> dict[str, Any]:
     configure_mujoco_gl(mujoco_gl)
     cfg, env_name = load_run_flags(run_dir)
+    if int(subgoal_eval_num_samples) > 0:
+        cfg['subgoal_eval_num_samples'] = int(subgoal_eval_num_samples)
     family = manip_play_family(env_name)
-    em, idm_h, act_h = _load_eval_rollout_limits(run_dir)
+    idm_h, act_h = _load_eval_rollout_limits(run_dir)
     if idm_horizon is not None and int(idm_horizon) > 0:
         idm_h = int(idm_horizon)
 
@@ -382,202 +418,290 @@ def _run_one_task(
     if not (1 <= int(task_id) <= n_tasks):
         raise ValueError(f'task_id must be in [1, {n_tasks}]')
 
-    s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
+    env, train_raw, _ = make_env_and_datasets(
+        env_name,
+        frame_stack=cfg.get('frame_stack'),
+        render_mode='rgb_array',
+    )
+    u = env.unwrapped
+    n_tasks = int(getattr(u, 'num_tasks', 5))
+    if not (1 <= int(task_id) <= n_tasks):
+        raise ValueError(f'task_id must be in [1, {n_tasks}]')
 
     dyn_dir = resolve_dynamics_checkpoint_dir(run_dir)
     ckpt_epoch = pick_epoch(int(ckpt_epoch), list_checkpoint_suffixes(dyn_dir))
     act_dir = resolve_actor_checkpoint_dir(run_dir, required=True)
     act_ep = pick_epoch(int(ckpt_epoch), list_checkpoint_suffixes(act_dir))
 
-    ex = jnp.zeros((1, s0.shape[-1]), dtype=jnp.float32)
+    ex = jnp.zeros((1, int(np.prod(env.observation_space.shape))), dtype=jnp.float32)
     act_dim = int(np.prod(env.action_space.shape))
     ex_act = jnp.zeros((1, act_dim), dtype=jnp.float32)
     agent = DynamicsAgent.create(int(seed), ex, cfg, ex_actions=ex_act)
     dyn_pkl = dyn_dir / f'params_{ckpt_epoch}.pkl'
     agent = load_checkpoint_pkl(agent, dyn_pkl)
 
+    critic_agent = None
+    if _uses_eval_subgoal(cfg):
+        critic_agent = load_critic_for_run(
+            run_dir, int(ckpt_epoch), env, train_raw, seed=int(seed),
+        )
+
     low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
 
-    idm_chunks = (
-        int(idm_max_chunks)
-        if int(idm_max_chunks) >= 0
-        else _chunk_budget_for_full_episode(env, int(idm_h), int(em))
-    )
-    s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
-    idm_subgoals_per_step: list[np.ndarray] = []
-    idm_mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] = []
+    def _run_idm_actor_rollouts(ep_ix: int, *, phase: str = 'both') -> dict[str, Any]:
+        run_idm = phase in ('both', 'idm')
+        run_actor = phase in ('both', 'actor')
+        idm_outcome = None
+        idm_mp4_rel = ''
+        idm_mp4_frames = 0
+        idm_subgoals_per_step: list[np.ndarray] = []
 
-    def _idm_post_step_mocap(e: Any) -> None:
-        snap = snapshot_manip_mocap(e)
-        if snap is not None:
-            idm_mocap_snapshots.append(snap)
+        if run_idm:
+            s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
+            idm_mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] = []
 
-    def _idm_chunk_with_subgoal_trace(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
-        pred = np.asarray(agent.infer_subgoal(jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(goal, dtype=jnp.float32)))
-        pred = pred.reshape(-1).astype(np.float32)
-        chunk = _idm_action_chunk(agent, np.asarray(obs, dtype=np.float32).reshape(-1), pred, int(idm_h))
-        for _ in range(int(chunk.shape[0])):
-            idm_subgoals_per_step.append(pred.copy())
-        return chunk
+            def _idm_post_step_mocap(e: Any) -> None:
+                snap = snapshot_manip_mocap(e)
+                if snap is not None:
+                    idm_mocap_snapshots.append(snap)
 
-    idm_outcome = run_chunked_episode(
-        env,
-        s0,
-        s_g,
-        low=low,
-        high=high,
-        max_chunks=int(idm_chunks),
-        sample_action_chunk=_idm_chunk_with_subgoal_trace,
-        post_step_hook=_idm_post_step_mocap,
-        record_rgb=True,
-    )
-    idm_out_tag = 'success' if idm_outcome.ok_env else 'fail'
-    mp4_idm = out_task_dir / f'idm_env_rgb_{idm_out_tag}.mp4'
-    idm_mp4_rel = ''
-    idm_mp4_frames = 0
-    if idm_outcome.rgb_frames is not None and idm_outcome.rgb_frames.size > 0:
-        idm_mp4_frames = _write_state_subgoal_mp4(
-            env_name=env_name,
-            frame_stack=cfg.get('frame_stack'),
-            task_id=int(task_id),
-            state_frames=idm_outcome.rgb_frames,
-            subgoals_per_step=idm_subgoals_per_step,
-            path=mp4_idm,
-            fps=float(fps),
-            min_mp4_seconds=float(min_mp4_seconds),
-            mocap_snapshots=idm_mocap_snapshots if idm_mocap_snapshots else None,
-            s_g=s_g,
-            goal_rendered=goal_rendered,
-            show_goal_panel=show_goal_panel,
-            overlay_caption=overlay_caption,
-        )
-        idm_mp4_rel = _path_rel_to(out_dir, mp4_idm)
-        print(
-            f'[task {task_id}] wrote {mp4_idm}  raw_frames={idm_outcome.rgb_frames.shape[0]} '
-            f'mp4_frames={idm_mp4_frames} chunks={idm_outcome.n_chunks} idm_horizon={idm_h} '
-            f'eval_max_chunks={em} env_info_success={idm_outcome.ok_env}'
-        )
-    else:
-        print(f'[task {task_id}] IDM: no RGB frames states={idm_outcome.states.shape[0]}')
+            def _idm_chunk_with_subgoal_trace(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+                pred = _predict_subgoal_for_rollout(
+                    agent, obs, goal, critic_agent=critic_agent, cfg=cfg, ep_ix=ep_ix,
+                )
+                chunk = _idm_action_chunk(agent, np.asarray(obs, dtype=np.float32).reshape(-1), pred, int(idm_h))
+                for _ in range(int(chunk.shape[0])):
+                    idm_subgoals_per_step.append(pred.copy())
+                return chunk
 
-    if idm_only:
+            idm_outcome = run_chunked_episode(
+                env,
+                s0,
+                s_g,
+                low=low,
+                high=high,
+                max_chunks=int(idm_chunks),
+                sample_action_chunk=_idm_chunk_with_subgoal_trace,
+                post_step_hook=_idm_post_step_mocap,
+                record_rgb=True,
+            )
+            idm_out_tag = 'success' if idm_outcome.ok_env else 'fail'
+            mp4_idm = out_task_dir / f'idm_env_rgb_{idm_out_tag}.mp4'
+            if idm_outcome.rgb_frames is not None and idm_outcome.rgb_frames.size > 0:
+                idm_mp4_frames = _write_state_subgoal_mp4(
+                    env_name=env_name,
+                    frame_stack=cfg.get('frame_stack'),
+                    task_id=int(task_id),
+                    state_frames=idm_outcome.rgb_frames,
+                    subgoals_per_step=idm_subgoals_per_step,
+                    path=mp4_idm,
+                    fps=float(fps),
+                    min_mp4_seconds=float(min_mp4_seconds),
+                    mocap_snapshots=idm_mocap_snapshots if idm_mocap_snapshots else None,
+                    s_g=s_g,
+                    goal_rendered=goal_rendered,
+                    show_goal_panel=show_goal_panel,
+                    show_caption=show_caption,
+                )
+                idm_mp4_rel = _path_rel_to(out_dir, mp4_idm)
+                print(
+                    f'[task {task_id}] wrote {mp4_idm}  raw_frames={idm_outcome.rgb_frames.shape[0]} '
+                    f'mp4_frames={idm_mp4_frames} chunks={idm_outcome.n_chunks} idm_horizon={idm_h} '
+                    f'eval_ep_ix={ep_ix} eval_budget=env_max_episode_steps env_info_success={idm_outcome.ok_env}'
+                )
+            else:
+                print(f'[task {task_id}] IDM: no RGB frames states={idm_outcome.states.shape[0]} eval_ep_ix={ep_ix}')
+
+            if idm_only or phase == 'idm':
+                return {
+                    'task_id': int(task_id),
+                    'env_name': str(env_name),
+                    'family': str(family),
+                    'checkpoint_epoch': int(ckpt_epoch),
+                    'actor_checkpoint_epoch': int(act_ep),
+                    'eval_budget': 'env_max_episode_steps',
+                    'idm_horizon': int(idm_h),
+                    'actor_horizon': int(act_h),
+                    'eval_ep_ix': int(ep_ix),
+                    'idm_chunks': int(idm_outcome.n_chunks),
+                    'actor_chunks': 0,
+                    'idm_env_success': int(bool(idm_outcome.ok_env)),
+                    'actor_env_success': 0,
+                    'idm_mp4': idm_mp4_rel,
+                    'actor_mp4': '',
+                    'idm_mp4_frames': idm_mp4_frames,
+                    'actor_mp4_frames': 0,
+                }
+
+        actor_outcome = None
+        actor_mp4_rel = ''
+        actor_mp4_frames = 0
+        if run_actor:
+            flags_path = run_dir / 'flags.json'
+            actor_cfg = _load_actor_cfg(flags_path)
+            actor_cfg['action_dim'] = act_dim
+            ex_goal = jnp.asarray(
+                _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)[1].reshape(1, -1),
+                dtype=jnp.float32,
+            )
+            actor_agent = ActorAgent.create(int(seed), ex, actor_cfg, ex_goals=ex_goal)
+            actor_pkl = act_dir / f'params_{act_ep}.pkl'
+            actor_agent = load_checkpoint_pkl(actor_agent, actor_pkl)
+
+            actor_chunks = (
+                int(actor_max_chunks)
+                if int(actor_max_chunks) >= 0
+                else _chunk_budget_for_full_episode(env, int(act_h))
+            )
+            s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
+            actor_subgoals_per_step: list[np.ndarray] = []
+            actor_mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] = []
+
+            def _actor_post_step_mocap(e: Any) -> None:
+                snap = snapshot_manip_mocap(e)
+                if snap is not None:
+                    actor_mocap_snapshots.append(snap)
+
+            def _actor_chunk_with_subgoal_trace(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
+                pred = _predict_subgoal_for_rollout(
+                    agent, obs, goal, critic_agent=critic_agent, cfg=cfg, ep_ix=ep_ix,
+                )
+                chunk = np.asarray(
+                    actor_agent.sample_actions(
+                        jnp.asarray(obs, dtype=jnp.float32),
+                        jnp.asarray(pred, dtype=jnp.float32),
+                    ),
+                    dtype=np.float32,
+                ).reshape(int(act_h), -1)
+                if not chunk.flags.writeable:
+                    chunk = chunk.copy()
+                for i in range(int(chunk.shape[0])):
+                    chunk[i] = align_action_to_env(chunk[i], int(act_dim))
+                    actor_subgoals_per_step.append(pred.copy())
+                return chunk
+
+            actor_outcome = run_chunked_episode(
+                env,
+                s0,
+                s_g,
+                low=low,
+                high=high,
+                max_chunks=int(actor_chunks),
+                sample_action_chunk=_actor_chunk_with_subgoal_trace,
+                post_step_hook=_actor_post_step_mocap,
+                record_rgb=True,
+            )
+            ac_out_tag = 'success' if actor_outcome.ok_env else 'fail'
+            mp4_ac = out_task_dir / f'actor_env_rgb_{ac_out_tag}.mp4'
+            if actor_outcome.rgb_frames is not None and actor_outcome.rgb_frames.size > 0:
+                actor_mp4_frames = _write_state_subgoal_mp4(
+                    env_name=env_name,
+                    frame_stack=cfg.get('frame_stack'),
+                    task_id=int(task_id),
+                    state_frames=actor_outcome.rgb_frames,
+                    subgoals_per_step=actor_subgoals_per_step,
+                    path=mp4_ac,
+                    fps=float(fps),
+                    min_mp4_seconds=float(min_mp4_seconds),
+                    mocap_snapshots=actor_mocap_snapshots if actor_mocap_snapshots else None,
+                    s_g=s_g,
+                    goal_rendered=goal_rendered,
+                    show_goal_panel=show_goal_panel,
+                    show_caption=show_caption,
+                )
+                actor_mp4_rel = _path_rel_to(out_dir, mp4_ac)
+                print(
+                    f'[task {task_id}] wrote {mp4_ac}  raw_frames={actor_outcome.rgb_frames.shape[0]} '
+                    f'mp4_frames={actor_mp4_frames} chunks={actor_outcome.n_chunks} actor_horizon={act_h} '
+                    f'eval_ep_ix={ep_ix} eval_budget=env_max_episode_steps env_info_success={actor_outcome.ok_env}'
+                )
+            else:
+                print(f'[task {task_id}] actor: no RGB frames states={actor_outcome.states.shape[0]} eval_ep_ix={ep_ix}')
+
+            if phase == 'actor':
+                return {
+                    'task_id': int(task_id),
+                    'env_name': str(env_name),
+                    'family': str(family),
+                    'checkpoint_epoch': int(ckpt_epoch),
+                    'actor_checkpoint_epoch': int(act_ep),
+                    'eval_budget': 'env_max_episode_steps',
+                    'idm_horizon': int(idm_h),
+                    'actor_horizon': int(act_h),
+                    'eval_ep_ix': int(ep_ix),
+                    'idm_chunks': 0,
+                    'actor_chunks': int(actor_outcome.n_chunks),
+                    'idm_env_success': 0,
+                    'actor_env_success': int(bool(actor_outcome.ok_env)),
+                    'idm_mp4': '',
+                    'actor_mp4': actor_mp4_rel,
+                    'idm_mp4_frames': 0,
+                    'actor_mp4_frames': actor_mp4_frames,
+                }
+
+        assert idm_outcome is not None and actor_outcome is not None
         return {
             'task_id': int(task_id),
             'env_name': str(env_name),
             'family': str(family),
             'checkpoint_epoch': int(ckpt_epoch),
             'actor_checkpoint_epoch': int(act_ep),
-            'eval_max_chunks': int(em),
+            'eval_budget': 'env_max_episode_steps',
             'idm_horizon': int(idm_h),
             'actor_horizon': int(act_h),
+            'eval_ep_ix': int(ep_ix),
             'idm_chunks': int(idm_outcome.n_chunks),
-            'actor_chunks': 0,
+            'actor_chunks': int(actor_outcome.n_chunks),
             'idm_env_success': int(bool(idm_outcome.ok_env)),
-            'actor_env_success': 0,
+            'actor_env_success': int(bool(actor_outcome.ok_env)),
             'idm_mp4': idm_mp4_rel,
-            'actor_mp4': '',
+            'actor_mp4': actor_mp4_rel,
             'idm_mp4_frames': idm_mp4_frames,
-            'actor_mp4_frames': 0,
+            'actor_mp4_frames': actor_mp4_frames,
         }
 
-    flags_path = run_dir / 'flags.json'
-    actor_cfg = _load_actor_cfg(flags_path)
-    actor_cfg['action_dim'] = act_dim
-    ex_goal = jnp.asarray(s_g.reshape(1, -1), dtype=jnp.float32)
-    actor_agent = ActorAgent.create(int(seed), ex, actor_cfg, ex_goals=ex_goal)
-    actor_pkl = act_dir / f'params_{act_ep}.pkl'
-    actor_agent = load_checkpoint_pkl(actor_agent, actor_pkl)
-
-    actor_chunks = (
-        int(actor_max_chunks)
-        if int(actor_max_chunks) >= 0
-        else _chunk_budget_for_full_episode(env, int(act_h), int(em))
+    idm_chunks = (
+        int(idm_max_chunks)
+        if int(idm_max_chunks) >= 0
+        else _chunk_budget_for_full_episode(env, int(idm_h))
     )
-    s0, s_g, goal_rendered = _reset_task_env(env, int(task_id), show_goal_panel=show_goal_panel)
-    actor_subgoals_per_step: list[np.ndarray] = []
-    actor_mocap_snapshots: list[tuple[np.ndarray, np.ndarray]] = []
 
-    def _actor_post_step_mocap(e: Any) -> None:
-        snap = snapshot_manip_mocap(e)
-        if snap is not None:
-            actor_mocap_snapshots.append(snap)
-
-    def _actor_chunk_with_subgoal_trace(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
-        pred = np.asarray(agent.infer_subgoal(jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(goal, dtype=jnp.float32)))
-        pred = pred.reshape(-1).astype(np.float32)
-        chunk = np.asarray(
-            actor_agent.sample_actions(
-                jnp.asarray(obs, dtype=jnp.float32),
-                jnp.asarray(pred, dtype=jnp.float32),
-            ),
-            dtype=np.float32,
-        ).reshape(int(act_h), -1)
-        if not chunk.flags.writeable:
-            chunk = chunk.copy()
-        for i in range(int(chunk.shape[0])):
-            chunk[i] = align_action_to_env(chunk[i], int(act_dim))
-            actor_subgoals_per_step.append(pred.copy())
-        return chunk
-
-    actor_outcome = run_chunked_episode(
-        env,
-        s0,
-        s_g,
-        low=low,
-        high=high,
-        max_chunks=int(actor_chunks),
-        sample_action_chunk=_actor_chunk_with_subgoal_trace,
-        post_step_hook=_actor_post_step_mocap,
-        record_rgb=True,
-    )
-    ac_out_tag = 'success' if actor_outcome.ok_env else 'fail'
-    mp4_ac = out_task_dir / f'actor_env_rgb_{ac_out_tag}.mp4'
-    actor_mp4_rel = ''
-    actor_mp4_frames = 0
-    if actor_outcome.rgb_frames is not None and actor_outcome.rgb_frames.size > 0:
-        actor_mp4_frames = _write_state_subgoal_mp4(
-            env_name=env_name,
-            frame_stack=cfg.get('frame_stack'),
-            task_id=int(task_id),
-            state_frames=actor_outcome.rgb_frames,
-            subgoals_per_step=actor_subgoals_per_step,
-            path=mp4_ac,
-            fps=float(fps),
-            min_mp4_seconds=float(min_mp4_seconds),
-            mocap_snapshots=actor_mocap_snapshots if actor_mocap_snapshots else None,
-            s_g=s_g,
-            goal_rendered=goal_rendered,
-            show_goal_panel=show_goal_panel,
-            overlay_caption=overlay_caption,
+    if bool(until_success):
+        idm_row: dict[str, Any] | None = None
+        actor_row: dict[str, Any] | None = None
+        last_row: dict[str, Any] | None = None
+        for ep_ix in range(max(1, int(max_eval_ep_ix))):
+            row = _run_idm_actor_rollouts(int(ep_ix), phase='idm')
+            last_row = row
+            if bool(row.get('idm_env_success')):
+                idm_row = row
+                break
+        for ep_ix in range(max(1, int(max_eval_ep_ix))):
+            row = _run_idm_actor_rollouts(int(ep_ix), phase='actor')
+            last_row = row
+            if bool(row.get('actor_env_success')):
+                actor_row = row
+                break
+        if idm_row is None or actor_row is None:
+            if last_row is None:
+                raise RuntimeError(f'task {task_id}: until_success found no rollout rows')
+            return last_row
+        merged = dict(idm_row)
+        merged.update({
+            'actor_env_success': actor_row.get('actor_env_success', 0),
+            'actor_mp4': actor_row.get('actor_mp4', ''),
+            'actor_mp4_frames': actor_row.get('actor_mp4_frames', 0),
+            'actor_chunks': actor_row.get('actor_chunks', 0),
+        })
+        idm_ep = idm_row.get('eval_ep_ix')
+        actor_ep = actor_row.get('eval_ep_ix')
+        merged['eval_ep_ix'] = (
+            int(idm_ep) if idm_ep == actor_ep else f'idm={idm_ep},actor={actor_ep}'
         )
-        actor_mp4_rel = _path_rel_to(out_dir, mp4_ac)
-        print(
-            f'[task {task_id}] wrote {mp4_ac}  raw_frames={actor_outcome.rgb_frames.shape[0]} '
-            f'mp4_frames={actor_mp4_frames} chunks={actor_outcome.n_chunks} actor_horizon={act_h} '
-            f'eval_max_chunks={em} env_info_success={actor_outcome.ok_env}'
-        )
-    else:
-        print(f'[task {task_id}] actor: no RGB frames states={actor_outcome.states.shape[0]}')
+        return merged
 
-    return {
-        'task_id': int(task_id),
-        'env_name': str(env_name),
-        'family': str(family),
-        'checkpoint_epoch': int(ckpt_epoch),
-        'actor_checkpoint_epoch': int(act_ep),
-        'eval_max_chunks': int(em),
-        'idm_horizon': int(idm_h),
-        'actor_horizon': int(act_h),
-        'idm_chunks': int(idm_outcome.n_chunks),
-        'actor_chunks': int(actor_outcome.n_chunks),
-        'idm_env_success': int(bool(idm_outcome.ok_env)),
-        'actor_env_success': int(bool(actor_outcome.ok_env)),
-        'idm_mp4': idm_mp4_rel,
-        'actor_mp4': actor_mp4_rel,
-        'idm_mp4_frames': idm_mp4_frames,
-        'actor_mp4_frames': actor_mp4_frames,
-    }
+    return _run_idm_actor_rollouts(int(eval_ep_ix))
 
 
 def main() -> None:
@@ -609,13 +733,13 @@ def main() -> None:
         '--idm_max_chunks',
         type=int,
         default=-1,
-        help='Outer replans; -1 → max(flags.eval_max_chunks, ceil(TimeLimit/chunk)).',
+        help='Outer replans; -1 -> ceil(env max episode steps / IDM horizon).',
     )
     p.add_argument(
         '--actor_max_chunks',
         type=int,
         default=-1,
-        help='Outer replans; -1 → max(flags.eval_max_chunks, ceil(TimeLimit/chunk)).',
+        help='Outer replans; -1 -> ceil(env max episode steps / actor horizon).',
     )
     p.add_argument(
         '--min_mp4_seconds',
@@ -630,9 +754,32 @@ def main() -> None:
         help='Append a third MP4 panel showing the task goal configuration (default: on).',
     )
     p.add_argument(
-        '--no_overlay_text',
+        '--subgoal_eval_num_samples',
+        type=int,
+        default=-1,
+        help='Override dynamics.subgoal_eval_num_samples for infer_subgoal (-1 = flags.json).',
+    )
+    p.add_argument(
+        '--eval_ep_ix',
+        type=int,
+        default=0,
+        help='Episode index for eval subgoal RNG (matches main eval: seed_base + ep_ix).',
+    )
+    p.add_argument(
+        '--until_success',
         action='store_true',
-        help='Omit bottom caption strip on MP4s (panel labels at top are kept).',
+        help='Try eval_ep_ix=0..max_eval_ep_ix-1 until IDM or actor succeeds.',
+    )
+    p.add_argument(
+        '--max_eval_ep_ix',
+        type=int,
+        default=25,
+        help='Upper bound for --until_success episode search.',
+    )
+    p.add_argument(
+        '--show_caption',
+        action='store_true',
+        help='Burn English panel labels into the bottom of MP4s (default: off).',
     )
     p.add_argument(
         '--no_exclusive_lock',
@@ -676,9 +823,13 @@ def main() -> None:
                     fps=float(args.fps),
                     min_mp4_seconds=float(args.min_mp4_seconds),
                     show_goal_panel=bool(args.show_goal_panel),
-                    overlay_caption=not bool(args.no_overlay_text),
                     idm_horizon=int(args.idm_horizon) if int(args.idm_horizon) > 0 else None,
                     idm_only=bool(args.idm_only),
+                    subgoal_eval_num_samples=int(args.subgoal_eval_num_samples),
+                    eval_ep_ix=int(args.eval_ep_ix),
+                    until_success=bool(args.until_success),
+                    max_eval_ep_ix=int(args.max_eval_ep_ix),
+                    show_caption=bool(args.show_caption),
                 )
             )
         summary_path = _write_rollout_task_summary_csv(out_dir, rows)

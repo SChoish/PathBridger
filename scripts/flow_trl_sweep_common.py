@@ -5,11 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from utils.trl_critic_config import (
-    TRL_ENV_SPECS,
-    eval_max_chunks_for_env,
-    trl_critic_agent_config,
-)
+from utils.trl_critic_config import TRL_ENV_SPECS, trl_critic_agent_config
 from yaml_run_config import build_trl_run_config
 
 GAP_VALUES = [1.0, 3.0, 5.0, 10.0]
@@ -18,7 +14,7 @@ TRAIN_N = 1
 FINAL_EVAL_N_VALUES = [1, 2, 4, 8, 16]
 
 # Run order: puzzle -> cube -> antmaze.
-ENV_ORDER = ['p3', 'p4', 'cs', 'cd', 'ct', 'amm', 'aml', 'amg', 'hmm', 'hml']
+ENV_ORDER = ['p3', 'p4', 'p45', 'p46', 'cs', 'cd', 'ct', 'amm', 'aml', 'amg']
 
 FLOW_DYNAMICS_BASE: dict[str, Any] = {
     'subgoal_distribution': 'flow',
@@ -85,7 +81,6 @@ def build_flow_trl_sweep_config(
         }
     )
     critic_cfg = trl_critic_agent_config(env_prefix)
-    action_chunk_h = int(critic_cfg.get('action_chunk_horizon', 5))
     cfg = build_trl_run_config(
         env_name=str(env_spec['env_name']),
         run_group=f'{run_group_prefix}{env_prefix}_{variant_suffix_key}',
@@ -95,10 +90,6 @@ def build_flow_trl_sweep_config(
         value_distance_weight_power=float(critic_cfg['value_distance_weight_power']),
         batch_size=int(env_spec['batch_size']),
         train_epochs=600,
-        eval_max_chunks=eval_max_chunks_for_env(
-            env_prefix,
-            action_chunk_horizon=action_chunk_h,
-        ),
         dynamics_overrides=dynamics_overrides,
         critic_overrides=critic_cfg,
         value_goal_sampling={},
@@ -125,39 +116,6 @@ def resolve_run_dir(
     final_epoch: int = 600,
     require_checkpoint: bool = True,
 ) -> str:
-    run_dir, latest_epoch = find_run_dir_for_config(
-        config_path=config_path,
-        runs_root=runs_root,
-        seed=seed,
-        final_epoch=final_epoch,
-    )
-    if not run_dir:
-        return ''
-    if require_checkpoint and latest_epoch < int(final_epoch):
-        return ''
-    return run_dir
-
-
-def latest_checkpoint_epoch(dynamics_ckpt_dir: str) -> int:
-    import glob
-    import os
-    import re
-
-    best = 0
-    for path in glob.glob(os.path.join(dynamics_ckpt_dir, 'params_*.pkl')):
-        match = re.search(r'params_(\d+)\.pkl$', os.path.basename(path))
-        if match:
-            best = max(best, int(match.group(1)))
-    return best
-
-
-def find_run_dir_for_config(
-    *,
-    config_path: str,
-    runs_root: str,
-    seed: int,
-    final_epoch: int = 600,
-) -> tuple[str, int]:
     import glob
     import json
     import os
@@ -169,11 +127,9 @@ def find_run_dir_for_config(
     run_group = str(cfg.get('run_group', ''))
     env_name = str(cfg.get('env_name', ''))
     if not run_group or not env_name:
-        return '', 0
+        return ''
 
-    best_dir = ''
-    best_epoch = 0
-    best_mtime = 0.0
+    candidates: list[str] = []
     pattern = os.path.join(runs_root, f'*_seed{seed}_{env_name}')
     for run_dir in glob.glob(pattern):
         flags_path = os.path.join(run_dir, 'flags.json')
@@ -183,16 +139,44 @@ def find_run_dir_for_config(
             flags = json.load(f).get('flags', {})
         if flags.get('run_group') != run_group:
             continue
-        dynamics_ckpt_dir = os.path.join(run_dir, 'checkpoints', 'dynamics')
-        latest_epoch = latest_checkpoint_epoch(dynamics_ckpt_dir)
-        if latest_epoch <= 0:
-            continue
-        mtime = os.path.getmtime(run_dir)
-        if mtime >= best_mtime:
-            best_mtime = mtime
-            best_dir = run_dir
-            best_epoch = latest_epoch
-    return best_dir, best_epoch
+        if require_checkpoint and final_epoch > 0:
+            ckpt = os.path.join(
+                run_dir, 'checkpoints', 'dynamics', f'params_{final_epoch}.pkl'
+            )
+            if not os.path.isfile(ckpt):
+                continue
+        candidates.append(run_dir)
+    if not candidates:
+        return ''
+    return max(candidates, key=os.path.getmtime)
+
+
+def run_gamma_matches_config(
+    *,
+    config_path: str,
+    run_dir: str,
+    tol: float = 1e-6,
+) -> bool:
+    """True if saved run critic discount matches the YAML config."""
+    import json
+    import os
+
+    import yaml
+
+    if not run_dir:
+        return False
+    flags_path = os.path.join(run_dir, 'flags.json')
+    if not os.path.isfile(flags_path):
+        return False
+    with open(config_path, encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    want = float(cfg.get('critic_agent', {}).get('discount', float('nan')))
+    with open(flags_path, encoding='utf-8') as f:
+        root = json.load(f)
+    got = float(root.get('critic_agent', {}).get('discount', float('nan')))
+    if not (want == want and got == got):  # NaN guard
+        return False
+    return abs(want - got) <= tol
 
 
 def eval_results_complete(

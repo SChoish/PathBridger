@@ -1,14 +1,5 @@
 #!/usr/bin/env bash
-# Sequential Flow subgoal + TRL sweep.
-#
-# Trains with subgoal_num_samples=1 and wmax=5, sweeping gap={1,3,5,10}.
-# Final epoch (600) runs in-training N sweep via final_eval_subgoal_eval_num_samples.
-# Post-train eval_checkpoint.py remains as fallback for incomplete eval_results/.
-#
-# Env:
-#   GPU_ID, PYTHON_BIN, SEED (default 0)
-#   EVAL_ONLY=1  skip training; eval completed runs only (needs epoch checkpoint)
-#   FINAL_EPOCH  checkpoint + eval epoch (default 600)
+# Flow+TRL: puzzle-4x5/4x6 K=40, gap10/wmax5/N1, final eval only.
 
 set -euo pipefail
 
@@ -21,42 +12,25 @@ export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 GPU_ID="${GPU_ID:-0}"
 SEED="${SEED:-0}"
 EVAL_ONLY="${EVAL_ONLY:-0}"
-PYTHON_BIN="${PYTHON_BIN:-/home/choi/miniconda3/envs/offrl/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/offrl/miniconda3/envs/offrl/bin/python}"
 WITH_CUDA="${ROOT}/scripts/with_jax_cuda.sh"
 LOG_DIR="${ROOT}/nohup_logs"
 RUNS_ROOT="${ROOT}/runs"
-CONFIG_DIR="${ROOT}/config/sweep_flow_trl_finaleval"
-WRITER="${ROOT}/scripts/write_flow_trl_sweep_yaml.py"
-LOG_TAG="flow_trl_feval"
-FINAL_EPOCH="${FINAL_EPOCH:-600}"
+CONFIG_DIR="${ROOT}/config/sweep_flow_trl_p456_k40_g10"
+LOG_TAG="flow_trl_p456_k40_g10"
+FINAL_STEP="${FINAL_STEP:-600000}"
 
 mkdir -p "${LOG_DIR}"
 MASTER_LOG="${LOG_DIR}/${LOG_TAG}_master.log"
-"${PYTHON_BIN}" "${WRITER}"
-"${PYTHON_BIN}" "${WRITER}" --probe
-
-mode_label="train+eval"
-if [[ "${EVAL_ONLY}" == "1" ]]; then
-  mode_label="eval-only"
-fi
-echo "[$(date -Is)] ${LOG_TAG} sweep start mode=${mode_label} GPU=${GPU_ID} seed=${SEED}" | tee -a "${MASTER_LOG}"
 
 mapfile -t configs < <(
   CONFIG_DIR="${CONFIG_DIR}" "${PYTHON_BIN}" - <<'PY'
-import glob
 import os
-import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))
-from flow_trl_sweep_common import config_sort_key
-
-config_dir = os.environ['CONFIG_DIR']
-paths = [
-    p for p in glob.glob(os.path.join(config_dir, '*.yaml'))
-    if not os.path.basename(p).startswith('_')
-]
-for p in sorted(paths, key=lambda x: config_sort_key(os.path.basename(x))):
-    print(p)
+config_dir = Path(os.environ['CONFIG_DIR'])
+for name in ('p45_k40_g10_w5_n1.yaml', 'p46_k40_g10_w5_n1.yaml'):
+    print(config_dir / name)
 PY
 )
 
@@ -70,7 +44,7 @@ PY
 
 resolve_run_dir() {
   local cfg="$1"
-  CONFIG_PATH="${cfg}" RUNS_ROOT="${RUNS_ROOT}" SEED="${SEED}" FINAL_EPOCH="${FINAL_EPOCH}" \
+  CONFIG_PATH="${cfg}" RUNS_ROOT="${RUNS_ROOT}" SEED="${SEED}" FINAL_STEP="${FINAL_STEP}" \
     "${PYTHON_BIN}" - <<'PY'
 import os
 import sys
@@ -83,10 +57,23 @@ print(
         config_path=os.environ['CONFIG_PATH'],
         runs_root=os.environ['RUNS_ROOT'],
         seed=int(os.environ['SEED']),
-        final_epoch=int(os.environ['FINAL_EPOCH']),
+        final_epoch=int(os.environ['FINAL_STEP']),
         require_checkpoint=True,
     )
 )
+PY
+}
+
+eval_results_complete() {
+  RUN_DIR="$1" FINAL_STEP="${FINAL_STEP}" \
+    "${PYTHON_BIN}" - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))
+from flow_trl_sweep_common import eval_results_complete
+
+print('1' if eval_results_complete(os.environ['RUN_DIR'], epoch=int(os.environ['FINAL_STEP'])) else '0')
 PY
 }
 
@@ -98,7 +85,7 @@ run_final_evals() {
     echo "[$(date -Is)] START_EVAL ${base} eval_n=${eval_n} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
     CUDA_VISIBLE_DEVICES="${GPU_ID}" bash "${WITH_CUDA}" "${PYTHON_BIN}" -u eval_checkpoint.py \
       --run_dir "${run_dir}" \
-      --epoch "${FINAL_EPOCH}" \
+      --epoch "${FINAL_STEP}" \
       --seed "${SEED}" \
       --eval_episodes_per_task 25 \
       --subgoal_eval_num_samples "${eval_n}" \
@@ -109,55 +96,25 @@ run_final_evals() {
   done
 }
 
-eval_results_complete() {
-  RUN_DIR="$1" FINAL_EPOCH="${FINAL_EPOCH}" \
-    "${PYTHON_BIN}" - <<'PY'
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))
-from flow_trl_sweep_common import eval_results_complete
-
-print('1' if eval_results_complete(os.environ['RUN_DIR'], epoch=int(os.environ['FINAL_EPOCH'])) else '0')
-PY
-}
-
-run_gamma_matches_config() {
-  CONFIG_PATH="$1" RUN_DIR="$2" \
-    "${PYTHON_BIN}" - <<'PY'
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))
-from flow_trl_sweep_common import run_gamma_matches_config
-
-print('1' if run_gamma_matches_config(
-    config_path=os.environ['CONFIG_PATH'],
-    run_dir=os.environ['RUN_DIR'],
-) else '0')
-PY
-}
-
-if ((${#configs[@]} == 0)); then
-  echo "No configs in ${CONFIG_DIR}" | tee -a "${MASTER_LOG}"
-  exit 1
+mode_label="train+final-eval"
+if [[ "${EVAL_ONLY}" == "1" ]]; then
+  mode_label="eval-only"
 fi
+echo "[$(date -Is)] ${LOG_TAG} start mode=${mode_label} GPU=${GPU_ID} seed=${SEED}" | tee -a "${MASTER_LOG}"
 
 for cfg in "${configs[@]}"; do
+  if [[ ! -f "${cfg}" ]]; then
+    echo "Missing config: ${cfg}" | tee -a "${MASTER_LOG}"
+    exit 1
+  fi
   base="$(basename "$cfg" .yaml)"
   env_name="$("${PYTHON_BIN}" -c "import yaml; print(yaml.safe_load(open('${cfg}'))['env_name'])")"
   run_dir="$(resolve_run_dir "${cfg}")"
 
   if [[ "${EVAL_ONLY}" != "1" ]]; then
-    if [[ -n "${run_dir}" ]] && [[ "$(eval_results_complete "${run_dir}")" == "1" ]] \
-        && [[ "$(run_gamma_matches_config "${cfg}" "${run_dir}")" == "1" ]]; then
+    if [[ -n "${run_dir}" ]] && [[ "$(eval_results_complete "${run_dir}")" == "1" ]]; then
       echo "[$(date -Is)] SKIP_COMPLETE ${base} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
       continue
-    fi
-    if [[ -n "${run_dir}" ]] && [[ "$(eval_results_complete "${run_dir}")" == "1" ]] \
-        && [[ "$(run_gamma_matches_config "${cfg}" "${run_dir}")" != "1" ]]; then
-      echo "[$(date -Is)] GAMMA_MISMATCH_RETRAIN ${base} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
-      run_dir=""
     fi
     if [[ -n "${run_dir}" ]]; then
       echo "[$(date -Is)] SKIP_TRAIN_INCOMPLETE_EVAL ${base} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
@@ -177,24 +134,17 @@ for cfg in "${configs[@]}"; do
   fi
 
   if [[ -z "${run_dir}" ]]; then
-    if [[ "${EVAL_ONLY}" == "1" ]]; then
-      echo "[$(date -Is)] SKIP_EVAL_NO_RUNDIR ${base} (no epoch=${FINAL_EPOCH} checkpoint)" | tee -a "${MASTER_LOG}"
-    else
-      echo "[$(date -Is)] TRAIN_DONE_NO_RUNDIR ${base}; skipping final eval" | tee -a "${MASTER_LOG}"
-    fi
+    echo "[$(date -Is)] SKIP_EVAL_NO_RUNDIR ${base}" | tee -a "${MASTER_LOG}"
     continue
   fi
-
   if [[ "$(eval_results_complete "${run_dir}")" == "1" ]]; then
     echo "[$(date -Is)] EVAL_ALREADY_COMPLETE ${base} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
     continue
   fi
-
   echo "[$(date -Is)] RESOLVED_RUNDIR ${base} run_dir=${run_dir}" | tee -a "${MASTER_LOG}"
   run_final_evals "${base}" "${run_dir}"
 done
 
 echo "[$(date -Is)] SUMMARIZE feval results" | tee -a "${MASTER_LOG}"
 "${PYTHON_BIN}" "${ROOT}/scripts/summarize_feval_results.py" | tee -a "${MASTER_LOG}"
-
-echo "[$(date -Is)] ${LOG_TAG} sweep complete mode=${mode_label} (${#configs[@]} configs)" | tee -a "${MASTER_LOG}"
+echo "[$(date -Is)] ${LOG_TAG} complete (${#configs[@]} configs)" | tee -a "${MASTER_LOG}"

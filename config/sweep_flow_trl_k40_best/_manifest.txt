@@ -1,0 +1,10 @@
+# 8 K=40 best-param Flow+TRL configs
+# Source params: docs/flow_trl_best_params.md
+config/sweep_flow_trl_k40_best/p3_k40_g1_w5_n1_en32.yaml
+config/sweep_flow_trl_k40_best/p4_k40_g5_w5_n1_en16.yaml
+config/sweep_flow_trl_k40_best/cs_k40_g10_w5_n1_en2.yaml
+config/sweep_flow_trl_k40_best/cd_k40_g10_w5_n1_en8.yaml
+config/sweep_flow_trl_k40_best/ct_k40_g10_w5_n1_en8.yaml
+config/sweep_flow_trl_k40_best/amm_k40_g3_w5_n1_en8.yaml
+config/sweep_flow_trl_k40_best/aml_k40_g10_w5_n1_en16.yaml
+config/sweep_flow_trl_k40_best/amg_k40_g3_w5_n1_en8.yaml

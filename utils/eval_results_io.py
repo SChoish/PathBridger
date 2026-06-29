@@ -9,27 +9,23 @@ from pathlib import Path
 from typing import Any
 
 
-def eval_score_type_tag(score_type: str | None) -> str:
-    """Filename suffix for non-default eval score types (empty keeps legacy paths)."""
-    st = str(score_type or 'transitive_ratio').lower()
-    if st in ('transitive_ratio', 'transitive', 'v_v_v', 'ratio', ''):
-        return ''
-    if st in ('goal_value', 'v_z_g', 'vzg'):
-        return '_score_goal_value'
-    return f'_score_{st}'
-
-
 def eval_result_path(
     run_dir: Path | str,
     *,
     epoch: int,
     eval_n: int,
-    score_type: str | None = None,
-    suffix: str = '',
+    subgoal_temperature: float | None = None,
 ) -> Path:
-    tag = eval_score_type_tag(score_type)
-    extra = f'_{suffix.strip()}' if str(suffix).strip() else ''
-    return Path(run_dir) / 'eval_results' / f'epoch{int(epoch)}_n{int(eval_n)}{tag}{extra}.json'
+    if subgoal_temperature is None:
+        return Path(run_dir) / 'eval_results' / f'epoch{int(epoch)}_n{int(eval_n)}.json'
+    temp_tag = _temp_tag(float(subgoal_temperature))
+    return Path(run_dir) / 'eval_results' / f'epoch{int(epoch)}_t{temp_tag}_n{int(eval_n)}.json'
+
+
+def _temp_tag(temperature: float) -> str:
+    if abs(temperature - round(temperature)) < 1e-9:
+        return str(int(round(temperature)))
+    return format(temperature, 'g').replace('.', 'p')
 
 
 def save_eval_results(
@@ -42,19 +38,34 @@ def save_eval_results(
     metrics: dict[str, Any],
     fg: dict[str, Any],
     root: dict[str, Any],
-    result_suffix: str = '',
+    subgoal_temperature: float | None = None,
 ) -> Path:
     run_dir = Path(run_dir)
     eval_n = int(subgoal_eval_num_samples)
-    idm_tasks = {
-        str(tid): float(metrics[f'eval_idm/task_{tid}/success_rate'])
-        for tid in task_ids
-        if f'eval_idm/task_{tid}/success_rate' in metrics
+    def _task_rates(prefix: str) -> dict[str, float]:
+        return {
+            str(tid): float(metrics[f'{prefix}/task_{tid}/success_rate'])
+            for tid in task_ids
+            if f'{prefix}/task_{tid}/success_rate' in metrics
+        }
+
+    idm_tasks = _task_rates('eval_idm')
+    actor_tasks = _task_rates('eval')
+    four_way_prefixes = (
+        'eval_flow_idm',
+        'eval_flow_actor',
+        'eval_spi_subgoal_idm',
+        'eval_spi_subgoal_actor',
+    )
+    four_way_means = {
+        prefix: float(metrics[f'{prefix}/success_rate_mean'])
+        for prefix in four_way_prefixes
+        if f'{prefix}/success_rate_mean' in metrics
     }
-    actor_tasks = {
-        str(tid): float(metrics[f'eval/task_{tid}/success_rate'])
-        for tid in task_ids
-        if f'eval/task_{tid}/success_rate' in metrics
+    four_way_tasks = {
+        prefix: _task_rates(prefix)
+        for prefix in four_way_prefixes
+        if any(f'{prefix}/task_{tid}/success_rate' in metrics for tid in task_ids)
     }
     dyn = root.get('dynamics', {})
     record: dict[str, Any] = {
@@ -64,18 +75,21 @@ def save_eval_results(
         'env_name': str(fg.get('env_name', '')),
         'epoch': int(epoch),
         'subgoal_eval_num_samples': eval_n,
-        'subgoal_eval_score_type': str(dyn.get('subgoal_eval_score_type', 'transitive_ratio')),
         'subgoal_num_samples_train': int(dyn.get('subgoal_num_samples', 0)),
         'subgoal_value_gap_scale': float(dyn.get('subgoal_value_gap_scale', 0.0)),
         'subgoal_value_weight_max': float(dyn.get('subgoal_value_weight_max', 0.0)),
-        'subgoal_flow_steps': int(dyn.get('subgoal_flow_steps', 0)),
-        'subgoal_temperature': float(dyn.get('subgoal_temperature', 1.0)),
+        'subgoal_temperature': float(
+            subgoal_temperature if subgoal_temperature is not None else dyn.get('subgoal_temperature', 1.0)
+        ),
         'eval_episodes_per_task': int(episodes_per_task),
+        'eval_budget': 'env_max_episode_steps',
         'eval_task_ids': [int(t) for t in task_ids],
         'idm_success_rate_mean': float(metrics.get('eval_idm/success_rate_mean', float('nan'))),
         'actor_success_rate_mean': float(metrics.get('eval/success_rate_mean', float('nan'))),
         'idm_task_success_rates': idm_tasks,
         'actor_task_success_rates': actor_tasks,
+        'four_way_success_rate_means': four_way_means,
+        'four_way_task_success_rates': four_way_tasks,
     }
     out_dir = run_dir / 'eval_results'
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -83,8 +97,7 @@ def save_eval_results(
         run_dir,
         epoch=epoch,
         eval_n=eval_n,
-        score_type=str(dyn.get('subgoal_eval_score_type', 'transitive_ratio')),
-        suffix=result_suffix,
+        subgoal_temperature=subgoal_temperature,
     )
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(record, f, indent=2)
@@ -100,6 +113,11 @@ def save_eval_results(
         'idm_tasks': ','.join(f'{k}:{v:.4f}' for k, v in sorted(idm_tasks.items())),
         'actor_tasks': ','.join(f'{k}:{v:.4f}' for k, v in sorted(actor_tasks.items())),
     }
+    for prefix in four_way_prefixes:
+        row[f'{prefix}_mean'] = four_way_means.get(prefix, '')
+        row[f'{prefix}_tasks'] = ','.join(
+            f'{k}:{v:.4f}' for k, v in sorted(four_way_tasks.get(prefix, {}).items())
+        )
     write_header = not csv_path.is_file()
     with open(csv_path, 'a', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))

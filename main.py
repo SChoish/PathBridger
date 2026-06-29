@@ -45,6 +45,10 @@ FLAGS = flags.FLAGS
 _DEFAULT_HORIZON = 25
 
 
+def _subgoal_spi_enabled_config(config: Any) -> bool:
+    return bool(config.get('subgoal_spi_enabled', False)) or str(config.get('subgoal_distribution', '')).lower() == 'deterministic_spi'
+
+
 def _impl_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -101,12 +105,17 @@ flags.DEFINE_string(
     'Optional dataset directory override. If this points to a sharded OGBench directory, load and concatenate all '
     'train/val NPZ shards from there.',
 )
-flags.DEFINE_string('resume_run_dir', '', 'Existing run dir: resume from checkpoint or reuse path (see resume_epoch).')
+flags.DEFINE_string('resume_run_dir', '', 'Existing run dir: resume from checkpoint or reuse path (see resume_step).')
+flags.DEFINE_integer(
+    'resume_step',
+    -1,
+    'With resume_run_dir: load params_<step>.pkl and continue if >= 0. '
+    '-1 falls back to deprecated resume_epoch.',
+)
 flags.DEFINE_integer(
     'resume_epoch',
     0,
-    'With resume_run_dir: load params_<epoch>.pkl and continue if >0; if 0, reuse that run_dir from epoch 1 '
-    'without restoring (for empty/stale dirs). Must be 0 when resume_run_dir is empty.',
+    'Deprecated alias for resume_step; checkpoint suffix is now a gradient step.',
 )
 flags.DEFINE_boolean(
     'resume_use_run_snapshot_config',
@@ -118,9 +127,13 @@ flags.DEFINE_boolean(
 flags.DEFINE_string('run_group', 'Debug', 'W&B group.')
 flags.DEFINE_integer('seed', 0, 'Seed.')
 flags.DEFINE_string('env_name', 'antmaze-medium-navigate-v0', 'OGBench env / dataset name.')
-flags.DEFINE_integer('train_epochs', 600, 'Training epochs.')
-flags.DEFINE_integer('log_every_n_epochs', 10, 'Log interval (epochs).')
-flags.DEFINE_integer('save_every_n_epochs', 100, 'Checkpoint interval.')
+flags.DEFINE_integer('train_steps', 0, 'Total gradient steps. If <= 0, use train_epochs * steps_per_epoch.')
+flags.DEFINE_integer('log_every_n_steps', 10000, 'Log interval in gradient steps. If <= 0, use log_every_n_epochs * steps_per_epoch.')
+flags.DEFINE_integer('save_every_n_steps', 0, 'Checkpoint interval in gradient steps. If <= 0, use save_every_n_epochs * steps_per_epoch.')
+flags.DEFINE_integer('eval_every_n_steps', 0, 'Non-final eval interval in gradient steps. If <= 0, use eval_freq * steps_per_epoch.')
+flags.DEFINE_integer('train_epochs', 600, 'Deprecated: converted to train_steps when train_steps <= 0.')
+flags.DEFINE_integer('log_every_n_epochs', 10, 'Deprecated: converted to log_every_n_steps when log_every_n_steps <= 0.')
+flags.DEFINE_integer('save_every_n_epochs', 100, 'Deprecated: converted to save_every_n_steps when save_every_n_steps <= 0.')
 flags.DEFINE_boolean('use_wandb', False, 'W&B.')
 flags.DEFINE_boolean('use_tqdm', False, 'tqdm over epochs.')
 flags.DEFINE_integer('batch_size', 1024, 'Shared batch size for dynamics, critic, and actor.')
@@ -138,22 +151,21 @@ flags.DEFINE_boolean(
 flags.DEFINE_integer(
     'eval_freq',
     100,
-    'Run validation loss and env evaluation every N epochs; <= 0 disables.',
+    'Deprecated: converted to eval_every_n_steps when eval_every_n_steps <= 0; <= 0 disables non-final eval.',
 )
 flags.DEFINE_string('eval_task_ids', '1,2,3,4,5', 'Comma-separated OGBench task ids for env evaluation.')
 flags.DEFINE_integer('eval_episodes_per_task', 10, 'Number of env evaluation episodes to run for each task id.')
 flags.DEFINE_integer(
     'final_eval_episodes_per_task',
     25,
-    'If > 0, override eval_episodes_per_task for the final training epoch evaluation only.',
+    'If > 0, override eval_episodes_per_task for the final training step evaluation only.',
 )
 flags.DEFINE_string(
     'final_eval_subgoal_eval_num_samples',
     '',
-    'Comma-separated subgoal_eval_num_samples for final-epoch env eval only (e.g. "1,2,4,8,16"). '
+    'Comma-separated subgoal_eval_num_samples for final-step env eval only (e.g. "1,2,4,8,16"). '
     'Empty = single eval using dynamics.subgoal_eval_num_samples.',
 )
-flags.DEFINE_integer('eval_max_chunks', 200, 'Maximum action chunks to execute per evaluation episode.')
 flags.DEFINE_integer(
     'eval_video_episodes_per_task',
     0,
@@ -188,6 +200,23 @@ def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
     return max(1, math.ceil(dataset_size / batch_size))
 
 
+def _resolve_total_steps(steps_per_epoch: int) -> int:
+    train_steps = int(FLAGS.train_steps)
+    if train_steps <= 0:
+        train_steps = int(FLAGS.train_epochs) * int(steps_per_epoch)
+    if train_steps < 1:
+        raise ValueError(f'train_steps must resolve to >= 1, got {train_steps}.')
+    return train_steps
+
+
+def _resolve_step_interval(step_value: int, epoch_value: int, steps_per_epoch: int, *, allow_disable: bool = False) -> int:
+    if int(step_value) > 0:
+        return int(step_value)
+    if int(epoch_value) > 0:
+        return int(epoch_value) * int(steps_per_epoch)
+    return 0 if allow_disable else int(steps_per_epoch)
+
+
 def _load_yaml(path: str) -> dict:
     with open(path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f) or {}
@@ -204,6 +233,7 @@ def _resolve_resume_snapshot_config_path(run_dir: str) -> str | None:
     fg = dict(snap.get('flags') or {})
     skip = {
         'resume_run_dir',
+        'resume_step',
         'resume_epoch',
         'run_config',
         'runs_root',
@@ -258,6 +288,12 @@ def _apply_yaml_to_flags(data: dict) -> tuple[dict, dict, dict]:
     if 'forward_bridge' in data:
         dynamics_updates = dynamics_updates or {}
         dynamics_updates.setdefault('forward_bridge', data.pop('forward_bridge'))
+    # Deprecated: eval now always runs to the environment's max episode length.
+    data.pop('eval_max_chunks', None)
+    # When the step-based eval interval is explicitly configured, do not let
+    # the legacy default eval_freq=100 re-enable intermediate eval.
+    if 'eval_every_n_steps' in data and 'eval_freq' not in data and not _argv_sets_flag('eval_freq'):
+        data['eval_freq'] = 0
 
     # Flatten ``dynamics.forward_bridge: { mode, noise_scale, ... }`` into the
     # individual ``forward_bridge_*`` keys recognised by the dynamics config.
@@ -275,10 +311,10 @@ def _apply_yaml_to_flags(data: dict) -> tuple[dict, dict, dict]:
     return dynamics_updates or {}, critic_updates or {}, actor_updates or {}
 
 
-def _setup_file_logger(run_dir: str, *, resume_epoch: int = 0) -> tuple[logging.Logger, str]:
-    if resume_epoch > 0:
+def _setup_file_logger(run_dir: str, *, resume_step: int = 0) -> tuple[logging.Logger, str]:
+    if resume_step > 0:
         ts = time.strftime('%Y%m%d_%H%M%S')
-        log_name = f'run_resume_from{int(resume_epoch)}_{ts}.log'
+        log_name = f'run_resume_from_step{int(resume_step)}_{ts}.log'
     else:
         log_name = 'run.log'
     log_path = os.path.join(run_dir, log_name)
@@ -341,7 +377,7 @@ def _emit_metric_means(metrics: dict[str, float], prefix: str, metric_sums: dict
     # Single device→host transfer for the whole tree avoids one sync per key.
     host_sums = jax.device_get(metric_sums)
     for key, total in host_sums.items():
-        metrics[f'{prefix}/{key}_epoch_mean'] = float(total) * inv
+        metrics[f'{prefix}/{key}_interval_mean'] = float(total) * inv
 
 
 def _to_host_metrics(prefix: str, info: dict | None) -> dict[str, float]:
@@ -362,50 +398,50 @@ def _emit_time_sums(metrics: dict[str, float], prefix: str, time_sums: dict[str,
     if count < 1:
         return
     for key, total in time_sums.items():
-        metrics[f'{prefix}/{key}_epoch_sec'] = float(total)
+        metrics[f'{prefix}/{key}_interval_sec'] = float(total)
         metrics[f'{prefix}/{key}_step_sec'] = float(total / count)
 
 
-def _format_epoch_log(metrics: dict[str, float]) -> str:
+def _format_step_log(metrics: dict[str, float]) -> str:
     parts = [
-        f"dyn={metrics['train/dynamics/phase1/loss_epoch_mean']:.6f}",
-        f"critic={metrics['train/critic/total_loss_epoch_mean']:.6f}",
+        f"dyn={metrics['train/dynamics/phase1/loss_interval_mean']:.6f}",
+        f"critic={metrics['train/critic/total_loss_interval_mean']:.6f}",
     ]
-    actor_key = 'train/actor/spi_actor/actor_loss_epoch_mean'
+    actor_key = 'train/actor/spi_actor/actor_loss_interval_mean'
     if actor_key in metrics:
         parts.append(f"actor={metrics[actor_key]:.6f}")
     else:
         parts.append('actor=disabled')
-    parts.append(f"coupling={metrics['train/coupling/critic_score_mean_epoch_mean']:.6f}")
+    parts.append(f"coupling={metrics['train/coupling/critic_score_mean_interval_mean']:.6f}")
 
     detail_keys = [
-        ('dyn_g', 'train/dynamics/phase1/loss_dynamics_epoch_mean'),
-        ('dyn_path', 'train/dynamics/phase1/loss_path_step_epoch_mean'),
-        ('dyn_roll', 'train/dynamics/phase1/loss_roll_epoch_mean'),
-        ('dyn_sub', 'train/dynamics/phase1/loss_subgoal_epoch_mean'),
-        ('dyn_idm', 'train/dynamics/phase1/loss_idm_epoch_mean'),
-        ('fb_path', 'train/dynamics/forward_bridge/loss_path_interior_epoch_mean'),
-        ('fb_next', 'train/dynamics/forward_bridge/loss_path_next_epoch_mean'),
-        ('critic_chunk', 'train/critic/chunk_critic/critic_loss_epoch_mean'),
-        ('critic_distill', 'train/critic/action_critic/distill_loss_epoch_mean'),
-        ('critic_value', 'train/critic/action_critic/value_loss_epoch_mean'),
-        ('actor_q', 'train/actor/spi_actor/q_mean_epoch_mean'),
-        ('actor_prox', 'train/actor/spi_actor/prox_mean_epoch_mean'),
-        ('actor_entropy', 'train/actor/spi_actor/rho_entropy_epoch_mean'),
-        ('t_data', 'time/data_epoch_sec'),
-        ('t_build', 'time/build_batches_epoch_sec'),
-        ('t_prop', 'time/build/proposal_build_epoch_sec'),
-        ('t_sg', 'time/build/predict_subgoal_epoch_sec'),
-        ('t_mean', 'time/build/mean_ode_epoch_sec'),
-        ('t_plan', 'time/build/plan_det_epoch_sec'),
-        ('t_sample', 'time/build/sample_plan_epoch_sec'),
-        ('t_idm', 'time/build/idm_epoch_sec'),
-        ('t_score', 'time/build/score_epoch_sec'),
-        ('t_dyn', 'time/dynamics_update_epoch_sec'),
-        ('t_critic', 'time/critic_update_epoch_sec'),
-        ('t_actor_rescore', 'time/actor_rescore_epoch_sec'),
-        ('t_actor', 'time/actor_update_epoch_sec'),
-        ('t_epoch', 'time/epoch_compute_sec'),
+        ('dyn_g', 'train/dynamics/phase1/loss_dynamics_interval_mean'),
+        ('dyn_path', 'train/dynamics/phase1/loss_path_step_interval_mean'),
+        ('dyn_roll', 'train/dynamics/phase1/loss_roll_interval_mean'),
+        ('dyn_sub', 'train/dynamics/phase1/loss_subgoal_interval_mean'),
+        ('dyn_idm', 'train/dynamics/phase1/loss_idm_interval_mean'),
+        ('fb_path', 'train/dynamics/forward_bridge/loss_path_interior_interval_mean'),
+        ('fb_next', 'train/dynamics/forward_bridge/loss_path_next_interval_mean'),
+        ('critic_chunk', 'train/critic/chunk_critic/critic_loss_interval_mean'),
+        ('critic_distill', 'train/critic/action_critic/distill_loss_interval_mean'),
+        ('critic_value', 'train/critic/action_critic/value_loss_interval_mean'),
+        ('actor_q', 'train/actor/spi_actor/q_mean_interval_mean'),
+        ('actor_prox', 'train/actor/spi_actor/prox_mean_interval_mean'),
+        ('actor_entropy', 'train/actor/spi_actor/rho_entropy_interval_mean'),
+        ('t_data', 'time/data_interval_sec'),
+        ('t_build', 'time/build_batches_interval_sec'),
+        ('t_prop', 'time/build/proposal_build_interval_sec'),
+        ('t_sg', 'time/build/predict_subgoal_interval_sec'),
+        ('t_mean', 'time/build/mean_ode_interval_sec'),
+        ('t_plan', 'time/build/plan_det_interval_sec'),
+        ('t_sample', 'time/build/sample_plan_interval_sec'),
+        ('t_idm', 'time/build/idm_interval_sec'),
+        ('t_score', 'time/build/score_interval_sec'),
+        ('t_dyn', 'time/dynamics_update_interval_sec'),
+        ('t_critic', 'time/critic_update_interval_sec'),
+        ('t_actor_rescore', 'time/actor_rescore_interval_sec'),
+        ('t_actor', 'time/actor_update_interval_sec'),
+        ('t_interval', 'time/interval_compute_sec'),
     ]
     for label, key in detail_keys:
         if key in metrics:
@@ -973,12 +1009,18 @@ def _idm_action_chunk(
 def _log_eval_run_logger(
     run_logger: logging.Logger,
     *,
-    epoch: int,
+    step: int,
     eval_task_ids: tuple[int, ...],
     metrics: dict[str, Any],
     header: str,
 ) -> None:
-    run_logger.info('%s epoch=%d num_tasks=%d stat_episodes_per_task=%d', header, epoch, int(metrics.get('eval/num_tasks', 0.0)), int(metrics.get('eval/episodes_per_task', 0.0)))
+    run_logger.info(
+        '%s step=%d num_tasks=%d stat_episodes_per_task=%d',
+        header,
+        step,
+        int(metrics.get('eval/num_tasks', 0.0)),
+        int(metrics.get('eval/episodes_per_task', 0.0)),
+    )
     run_logger.info('[IDM POLICY] primary_success=any_step_info_success')
     run_logger.info('idm env_success_rate_mean=%.2f', metrics.get('eval_idm/success_rate_mean', float('nan')))
     for task_id in eval_task_ids:
@@ -991,6 +1033,20 @@ def _log_eval_run_logger(
         task_key = f'eval/task_{task_id}/success_rate'
         if task_key in metrics:
             run_logger.info('actor task_%d env=%.2f', task_id, metrics[task_key])
+    for prefix, label in (
+        ('eval_flow_idm', 'flow+idm'),
+        ('eval_flow_actor', 'flow+actor'),
+        ('eval_spi_subgoal_idm', 'spi_subgoal+idm'),
+        ('eval_spi_subgoal_actor', 'spi_subgoal+actor'),
+    ):
+        mean_key = f'{prefix}/success_rate_mean'
+        if mean_key not in metrics:
+            continue
+        run_logger.info('[%s] env_success_rate_mean=%.2f', label, metrics[mean_key])
+        for task_id in eval_task_ids:
+            task_key = f'{prefix}/task_{task_id}/success_rate'
+            if task_key in metrics:
+                run_logger.info('%s task_%d env=%.2f', label, task_id, metrics[task_key])
 
 
 def _evaluate_env_tasks(
@@ -1003,7 +1059,6 @@ def _evaluate_env_tasks(
     critic_agent: Any | None = None,
     task_ids: tuple[int, ...],
     episodes_per_task: int,
-    max_chunks: int,
     video_episodes_per_task: int = 0,
     video_frame_skip: int = 4,
     video_fps: int = 15,
@@ -1018,8 +1073,6 @@ def _evaluate_env_tasks(
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     actor_horizon = int(actor_config['actor_chunk_horizon'])
     idm_horizon = int(critic_config['action_chunk_horizon'])
-    actor_task_successes: list[float] = []
-    idm_task_successes: list[float] = []
     metrics: dict[str, Any] = {}
     wandb_media: dict[str, Any] = {}
 
@@ -1037,8 +1090,40 @@ def _evaluate_env_tasks(
     # 'sample' and 'best_of_n_goal_l2' do not need a critic; 'best_of_n_value' does.
     use_eval_bon = eval_selection in ('best_of_n_value', 'best_of_n_goal_l2', 'sample')
     eval_seed_base = int(dynamics_agent.config.get('subgoal_eval_seed', 0))
+    eval_four_way = _subgoal_spi_enabled_config(dynamics_agent.config)
+    primary_subgoal_source = 'spi' if eval_four_way else 'flow'
+    variants = [
+        ('flow', 'idm', 'eval_flow_idm'),
+        ('flow', 'actor', 'eval_flow_actor'),
+    ]
+    if eval_four_way:
+        variants.extend(
+            [
+                ('spi', 'idm', 'eval_spi_subgoal_idm'),
+                ('spi', 'actor', 'eval_spi_subgoal_actor'),
+            ]
+        )
+    task_successes_by_key: dict[str, list[float]] = {metric_key: [] for _, _, metric_key in variants}
 
-    def _eval_subgoal(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
+    def _eval_subgoal(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int, source: str) -> np.ndarray:
+        if source == 'flow' and eval_four_way:
+            rng = jax.random.PRNGKey(eval_seed_base + int(ep_ix)) if use_eval_bon else None
+            pred = dynamics_agent.infer_proposal_subgoal_for_eval(
+                jnp.asarray(obs, dtype=jnp.float32),
+                jnp.asarray(goal, dtype=jnp.float32),
+                critic_agent=critic_agent,
+                rng=rng,
+            )
+            return np.asarray(pred, dtype=np.float32).reshape(-1)
+        if source == 'spi' and eval_four_way:
+            rng = jax.random.PRNGKey(eval_seed_base + int(ep_ix)) if use_eval_bon else None
+            pred = dynamics_agent.infer_subgoal_for_eval(
+                jnp.asarray(obs, dtype=jnp.float32),
+                jnp.asarray(goal, dtype=jnp.float32),
+                critic_agent=critic_agent,
+                rng=rng,
+            )
+            return np.asarray(pred, dtype=np.float32).reshape(-1)
         if use_eval_bon:
             rng = jax.random.PRNGKey(eval_seed_base + int(ep_ix))
             pred = dynamics_agent.infer_subgoal_for_eval(
@@ -1053,100 +1138,88 @@ def _evaluate_env_tasks(
             dtype=np.float32,
         ).reshape(-1)
 
-    def _actor_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
+    def _actor_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int, source: str) -> np.ndarray:
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
-            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix)
+            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix, source=source)
         return np.asarray(actor_agent.sample_actions(obs, pred), dtype=np.float32).reshape(actor_horizon, -1)
 
-    def _idm_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
+    def _idm_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int, source: str) -> np.ndarray:
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
-            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix)
+            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix, source=source)
         return _idm_action_chunk(dynamics_agent, obs, pred, idm_horizon)
 
     for task_id in task_ids:
-        actor_episode_successes: list[float] = []
-        idm_episode_successes: list[float] = []
+        episode_successes_by_key: dict[str, list[float]] = {metric_key: [] for _, _, metric_key in variants}
 
         for ep_ix in range(total_eps):
             should_render = ep_ix >= num_eval
             count_stats = ep_ix < num_eval
             render_goal = bool(should_render)
-            ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=render_goal))
-            if 'goal' not in info:
-                raise RuntimeError(f'Env reset(task_id={task_id}) did not provide info["goal"].')
-            obs = np.asarray(ob, dtype=np.float32).reshape(-1)
-            goal = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
-            goal_frame = info.get('goal_rendered')
-            if goal_frame is not None:
-                goal_frame = np.asarray(goal_frame, dtype=np.uint8)
-
             record_wb = bool(wandb_enabled and should_render and num_video > 0 and ep_ix == num_eval)
-            actor_buf: list[np.ndarray] = [] if record_wb else []
 
-            ok_env = rollout_chunked_eval_episode(
-                env,
-                obs,
-                goal,
-                low,
-                high,
-                max_chunks,
-                sample_action_chunk=lambda o, g: _actor_chunk(o, g, ep_ix=ep_ix),
-                render_buf=actor_buf if record_wb else None,
-                goal_frame=goal_frame,
-                should_render=bool(record_wb),
-                video_frame_skip=video_frame_skip,
-            )
-            if count_stats:
-                actor_episode_successes.append(1.0 if ok_env else 0.0)
-            if record_wb and actor_buf:
-                actor_video_by_task[int(task_id)] = np.stack(actor_buf, axis=0)
+            for subgoal_source, policy, metric_key in variants:
+                ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=render_goal))
+                if 'goal' not in info:
+                    raise RuntimeError(f'Env reset(task_id={task_id}) did not provide info["goal"].')
+                obs = np.asarray(ob, dtype=np.float32).reshape(-1)
+                goal = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+                goal_frame = info.get('goal_rendered')
+                if goal_frame is not None:
+                    goal_frame = np.asarray(goal_frame, dtype=np.uint8)
 
-            ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=render_goal))
-            if 'goal' not in info:
-                raise RuntimeError(f'Env reset(task_id={task_id}) did not provide info["goal"].')
-            obs = np.asarray(ob, dtype=np.float32).reshape(-1)
-            goal = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
-            goal_frame = info.get('goal_rendered')
-            if goal_frame is not None:
-                goal_frame = np.asarray(goal_frame, dtype=np.uint8)
+                is_primary_video = subgoal_source == primary_subgoal_source
+                buf: list[np.ndarray] = [] if record_wb and is_primary_video else []
+                if policy == 'actor':
+                    sampler = lambda o, g, source=subgoal_source: _actor_chunk(o, g, ep_ix=ep_ix, source=source)
+                else:
+                    sampler = lambda o, g, source=subgoal_source: _idm_chunk(o, g, ep_ix=ep_ix, source=source)
+                ok_env = rollout_chunked_eval_episode(
+                    env,
+                    obs,
+                    goal,
+                    low,
+                    high,
+                    sample_action_chunk=sampler,
+                    render_buf=buf if record_wb and is_primary_video else None,
+                    goal_frame=goal_frame,
+                    should_render=bool(record_wb and is_primary_video),
+                    video_frame_skip=video_frame_skip,
+                )
+                if count_stats:
+                    episode_successes_by_key[metric_key].append(1.0 if ok_env else 0.0)
+                if record_wb and is_primary_video and buf:
+                    if policy == 'actor':
+                        actor_video_by_task[int(task_id)] = np.stack(buf, axis=0)
+                    else:
+                        idm_video_by_task[int(task_id)] = np.stack(buf, axis=0)
 
-            idm_buf: list[np.ndarray] = [] if record_wb else []
-            ok_env_i = rollout_chunked_eval_episode(
-                env,
-                obs,
-                goal,
-                low,
-                high,
-                max_chunks,
-                sample_action_chunk=lambda o, g: _idm_chunk(o, g, ep_ix=ep_ix),
-                render_buf=idm_buf if record_wb else None,
-                goal_frame=goal_frame,
-                should_render=bool(record_wb),
-                video_frame_skip=video_frame_skip,
-            )
-            if count_stats:
-                idm_episode_successes.append(1.0 if ok_env_i else 0.0)
-            if record_wb and idm_buf:
-                idm_video_by_task[int(task_id)] = np.stack(idm_buf, axis=0)
+        for _source, _policy, metric_key in variants:
+            task_success_rate = float(np.mean(episode_successes_by_key[metric_key]))
+            metrics[f'{metric_key}/task_{task_id}/success_rate'] = task_success_rate
+            task_successes_by_key[metric_key].append(task_success_rate)
 
-        task_success_rate = float(np.mean(actor_episode_successes))
-        metrics[f'eval/task_{task_id}/success_rate'] = task_success_rate
-        metrics[f'evaluation/task_{task_id}_success'] = task_success_rate
-        actor_task_successes.append(task_success_rate)
-
-        idm_task_success_rate = float(np.mean(idm_episode_successes))
+        primary_actor_key = 'eval_spi_subgoal_actor' if eval_four_way else 'eval_flow_actor'
+        primary_idm_key = 'eval_spi_subgoal_idm' if eval_four_way else 'eval_flow_idm'
+        actor_task_success_rate = metrics[f'{primary_actor_key}/task_{task_id}/success_rate']
+        idm_task_success_rate = metrics[f'{primary_idm_key}/task_{task_id}/success_rate']
+        metrics[f'eval/task_{task_id}/success_rate'] = actor_task_success_rate
+        metrics[f'evaluation/task_{task_id}_success'] = actor_task_success_rate
         metrics[f'eval_idm/task_{task_id}/success_rate'] = idm_task_success_rate
         metrics[f'evaluation/idm_task_{task_id}_success'] = idm_task_success_rate
-        idm_task_successes.append(idm_task_success_rate)
 
-    metrics['eval/success_rate_mean'] = float(np.mean(actor_task_successes))
-    metrics['eval_idm/success_rate_mean'] = float(np.mean(idm_task_successes))
+    for _source, _policy, metric_key in variants:
+        metrics[f'{metric_key}/success_rate_mean'] = float(np.mean(task_successes_by_key[metric_key]))
+    primary_actor_key = 'eval_spi_subgoal_actor' if eval_four_way else 'eval_flow_actor'
+    primary_idm_key = 'eval_spi_subgoal_idm' if eval_four_way else 'eval_flow_idm'
+    metrics['eval/success_rate_mean'] = metrics[f'{primary_actor_key}/success_rate_mean']
+    metrics['eval_idm/success_rate_mean'] = metrics[f'{primary_idm_key}/success_rate_mean']
     metrics['evaluation/overall_success'] = metrics['eval/success_rate_mean']
     metrics['evaluation/overall_idm_success'] = metrics['eval_idm/success_rate_mean']
+    metrics['eval/four_way_enabled'] = float(1.0 if eval_four_way else 0.0)
     metrics['eval/num_tasks'] = float(len(task_ids))
     metrics['eval/episodes_per_task'] = float(num_eval)
     metrics['eval/video_episodes_per_task'] = float(num_video)
@@ -1166,12 +1239,14 @@ def _evaluate_env_tasks(
 def main(_):
     impl = _impl_dir()
     resume_run_dir = FLAGS.resume_run_dir.strip()
-    resume_epoch = int(FLAGS.resume_epoch)
-    if resume_epoch < 0:
-        raise ValueError('resume_epoch must be >= 0.')
-    if resume_epoch > 0 and not resume_run_dir:
-        raise ValueError('resume_epoch > 0 requires resume_run_dir.')
-    restoring_ckpt = bool(resume_run_dir and resume_epoch > 0)
+    resume_step = int(FLAGS.resume_step)
+    if resume_step < 0:
+        resume_step = int(FLAGS.resume_epoch)
+    if resume_step < 0:
+        raise ValueError('resume_step must be >= 0.')
+    if resume_step > 0 and not resume_run_dir:
+        raise ValueError('resume_step > 0 requires resume_run_dir.')
+    restoring_ckpt = bool(resume_run_dir and resume_step > 0)
 
     cfg_path = FLAGS.run_config.strip() or _default_yaml_path()
     resume_snapshot_path: str | None = None
@@ -1228,7 +1303,7 @@ def main(_):
     if FLAGS.use_wandb:
         setup_wandb(project='OGBench', group=FLAGS.run_group, name=exp_name)
 
-    run_logger, run_log_path = _setup_file_logger(run_dir, resume_epoch=resume_epoch if restoring_ckpt else 0)
+    run_logger, run_log_path = _setup_file_logger(run_dir, resume_step=resume_step if restoring_ckpt else 0)
     run_logger.info('run_dir=%s', run_dir)
     run_logger.info('log_path=%s', run_log_path)
     if resume_snapshot_path is not None:
@@ -1301,19 +1376,27 @@ def main(_):
     critic_agent = _create_critic_agent(FLAGS.seed, ex_critic, critic_config)
     actor_agent = _create_actor_agent(FLAGS.seed, ex_dynamics, actor_config)
     if restoring_ckpt:
-        dynamics_agent = restore_agent(dynamics_agent, dynamics_ckpt_dir, resume_epoch)
-        critic_agent = restore_agent(critic_agent, critic_ckpt_dir, resume_epoch)
-        actor_agent = restore_agent(actor_agent, actor_ckpt_dir, resume_epoch)
+        dynamics_agent = restore_agent(dynamics_agent, dynamics_ckpt_dir, resume_step)
+        critic_agent = restore_agent(critic_agent, critic_ckpt_dir, resume_step)
+        actor_agent = restore_agent(actor_agent, actor_ckpt_dir, resume_step)
 
     batch_size = int(dynamics_config['batch_size'])
     spe = _steps_per_epoch(len(common_valid_starts), batch_size)
     measure_timing = bool(FLAGS.measure_timing)
-    eval_freq = int(FLAGS.eval_freq)
+    train_steps = _resolve_total_steps(spe)
+    log_every_steps = _resolve_step_interval(
+        int(FLAGS.log_every_n_steps), int(FLAGS.log_every_n_epochs), spe
+    )
+    save_every_steps = _resolve_step_interval(
+        int(FLAGS.save_every_n_steps), int(FLAGS.save_every_n_epochs), spe
+    )
+    eval_every_steps = _resolve_step_interval(
+        int(FLAGS.eval_every_n_steps), int(FLAGS.eval_freq), spe, allow_disable=True
+    )
     eval_task_ids = parse_int_list(FLAGS.eval_task_ids)
     eval_episodes_per_task = max(1, int(FLAGS.eval_episodes_per_task))
     final_eval_episodes_per_task = max(0, int(FLAGS.final_eval_episodes_per_task))
     final_eval_n_values = parse_int_list(str(FLAGS.final_eval_subgoal_eval_num_samples))
-    eval_max_chunks = max(1, int(FLAGS.eval_max_chunks))
     run_logger.info(
         'shared_valid_starts=%d batch_size=%d steps_per_epoch=%d dyn_h=%d critic_h=%d actor_h=%d',
         len(common_valid_starts),
@@ -1324,12 +1407,16 @@ def main(_):
         int(actor_config.get('actor_chunk_horizon', 0)),
     )
     run_logger.info(
-        'run_setup env=%s seed=%d train_epochs=%d start_epoch=%d save_every=%d async_prefetch=%s action_dim=%d',
+        'run_setup env=%s seed=%d train_steps=%d start_step=%d log_every_steps=%d save_every_steps=%d '
+        'legacy_train_epochs=%d steps_per_epoch=%d async_prefetch=%s action_dim=%d',
         FLAGS.env_name,
         int(FLAGS.seed),
+        int(train_steps),
+        int(resume_step + 1 if restoring_ckpt else 1),
+        int(log_every_steps),
+        int(save_every_steps),
         int(FLAGS.train_epochs),
-        int(resume_epoch + 1 if restoring_ckpt else 1),
-        int(FLAGS.save_every_n_epochs),
+        int(spe),
         bool(FLAGS.async_prefetch),
         action_dim,
     )
@@ -1346,8 +1433,9 @@ def main(_):
         float(dynamics_config.get('dynamics_beta_max', 0.0)),
     )
     run_logger.info(
-        'subgoal mode=%s stochastic_loss=%s target_mode=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_style=%s value_expectile=%.4g value_gap_scale=%.4g value_weight_max=%.4g use_mean_for_actor_goal=%s',
+        'subgoal distribution=%s spi_enabled=%s stochastic_loss=%s target_mode=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_style=%s value_expectile=%.4g value_gap_scale=%.4g value_weight_max=%.4g use_mean_for_actor_goal=%s',
         str(dynamics_config.get('subgoal_distribution', '')),
+        _subgoal_spi_enabled_config(dynamics_config),
         str(dynamics_config.get('subgoal_stochastic_loss', 'mse')),
         str(dynamics_config.get('subgoal_target_mode', 'absolute')),
         int(dynamics_config.get('subgoal_steps', 0)),
@@ -1369,6 +1457,17 @@ def main(_):
         int(dynamics_config.get('subgoal_eval_num_samples', 1)),
         str(final_eval_n_values) if final_eval_n_values else 'off',
         bool(dynamics_config.get('subgoal_eval_include_zero_candidate', True)),
+    )
+    run_logger.info(
+        'subgoal_spi proposal=%s samples=%d beta=%.4g tau=%.4g energy_norm_eps=%.4g include_mean=%s loss_w=%.4g proposal_loss_w=%.4g',
+        str(dynamics_config.get('subgoal_spi_proposal_distribution', 'flow')),
+        int(dynamics_config.get('subgoal_spi_num_samples', 0)),
+        float(dynamics_config.get('subgoal_spi_beta', 0.0)),
+        float(dynamics_config.get('subgoal_spi_tau', 0.0)),
+        float(dynamics_config.get('subgoal_spi_energy_norm_eps', 0.0)),
+        bool(dynamics_config.get('subgoal_spi_include_mean_candidate', True)),
+        float(dynamics_config.get('subgoal_spi_loss_weight', 0.0)),
+        float(dynamics_config.get('subgoal_spi_proposal_loss_weight', 0.0)),
     )
     run_logger.info(
         'planner_sampling plan_noise_scale=%.4g forward_bridge_mode=%s forward_bridge_use_path_loss=%s path_loss_weight=%.4g rollout_horizon=%d rollout_loss_weight=%.4g',
@@ -1396,13 +1495,14 @@ def main(_):
         float(critic_config.get('discount', 0.0)),
     )
     run_logger.info(
-        'eval eval_freq=%d eval_tasks=%s eval_episodes=%d final_eval_episodes=%d eval_max_chunks=%d '
-        'video_episodes_per_task=%d video_frame_skip=%d primary_success=any_step_info_success',
-        eval_freq,
+        'eval eval_every_steps=%d legacy_eval_freq=%d eval_tasks=%s eval_episodes=%d final_eval_episodes=%d '
+        'env_max_episode_steps=%d video_episodes_per_task=%d video_frame_skip=%d primary_success=any_step_info_success',
+        eval_every_steps,
+        int(FLAGS.eval_freq),
         ','.join(str(x) for x in eval_task_ids),
         eval_episodes_per_task,
         final_eval_episodes_per_task,
-        eval_max_chunks,
+        _env_max_episode_steps(env),
         int(FLAGS.eval_video_episodes_per_task),
         int(FLAGS.eval_video_frame_skip),
     )
@@ -1411,10 +1511,10 @@ def main(_):
     first_time = time.time()
     last_log = time.time()
 
-    start_epoch = resume_epoch + 1 if restoring_ckpt else 1
-    epoch_iter = range(start_epoch, FLAGS.train_epochs + 1)
+    start_step = resume_step + 1 if restoring_ckpt else 1
+    step_iter = range(start_step, train_steps + 1)
     if FLAGS.use_tqdm:
-        epoch_iter = tqdm.tqdm(epoch_iter, smoothing=0.1, dynamic_ncols=True)
+        step_iter = tqdm.tqdm(step_iter, smoothing=0.1, dynamic_ncols=True)
 
     # Async batch prefetch: a single worker thread overlaps host-side numpy
     # slicing for batch N+1 with GPU work for batch N. Single-worker
@@ -1438,270 +1538,282 @@ def main(_):
 
     next_batch_future: Future | None = _submit_prefetch() if prefetch_pool is not None else None
 
-    for epoch in epoch_iter:
+    data_time = 0.0
+    build_time = 0.0
+    build_detail_times = {}
+    dynamics_time = 0.0
+    critic_time = 0.0
+    actor_rescore_time = 0.0
+    actor_time = 0.0
+    interval_compute_time = 0.0
+    dynamics_metric_sums = {}
+    critic_metric_sums = {}
+    actor_metric_sums = {}
+    coupling_metric_sums = {}
+    last_dynamics_info = None
+    last_critic_info = None
+    last_actor_info = None
+    last_coupling_info = None
+    steps_since_log = 0
+
+    for step in step_iter:
         if measure_timing:
-            epoch_start = time.perf_counter()
-        data_time = 0.0
-        build_time = 0.0
-        build_detail_times = {}
-        dynamics_time = 0.0
-        critic_time = 0.0
-        actor_rescore_time = 0.0
-        actor_time = 0.0
-        dynamics_metric_sums = {}
-        critic_metric_sums = {}
-        actor_metric_sums = {}
-        coupling_metric_sums = {}
-        last_dynamics_info = None
-        last_critic_info = None
-        last_actor_info = None
-        last_coupling_info = None
+            step_start = time.perf_counter()
+            t0 = time.perf_counter()
+        if next_batch_future is not None:
+            dynamics_batch, critic_batch = next_batch_future.result()
+            next_batch_future = _submit_prefetch()
+        else:
+            idxs = _sample_shared_idxs(common_valid_starts, batch_size)
+            dynamics_batch = dynamics_dataset.sample(batch_size, idxs=idxs)
+            critic_batch = critic_dataset.sample(batch_size, idxs=idxs)
+        if measure_timing:
+            data_time += time.perf_counter() - t0
 
-        for _ in range(spe):
-            if measure_timing:
-                t0 = time.perf_counter()
-            if next_batch_future is not None:
-                dynamics_batch, critic_batch = next_batch_future.result()
-                next_batch_future = _submit_prefetch()
-            else:
-                idxs = _sample_shared_idxs(common_valid_starts, batch_size)
-                dynamics_batch = dynamics_dataset.sample(batch_size, idxs=idxs)
-                critic_batch = critic_dataset.sample(batch_size, idxs=idxs)
-            if measure_timing:
-                data_time += time.perf_counter() - t0
+        if measure_timing:
+            t0 = time.perf_counter()
+        dynamics_agent, critic_batch, actor_batch, coupling_info, build_detail_info = _build_train_batches(
+            dynamics_agent,
+            critic_agent,
+            dynamics_batch,
+            critic_batch,
+            actor_config,
+        )
+        if measure_timing:
+            _block_until_ready((critic_batch, actor_batch))
+            build_time += time.perf_counter() - t0
+            _accumulate_time_sums(build_detail_times, build_detail_info)
 
-            if measure_timing:
-                t0 = time.perf_counter()
-            dynamics_agent, critic_batch, actor_batch, coupling_info, build_detail_info = _build_train_batches(
-                dynamics_agent,
-                critic_agent,
-                dynamics_batch,
-                critic_batch,
-                actor_config,
-            )
-            if measure_timing:
-                _block_until_ready((critic_batch, actor_batch))
-                build_time += time.perf_counter() - t0
-                _accumulate_time_sums(build_detail_times, build_detail_info)
+        if measure_timing:
+            t0 = time.perf_counter()
+        dynamics_agent, dynamics_info = dynamics_agent.update(
+            dynamics_batch,
+            critic_value_params=_extract_critic_value_params(critic_agent),
+        )
+        if measure_timing:
+            _block_until_ready(dynamics_info)
+            dynamics_time += time.perf_counter() - t0
 
-            if measure_timing:
-                t0 = time.perf_counter()
-            dynamics_agent, dynamics_info = dynamics_agent.update(
-                dynamics_batch,
-                critic_value_params=_extract_critic_value_params(critic_agent),
-            )
-            if measure_timing:
-                _block_until_ready(dynamics_info)
-                dynamics_time += time.perf_counter() - t0
+        if measure_timing:
+            t0 = time.perf_counter()
+        critic_agent, critic_info = critic_agent.update(critic_batch)
+        if measure_timing:
+            _block_until_ready(critic_info)
+            critic_time += time.perf_counter() - t0
 
-            if measure_timing:
-                t0 = time.perf_counter()
-            critic_agent, critic_info = critic_agent.update(critic_batch)
-            if measure_timing:
-                _block_until_ready(critic_info)
-                critic_time += time.perf_counter() - t0
+        if measure_timing:
+            t0 = time.perf_counter()
+        actor_batch_for_update, score_coupling_info = _rescore_actor_batch_for_update(
+            actor_batch, critic_agent, actor_config
+        )
+        coupling_info = dict(coupling_info)
+        coupling_info.update(score_coupling_info)
+        if measure_timing:
+            _block_until_ready(actor_batch_for_update)
+            actor_rescore_time += time.perf_counter() - t0
 
-            if measure_timing:
-                t0 = time.perf_counter()
-            actor_batch_for_update, score_coupling_info = _rescore_actor_batch_for_update(
-                actor_batch, critic_agent, actor_config
-            )
-            coupling_info = dict(coupling_info)
-            coupling_info.update(score_coupling_info)
-            if measure_timing:
-                _block_until_ready(actor_batch_for_update)
-                actor_rescore_time += time.perf_counter() - t0
+        if measure_timing:
+            t0 = time.perf_counter()
+        actor_agent, actor_info = actor_agent.update(actor_batch_for_update, critic_agent)
+        if measure_timing:
+            _block_until_ready(actor_info)
+            actor_time += time.perf_counter() - t0
+            interval_compute_time += time.perf_counter() - step_start
 
-            if measure_timing:
-                t0 = time.perf_counter()
-            actor_agent, actor_info = actor_agent.update(actor_batch_for_update, critic_agent)
-            if measure_timing:
-                _block_until_ready(actor_info)
-                actor_time += time.perf_counter() - t0
+        last_dynamics_info = dynamics_info
+        last_critic_info = critic_info
+        last_actor_info = actor_info
+        last_coupling_info = coupling_info
+        steps_since_log += 1
 
-            last_dynamics_info = dynamics_info
-            last_critic_info = critic_info
-            last_actor_info = actor_info
-            last_coupling_info = coupling_info
+        _accumulate_metric_sums(dynamics_metric_sums, dynamics_info)
+        _accumulate_metric_sums(critic_metric_sums, critic_info)
+        _accumulate_metric_sums(actor_metric_sums, actor_info)
+        _accumulate_metric_sums(coupling_metric_sums, coupling_info)
 
-            _accumulate_metric_sums(dynamics_metric_sums, dynamics_info)
-            _accumulate_metric_sums(critic_metric_sums, critic_info)
-            _accumulate_metric_sums(actor_metric_sums, actor_info)
-            _accumulate_metric_sums(coupling_metric_sums, coupling_info)
+        is_final_step = step == train_steps
+        do_regular_eval = bool(eval_every_steps > 0 and step % eval_every_steps == 0 and not is_final_step)
+        do_final_eval = bool(is_final_step and final_eval_n_values)
+        do_log = bool(step % log_every_steps == 0 or is_final_step or do_regular_eval or do_final_eval)
 
-        gstep = epoch * spe
-        steps_done = spe
-        if epoch % FLAGS.log_every_n_epochs == 0 and last_dynamics_info is not None:
+        if do_log and last_dynamics_info is not None and steps_since_log > 0:
             metrics = {}
             metrics.update(_to_host_metrics('train/dynamics', last_dynamics_info))
             metrics.update(_to_host_metrics('train/critic', last_critic_info))
             metrics.update(_to_host_metrics('train/actor', last_actor_info))
             metrics.update(_to_host_metrics('train/coupling', last_coupling_info))
             metrics['train/critic/primary_score'] = extract_critic_primary_score(last_critic_info)
-            _emit_metric_means(metrics, 'train/dynamics', dynamics_metric_sums, steps_done)
-            _emit_metric_means(metrics, 'train/critic', critic_metric_sums, steps_done)
-            _emit_metric_means(metrics, 'train/actor', actor_metric_sums, steps_done)
-            _emit_metric_means(metrics, 'train/coupling', coupling_metric_sums, steps_done)
-            metrics['train/epoch'] = float(epoch)
+            _emit_metric_means(metrics, 'train/dynamics', dynamics_metric_sums, steps_since_log)
+            _emit_metric_means(metrics, 'train/critic', critic_metric_sums, steps_since_log)
+            _emit_metric_means(metrics, 'train/actor', actor_metric_sums, steps_since_log)
+            _emit_metric_means(metrics, 'train/coupling', coupling_metric_sums, steps_since_log)
+            metrics['train/step'] = float(step)
+            metrics['train/steps_per_epoch'] = float(spe)
+
             did_final_n_sweep = False
-            if eval_freq > 0 and epoch % eval_freq == 0:
-                is_final_epoch = epoch == int(FLAGS.train_epochs)
+            if do_final_eval:
+                did_final_n_sweep = True
                 eval_episode_count = (
-                    final_eval_episodes_per_task
-                    if final_eval_episodes_per_task > 0 and is_final_epoch
-                    else eval_episodes_per_task
+                    final_eval_episodes_per_task if final_eval_episodes_per_task > 0 else eval_episodes_per_task
                 )
-                if is_final_epoch and final_eval_n_values:
-                    did_final_n_sweep = True
-                    with open(os.path.join(run_dir, 'flags.json'), encoding='utf-8') as f:
-                        flags_root = json.load(f)
-                    orig_eval_n = int(dynamics_config.get('subgoal_eval_num_samples', 1))
-                    last_eval_metrics: dict[str, Any] = {}
-                    for eval_n in final_eval_n_values:
-                        out_path = eval_result_path(
-                            run_dir,
-                            epoch=epoch,
-                            eval_n=eval_n,
-                            score_type=str(dynamics_config.get('subgoal_eval_score_type', 'transitive_ratio')),
-                        )
-                        if out_path.is_file():
-                            run_logger.info('SKIP final N=%d eval (already saved %s)', eval_n, out_path)
-                            with open(out_path, encoding='utf-8') as f:
-                                saved = json.load(f)
-                            last_eval_metrics = {
-                                'eval/num_tasks': float(len(eval_task_ids)),
-                                'eval/episodes_per_task': float(eval_episode_count),
-                                'eval_idm/success_rate_mean': float(saved['idm_success_rate_mean']),
-                                'eval/success_rate_mean': float(saved['actor_success_rate_mean']),
-                            }
-                            for tid in eval_task_ids:
-                                idm_tasks = saved.get('idm_task_success_rates', {})
-                                actor_tasks = saved.get('actor_task_success_rates', {})
-                                if str(tid) in idm_tasks:
-                                    last_eval_metrics[f'eval_idm/task_{tid}/success_rate'] = float(idm_tasks[str(tid)])
-                                if str(tid) in actor_tasks:
-                                    last_eval_metrics[f'eval/task_{tid}/success_rate'] = float(actor_tasks[str(tid)])
-                            continue
-                        dynamics_config['subgoal_eval_num_samples'] = eval_n
-                        eval_dynamics_agent = dynamics_agent.replace(
-                            config=dynamics_agent.config.copy({'subgoal_eval_num_samples': eval_n}),
-                        )
-                        feval_metrics = _evaluate_env_tasks(
-                            env,
-                            eval_dynamics_agent,
-                            actor_agent,
-                            actor_config,
-                            critic_config,
-                            critic_agent=critic_agent,
-                            task_ids=eval_task_ids,
-                            episodes_per_task=eval_episode_count,
-                            max_chunks=eval_max_chunks,
-                            video_episodes_per_task=int(FLAGS.eval_video_episodes_per_task),
-                            video_frame_skip=int(FLAGS.eval_video_frame_skip),
-                            video_fps=int(FLAGS.eval_video_fps),
-                            wandb_enabled=bool(FLAGS.use_wandb),
-                            subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
-                        )
-                        saved_path = save_eval_results(
-                            run_dir,
-                            epoch=epoch,
-                            subgoal_eval_num_samples=eval_n,
-                            task_ids=eval_task_ids,
-                            episodes_per_task=eval_episode_count,
-                            metrics=feval_metrics,
-                            fg=flags_root['flags'],
-                            root=flags_root,
-                        )
-                        run_logger.info('=== FINAL EVAL START epoch=%d eval_n=%d ===', epoch, eval_n)
-                        _log_eval_run_logger(
-                            run_logger,
-                            epoch=epoch,
-                            eval_task_ids=eval_task_ids,
-                            metrics=feval_metrics,
-                            header='final_eval',
-                        )
-                        run_logger.info(
-                            '=== FINAL EVAL END epoch=%d eval_n=%d saved=%s ===',
-                            epoch,
-                            eval_n,
-                            saved_path,
-                        )
-                        last_eval_metrics = feval_metrics
-                        for key, val in feval_metrics.items():
-                            if key.startswith('eval') or key.startswith('evaluation'):
-                                metrics[f'feval_n{eval_n}/{key}'] = val
-                    dynamics_config['subgoal_eval_num_samples'] = orig_eval_n
-                    if last_eval_metrics:
-                        metrics.update(last_eval_metrics)
-                else:
-                    metrics.update(
-                        _evaluate_env_tasks(
-                            env,
-                            dynamics_agent,
-                            actor_agent,
-                            actor_config,
-                            critic_config,
-                            critic_agent=critic_agent,
-                            task_ids=eval_task_ids,
-                            episodes_per_task=eval_episode_count,
-                            max_chunks=eval_max_chunks,
-                            video_episodes_per_task=int(FLAGS.eval_video_episodes_per_task),
-                            video_frame_skip=int(FLAGS.eval_video_frame_skip),
-                            video_fps=int(FLAGS.eval_video_fps),
-                            wandb_enabled=bool(FLAGS.use_wandb),
-                            subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
-                        )
+                with open(os.path.join(run_dir, 'flags.json'), encoding='utf-8') as f:
+                    flags_root = json.load(f)
+                orig_eval_n = int(dynamics_config.get('subgoal_eval_num_samples', 1))
+                last_eval_metrics: dict[str, Any] = {}
+                for eval_n in final_eval_n_values:
+                    out_path = eval_result_path(run_dir, epoch=step, eval_n=eval_n)
+                    if out_path.is_file():
+                        run_logger.info('SKIP final N=%d eval (already saved %s)', eval_n, out_path)
+                        with open(out_path, encoding='utf-8') as f:
+                            saved = json.load(f)
+                        last_eval_metrics = {
+                            'eval/num_tasks': float(len(eval_task_ids)),
+                            'eval/episodes_per_task': float(eval_episode_count),
+                            'eval_idm/success_rate_mean': float(saved['idm_success_rate_mean']),
+                            'eval/success_rate_mean': float(saved['actor_success_rate_mean']),
+                        }
+                        for tid in eval_task_ids:
+                            idm_tasks = saved.get('idm_task_success_rates', {})
+                            actor_tasks = saved.get('actor_task_success_rates', {})
+                            if str(tid) in idm_tasks:
+                                last_eval_metrics[f'eval_idm/task_{tid}/success_rate'] = float(idm_tasks[str(tid)])
+                            if str(tid) in actor_tasks:
+                                last_eval_metrics[f'eval/task_{tid}/success_rate'] = float(actor_tasks[str(tid)])
+                        continue
+                    dynamics_config['subgoal_eval_num_samples'] = eval_n
+                    eval_dynamics_agent = dynamics_agent.replace(
+                        config=dynamics_agent.config.copy({'subgoal_eval_num_samples': eval_n}),
                     )
+                    feval_metrics = _evaluate_env_tasks(
+                        env,
+                        eval_dynamics_agent,
+                        actor_agent,
+                        actor_config,
+                        critic_config,
+                        critic_agent=critic_agent,
+                        task_ids=eval_task_ids,
+                        episodes_per_task=eval_episode_count,
+                        video_episodes_per_task=int(FLAGS.eval_video_episodes_per_task),
+                        video_frame_skip=int(FLAGS.eval_video_frame_skip),
+                        video_fps=int(FLAGS.eval_video_fps),
+                        wandb_enabled=bool(FLAGS.use_wandb),
+                        subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
+                    )
+                    saved_path = save_eval_results(
+                        run_dir,
+                        epoch=step,
+                        subgoal_eval_num_samples=eval_n,
+                        task_ids=eval_task_ids,
+                        episodes_per_task=eval_episode_count,
+                        metrics=feval_metrics,
+                        fg=flags_root['flags'],
+                        root=flags_root,
+                    )
+                    run_logger.info('=== FINAL EVAL START step=%d eval_n=%d ===', step, eval_n)
+                    _log_eval_run_logger(
+                        run_logger,
+                        step=step,
+                        eval_task_ids=eval_task_ids,
+                        metrics=feval_metrics,
+                        header='final_eval',
+                    )
+                    run_logger.info(
+                        '=== FINAL EVAL END step=%d eval_n=%d saved=%s ===',
+                        step,
+                        eval_n,
+                        saved_path,
+                    )
+                    last_eval_metrics = feval_metrics
+                    for key, val in feval_metrics.items():
+                        if key.startswith('eval') or key.startswith('evaluation'):
+                            metrics[f'feval_n{eval_n}/{key}'] = val
+                dynamics_config['subgoal_eval_num_samples'] = orig_eval_n
+                if last_eval_metrics:
+                    metrics.update(last_eval_metrics)
+            elif do_regular_eval:
+                eval_episode_count = eval_episodes_per_task
+                metrics.update(
+                    _evaluate_env_tasks(
+                        env,
+                        dynamics_agent,
+                        actor_agent,
+                        actor_config,
+                        critic_config,
+                        critic_agent=critic_agent,
+                        task_ids=eval_task_ids,
+                        episodes_per_task=eval_episode_count,
+                        video_episodes_per_task=int(FLAGS.eval_video_episodes_per_task),
+                        video_frame_skip=int(FLAGS.eval_video_frame_skip),
+                        video_fps=int(FLAGS.eval_video_fps),
+                        wandb_enabled=bool(FLAGS.use_wandb),
+                        subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
+                    )
+                )
+
             if measure_timing:
-                metrics['time/data_epoch_sec'] = data_time
-                metrics['time/build_batches_epoch_sec'] = build_time
-                _emit_time_sums(metrics, 'time/build', build_detail_times, spe)
-                metrics['time/dynamics_update_epoch_sec'] = dynamics_time
-                metrics['time/critic_update_epoch_sec'] = critic_time
-                metrics['time/actor_rescore_epoch_sec'] = actor_rescore_time
-                metrics['time/actor_update_epoch_sec'] = actor_time
-                metrics['time/epoch_compute_sec'] = time.perf_counter() - epoch_start
-                metrics['time/data_step_sec'] = data_time / spe
-                metrics['time/build_batches_step_sec'] = build_time / spe
-                metrics['time/dynamics_update_step_sec'] = dynamics_time / spe
-                metrics['time/critic_update_step_sec'] = critic_time / spe
-                metrics['time/actor_rescore_step_sec'] = actor_rescore_time / spe
-                metrics['time/actor_update_step_sec'] = actor_time / spe
+                metrics['time/data_interval_sec'] = data_time
+                metrics['time/build_batches_interval_sec'] = build_time
+                _emit_time_sums(metrics, 'time/build', build_detail_times, steps_since_log)
+                metrics['time/dynamics_update_interval_sec'] = dynamics_time
+                metrics['time/critic_update_interval_sec'] = critic_time
+                metrics['time/actor_rescore_interval_sec'] = actor_rescore_time
+                metrics['time/actor_update_interval_sec'] = actor_time
+                metrics['time/interval_compute_sec'] = interval_compute_time
+                metrics['time/data_step_sec'] = data_time / steps_since_log
+                metrics['time/build_batches_step_sec'] = build_time / steps_since_log
+                metrics['time/dynamics_update_step_sec'] = dynamics_time / steps_since_log
+                metrics['time/critic_update_step_sec'] = critic_time / steps_since_log
+                metrics['time/actor_rescore_step_sec'] = actor_rescore_time / steps_since_log
+                metrics['time/actor_update_step_sec'] = actor_time / steps_since_log
             metrics['time/wall_sec'] = time.time() - last_log
             metrics['time/total_sec'] = time.time() - first_time
             last_log = time.time()
             if FLAGS.use_wandb:
-                wandb.log(metrics, step=gstep)
-            train_logger.log(metrics, step=gstep)
+                wandb.log(metrics, step=step)
+            train_logger.log(metrics, step=step)
             run_logger.info(
-                'epoch=%d %s',
-                epoch,
-                _format_epoch_log(metrics),
+                'step=%d %s',
+                step,
+                _format_step_log(metrics),
             )
-            if eval_freq > 0 and epoch % eval_freq == 0 and not did_final_n_sweep:
+            if do_regular_eval and not did_final_n_sweep:
                 num_tasks = int(metrics.get('eval/num_tasks', 0.0))
                 episodes_per_task = int(metrics.get('eval/episodes_per_task', 0.0))
                 video_eps = int(metrics.get('eval/video_episodes_per_task', 0.0))
                 run_logger.info(
-                    '=== EVAL START epoch=%d num_tasks=%d stat_episodes_per_task=%d video_episodes_per_task=%d ===',
-                    epoch,
+                    '=== EVAL START step=%d num_tasks=%d stat_episodes_per_task=%d video_episodes_per_task=%d ===',
+                    step,
                     num_tasks,
                     episodes_per_task,
                     video_eps,
                 )
                 _log_eval_run_logger(
                     run_logger,
-                    epoch=epoch,
+                    step=step,
                     eval_task_ids=eval_task_ids,
                     metrics=metrics,
                     header='eval',
                 )
-                run_logger.info('=== EVAL END epoch=%d ===', epoch)
+                run_logger.info('=== EVAL END step=%d ===', step)
 
-        if epoch % FLAGS.save_every_n_epochs == 0:
-            save_agent(dynamics_agent, dynamics_ckpt_dir, epoch)
-            save_agent(critic_agent, critic_ckpt_dir, epoch)
-            save_agent(actor_agent, actor_ckpt_dir, epoch)
+            data_time = 0.0
+            build_time = 0.0
+            build_detail_times = {}
+            dynamics_time = 0.0
+            critic_time = 0.0
+            actor_rescore_time = 0.0
+            actor_time = 0.0
+            interval_compute_time = 0.0
+            dynamics_metric_sums = {}
+            critic_metric_sums = {}
+            actor_metric_sums = {}
+            coupling_metric_sums = {}
+            steps_since_log = 0
+
+        if save_every_steps > 0 and (step % save_every_steps == 0 or is_final_step):
+            save_agent(dynamics_agent, dynamics_ckpt_dir, step)
+            save_agent(critic_agent, critic_ckpt_dir, step)
+            save_agent(actor_agent, actor_ckpt_dir, step)
 
     if prefetch_pool is not None:
         # Cancel any outstanding prefetch and tear down the worker thread.

@@ -27,6 +27,7 @@ class _FakeEnvA:
     """A: success True on step 1 only; terminates at step 3."""
 
     action_space = Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+    _max_episode_steps = 10
 
     def __init__(self) -> None:
         self.t = 0
@@ -63,7 +64,6 @@ def test_rollout_any_step_success_persists_after_false():
         goal,
         low,
         high,
-        max_chunks=10,
         sample_action_chunk=chunk,
     )
     assert ok_env is True
@@ -73,6 +73,7 @@ class _FakeEnvB:
     """B: obs moves close to goal but env never reports info['success']; ends on truncation."""
 
     action_space = Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+    _max_episode_steps = 10
 
     def __init__(self) -> None:
         self.t = 0
@@ -108,7 +109,6 @@ def test_rollout_without_env_success_is_failure_regardless_of_distance():
         goal,
         low,
         high,
-        max_chunks=10,
         sample_action_chunk=chunk,
     )
     assert ok_env is False

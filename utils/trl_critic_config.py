@@ -56,14 +56,6 @@ STANDARD_VALUE_GOAL_SAMPLING: dict[str, Any] = {
     'value_geom_sample': True,
 }
 
-# Paper TRL value sampling: (p_cur, p_geom, p_traj, p_rand) = (0, 0, 1, 0).
-TRL_VALUE_GOAL_SAMPLING: dict[str, Any] = {
-    'value_p_curgoal': 0.0,
-    'value_p_trajgoal': 1.0,
-    'value_p_randomgoal': 0.0,
-    'value_geom_sample': False,
-}
-
 LONG_HORIZON_VALUE_GOAL_SAMPLING: dict[str, Any] = {
     'value_p_curgoal': 0.0,
     'value_p_trajgoal': 0.0,
@@ -72,14 +64,11 @@ LONG_HORIZON_VALUE_GOAL_SAMPLING: dict[str, Any] = {
 }
 
 # gap10 baseline (write_trl_gap10_g099_sweep_yaml.py Table 5).
-DEFAULT_EVAL_MAX_CHUNKS = 200
-
 TRL_ENV_SPECS: dict[str, dict[str, Any]] = {
     'amm': {
         'env_name': 'antmaze-medium-navigate-v0',
         'stem': 'antmaze_medium',
         'regime': 'standard',
-        'max_episode_steps': 1000,
         'discount': 0.99,
         'value_distance_weight_power': 0.0,
         'batch_size': 1024,
@@ -89,8 +78,7 @@ TRL_ENV_SPECS: dict[str, dict[str, Any]] = {
         'env_name': 'antmaze-large-navigate-v0',
         'stem': 'antmaze_large',
         'regime': 'standard',
-        'max_episode_steps': 1000,
-        'discount': 0.99,
+        'discount': 0.995,
         'value_distance_weight_power': 0.0,
         'batch_size': 1024,
         'actor_goal_sampling': MAZE_ACTOR_GOAL_SAMPLING,
@@ -99,8 +87,7 @@ TRL_ENV_SPECS: dict[str, dict[str, Any]] = {
         'env_name': 'antmaze-giant-navigate-v0',
         'stem': 'antmaze_giant',
         'regime': 'standard',
-        'max_episode_steps': 1000,
-        'discount': 0.99,
+        'discount': 0.999,
         'value_distance_weight_power': 0.0,
         'batch_size': 1024,
         'actor_goal_sampling': MAZE_ACTOR_GOAL_SAMPLING,
@@ -109,7 +96,6 @@ TRL_ENV_SPECS: dict[str, dict[str, Any]] = {
         'env_name': 'puzzle-3x3-play-v0',
         'stem': 'puzzle_3x3',
         'regime': 'standard',
-        'max_episode_steps': 500,
         'discount': 0.99,
         'value_distance_weight_power': 0.5,
         'batch_size': 1024,
@@ -119,7 +105,6 @@ TRL_ENV_SPECS: dict[str, dict[str, Any]] = {
         'env_name': 'puzzle-4x4-play-v0',
         'stem': 'puzzle_4x4',
         'regime': 'standard',
-        'max_episode_steps': 500,
         'discount': 0.99,
         'value_distance_weight_power': 2.0,
         'batch_size': 1024,
@@ -129,7 +114,6 @@ TRL_ENV_SPECS: dict[str, dict[str, Any]] = {
         'env_name': 'cube-single-play-v0',
         'stem': 'cube_single',
         'regime': 'standard',
-        'max_episode_steps': 500,
         'discount': 0.99,
         'value_distance_weight_power': 0.7,
         'batch_size': 1024,
@@ -139,7 +123,6 @@ TRL_ENV_SPECS: dict[str, dict[str, Any]] = {
         'env_name': 'cube-double-play-v0',
         'stem': 'cube_double',
         'regime': 'standard',
-        'max_episode_steps': 500,
         'discount': 0.99,
         'value_distance_weight_power': 1.0,
         'batch_size': 1024,
@@ -149,55 +132,14 @@ TRL_ENV_SPECS: dict[str, dict[str, Any]] = {
         'env_name': 'cube-triple-play-v0',
         'stem': 'cube_triple',
         'regime': 'standard',
-        'max_episode_steps': 500,
         'discount': 0.995,
         'value_distance_weight_power': 1.0,
         'batch_size': 4096,
         'actor_goal_sampling': MAZE_ACTOR_GOAL_SAMPLING,
     },
-    # humanoidmaze: gamma=0.999; policy (0,0,1,0); TRL value (0,0,1,0).
-    'hmm': {
-        'env_name': 'humanoidmaze-medium-navigate-v0',
-        'stem': 'humanoidmaze_medium',
-        'regime': 'humanoidmaze',
-        'max_episode_steps': 2000,
-        'discount': 0.999,
-        'value_distance_weight_power': 0.0,
-        'batch_size': 1024,
-        'actor_goal_sampling': MAZE_ACTOR_GOAL_SAMPLING,
-        'value_goal_sampling': TRL_VALUE_GOAL_SAMPLING,
-    },
-    'hml': {
-        'env_name': 'humanoidmaze-large-navigate-v0',
-        'stem': 'humanoidmaze_large',
-        'regime': 'humanoidmaze',
-        'max_episode_steps': 2000,
-        'discount': 0.999,
-        'value_distance_weight_power': 0.0,
-        'batch_size': 1024,
-        'actor_goal_sampling': MAZE_ACTOR_GOAL_SAMPLING,
-        'value_goal_sampling': TRL_VALUE_GOAL_SAMPLING,
-    },
 }
 
-ENV_ORDER = ['amm', 'aml', 'amg', 'hmm', 'hml', 'p3', 'p4', 'cs', 'cd', 'ct']
-
-
-def eval_max_chunks_for_env(
-    env_prefix: str,
-    *,
-    action_chunk_horizon: int = 5,
-    max_episode_steps: int | None = None,
-) -> int:
-    """Outer replans so eval can use the env TimeLimit (``chunks × h_a`` env steps)."""
-    steps = max_episode_steps
-    if steps is None:
-        spec = TRL_ENV_SPECS.get(env_prefix, {})
-        steps = spec.get('max_episode_steps')
-    if steps is None:
-        return DEFAULT_EVAL_MAX_CHUNKS
-    h = max(1, int(action_chunk_horizon))
-    return max(1, (int(steps) + h - 1) // h)
+ENV_ORDER = ['amm', 'aml', 'amg', 'p3', 'p4', 'cs', 'cd', 'ct']
 
 
 def trl_critic_agent_config(env_slug: str) -> dict[str, Any]:
@@ -206,9 +148,7 @@ def trl_critic_agent_config(env_slug: str) -> dict[str, Any]:
     cfg = deepcopy(TRL_CRITIC_COMMON)
     cfg['discount'] = float(spec['discount'])
     cfg['value_distance_weight_power'] = float(spec['value_distance_weight_power'])
-    if 'value_goal_sampling' in spec:
-        cfg.update(deepcopy(spec['value_goal_sampling']))
-    elif str(spec['regime']) == 'long_horizon':
+    if str(spec['regime']) == 'long_horizon':
         cfg.update(LONG_HORIZON_VALUE_GOAL_SAMPLING)
     else:
         cfg.update(STANDARD_VALUE_GOAL_SAMPLING)

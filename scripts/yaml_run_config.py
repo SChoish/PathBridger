@@ -133,7 +133,6 @@ def build_trl_run_config(
     eval_task_ids: str = '1,2,3,4,5',
     eval_episodes_per_task: int = 10,
     final_eval_episodes_per_task: int = 25,
-    eval_max_chunks: int = 200,
     eval_video_episodes_per_task: int = 0,
     dynamics_overrides: dict[str, Any] | None = None,
     critic_overrides: dict[str, Any] | None = None,
@@ -161,7 +160,6 @@ def build_trl_run_config(
         'eval_task_ids': str(eval_task_ids),
         'eval_episodes_per_task': int(eval_episodes_per_task),
         'final_eval_episodes_per_task': int(final_eval_episodes_per_task),
-        'eval_max_chunks': int(eval_max_chunks),
         'eval_video_episodes_per_task': int(eval_video_episodes_per_task),
         'dynamics': _dynamics_block(
             gap_scale=gap_scale,
