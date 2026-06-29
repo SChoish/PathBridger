@@ -479,13 +479,14 @@ class CriticAgent(flax.struct.PyTreeNode):
         qs = jax.nn.sigmoid(logits).reshape(logits.shape[0], obs.shape[0], num_candidates)
         return self.aggregate_ensemble_q(qs).reshape(obs.shape[0], num_candidates)
 
-    @partial(jax.jit, static_argnames=())
+    @partial(jax.jit, static_argnames=('score_mode',))
     def score_transitive_subgoals(
         self,
         observations: jnp.ndarray,
         subgoals: jnp.ndarray,
         goals: jnp.ndarray,
         network_params: dict | None = None,
+        score_mode: str = 'ratio',
     ) -> jnp.ndarray:
         eps = jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-6)), dtype=jnp.float32)
         obs = jnp.asarray(observations, dtype=jnp.float32)
@@ -505,8 +506,14 @@ class CriticAgent(flax.struct.PyTreeNode):
         v_s_z = jax.nn.sigmoid(self.network.select('value')(obs_rep, z_flat, params=network_params))
         v_z_g = jax.nn.sigmoid(self.network.select('value')(z_flat, g_flat, params=network_params))
         v_s_g = jax.nn.sigmoid(self.network.select('value')(obs_rep, g_flat, params=network_params))
-        ratio = (v_s_z * v_z_g) / (v_s_g + eps)
-        return ratio.reshape(obs.shape[0], num_candidates)
+        product = v_s_z * v_z_g
+        mode = str(score_mode).lower()
+        if mode == 'product':
+            return product.reshape(obs.shape[0], num_candidates)
+        if mode == 'ratio':
+            ratio = product / (v_s_g + eps)
+            return ratio.reshape(obs.shape[0], num_candidates)
+        raise ValueError(f"score_mode must be 'ratio' or 'product', got {score_mode!r}.")
 
     @jax.jit
     def total_loss(self, batch: dict, grad_params: dict, rng=None):

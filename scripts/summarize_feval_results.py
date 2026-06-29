@@ -50,8 +50,16 @@ CSV_COLUMNS = [
     'eval_n',
     'IDM',
     'ACTOR',
+    'FLOW_IDM',
+    'FLOW_ACTOR',
+    'SPI_SUBGOAL_IDM',
+    'SPI_SUBGOAL_ACTOR',
     'idm_tasks',
     'actor_tasks',
+    'flow_idm_tasks',
+    'flow_actor_tasks',
+    'spi_subgoal_idm_tasks',
+    'spi_subgoal_actor_tasks',
     'source',
 ]
 
@@ -149,6 +157,8 @@ def _append_row(
     run_uid = f'{run_group}|{run_start_ts}' if run_start_ts else run_group
     idm_tasks = rec.get('idm_task_success_rates', {}) or {}
     actor_tasks = rec.get('actor_task_success_rates', {}) or {}
+    four_way_means = rec.get('four_way_success_rate_means', {}) or {}
+    four_way_tasks = rec.get('four_way_task_success_rates', {}) or {}
     _, eval_n, temp = _parse_eval_json_name(json_path) if json_path else (
         int(rec.get('epoch', final_epoch)),
         int(rec.get('subgoal_eval_num_samples', rec.get('eval_n', 0))),
@@ -186,11 +196,31 @@ def _append_row(
         'eval_n': eval_n,
         'IDM': rec.get('idm_success_rate_mean', rec.get('IDM', '')),
         'ACTOR': rec.get('actor_success_rate_mean', rec.get('ACTOR', '')),
+        'FLOW_IDM': four_way_means.get('eval_flow_idm', ''),
+        'FLOW_ACTOR': four_way_means.get('eval_flow_actor', ''),
+        'SPI_SUBGOAL_IDM': four_way_means.get('eval_spi_subgoal_idm', ''),
+        'SPI_SUBGOAL_ACTOR': four_way_means.get('eval_spi_subgoal_actor', ''),
         'idm_tasks': rec.get('idm_tasks', '') or ','.join(
             f'{k}:{float(v):.4f}' for k, v in sorted(idm_tasks.items(), key=lambda x: int(x[0]))
         ),
         'actor_tasks': rec.get('actor_tasks', '') or ','.join(
             f'{k}:{float(v):.4f}' for k, v in sorted(actor_tasks.items(), key=lambda x: int(x[0]))
+        ),
+        'flow_idm_tasks': ','.join(
+            f'{k}:{float(v):.4f}'
+            for k, v in sorted((four_way_tasks.get('eval_flow_idm', {}) or {}).items(), key=lambda x: int(x[0]))
+        ),
+        'flow_actor_tasks': ','.join(
+            f'{k}:{float(v):.4f}'
+            for k, v in sorted((four_way_tasks.get('eval_flow_actor', {}) or {}).items(), key=lambda x: int(x[0]))
+        ),
+        'spi_subgoal_idm_tasks': ','.join(
+            f'{k}:{float(v):.4f}'
+            for k, v in sorted((four_way_tasks.get('eval_spi_subgoal_idm', {}) or {}).items(), key=lambda x: int(x[0]))
+        ),
+        'spi_subgoal_actor_tasks': ','.join(
+            f'{k}:{float(v):.4f}'
+            for k, v in sorted((four_way_tasks.get('eval_spi_subgoal_actor', {}) or {}).items(), key=lambda x: int(x[0]))
         ),
         'source': source,
     })

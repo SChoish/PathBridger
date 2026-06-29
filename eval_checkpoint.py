@@ -197,6 +197,8 @@ def main() -> None:
         print(f'Skip eval (already saved): {saved_path}')
         print(f"eval_idm/success_rate_mean={record.get('idm_success_rate_mean', float('nan')):.4f}")
         print(f"eval/success_rate_mean={record.get('actor_success_rate_mean', float('nan')):.4f}")
+        for prefix, value in record.get('four_way_success_rate_means', {}).items():
+            print(f'{prefix}/success_rate_mean={float(value):.4f}')
         return
 
     print(f'Loaded epoch={ep} from {run_dir}')
@@ -236,6 +238,21 @@ def main() -> None:
         k = f'eval/task_{tid}/success_rate'
         if k in metrics:
             print(f'  {k}={metrics[k]:.4f}')
+    for prefix, label in (
+        ('eval_flow_idm', 'Flow+IDM'),
+        ('eval_flow_actor', 'Flow+Actor'),
+        ('eval_spi_subgoal_idm', 'SPI Subgoal+IDM'),
+        ('eval_spi_subgoal_actor', 'SPI Subgoal+Actor'),
+    ):
+        mean_key = f'{prefix}/success_rate_mean'
+        if mean_key not in metrics:
+            continue
+        print(f'--- {label} ---')
+        print(f'{mean_key}={metrics.get(mean_key, float("nan")):.4f}')
+        for tid in task_ids:
+            k = f'{prefix}/task_{tid}/success_rate'
+            if k in metrics:
+                print(f'  {k}={metrics[k]:.4f}')
 
     out_path = save_eval_results(
         run_dir,

@@ -136,6 +136,45 @@ Flow subgoal:
 | `subgoal_value_gap_scale` | value-gap weighting scale |
 | `subgoal_value_weight_max` | flow matching weight cap |
 
+Subgoal SPI:
+
+`subgoal_spi_enabled: true`는 기존 flow/gaussian subgoal을 대체하지 않습니다. 기존 `subgoal_net`은 그대로 proposal/teacher 역할을 하고, 별도의 deterministic `subgoal_spi_net`을 추가로 학습합니다.
+
+권장 config:
+
+```yaml
+dynamics:
+  subgoal_distribution: flow        # proposal/teacher subgoal net
+  subgoal_spi_enabled: true         # add deterministic subgoal_spi_net
+  subgoal_spi_num_samples: 16       # proposal candidates for SPI update
+  subgoal_spi_beta: 1.0             # Boltzmann weight temperature inverse
+  subgoal_spi_tau: 5.0              # proximal strength denominator
+  subgoal_spi_energy_norm_eps: 1.0e-6
+```
+
+학습 objective는 flow `subgoal_net`에서 N개 후보 `z_i`를 샘플링하고, critic product energy로 Boltzmann target을 만듭니다.
+
+```text
+E(s,z,g) = V(s,z) * V(z,g)
+rho_i = softmax(beta * E(s,z_i,g))
+L_spi = -E(s,z_theta,g) / scale
+        + sum_i rho_i * ||z_theta - stopgrad(z_i)||^2 / (2 * tau)
+scale = stopgrad(mean(abs(E(s,z_theta,g))) + eps)
+```
+
+여기서 `z_theta`는 deterministic `subgoal_spi_net(s,g)` 출력입니다. `scale`은 energy 항의 수치 크기 안정화용이고, `eps`는 `subgoal_spi_energy_norm_eps`입니다. flow proposal net은 기존 flow matching/value-guided loss로 계속 학습됩니다.
+
+eval에서 `subgoal_spi_enabled: true`이면 네 조합을 함께 기록합니다.
+
+| metric prefix | subgoal source | low-level policy |
+|---------------|----------------|------------------|
+| `eval_flow_idm` | flow `subgoal_net` best-of-N | IDM |
+| `eval_flow_actor` | flow `subgoal_net` best-of-N | actor |
+| `eval_spi_subgoal_idm` | deterministic `subgoal_spi_net` 1회 forward | IDM |
+| `eval_spi_subgoal_actor` | deterministic `subgoal_spi_net` 1회 forward | actor |
+
+기존 flow-only 학습을 하려면 `subgoal_spi_enabled`를 생략하거나 `false`로 둡니다. 이 경우 `subgoal_spi_net`은 생성되지 않고, 기존 `subgoal_distribution: flow` 경로만 사용합니다.
+
 TRL critic:
 
 | 키 | 설명 |
@@ -191,6 +230,21 @@ GPU_ID=0 nohup bash scripts/run_flow_trl_puzzle_45_46.sh > nohup_logs/flow_trl_p
 - gamma: `0.999`
 - `value_distance_weight_power: 0.0`
 - eval budget: 환경 max episode length
+
+### Puzzle 3x3 / 4x4 Subgoal SPI
+
+```bash
+GPU_ID=0 nohup bash scripts/run_flow_trl_spi_p33_p44_500k.sh > nohup_logs/flow_trl_spi_p33_p44_500k.nohup.log 2>&1 &
+```
+
+- configs: `config/sweep_flow_trl_spi_p33_p44_500k/`
+- subgoal: `subgoal_distribution: flow` + `subgoal_spi_enabled: true`
+- deterministic SPI net: `subgoal_spi_net`
+- proposal/teacher: flow `subgoal_net`
+- train steps: `250000`, `500000`
+- eval N: `{2, 16}`
+- eval temperature: `{1.0, 0.5}`
+- 250K eval uses `eval_episodes_per_task`; 500K eval uses `final_eval_episodes_per_task`
 
 ### K=40 best follow-up
 

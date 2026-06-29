@@ -42,15 +42,30 @@ def save_eval_results(
 ) -> Path:
     run_dir = Path(run_dir)
     eval_n = int(subgoal_eval_num_samples)
-    idm_tasks = {
-        str(tid): float(metrics[f'eval_idm/task_{tid}/success_rate'])
-        for tid in task_ids
-        if f'eval_idm/task_{tid}/success_rate' in metrics
+    def _task_rates(prefix: str) -> dict[str, float]:
+        return {
+            str(tid): float(metrics[f'{prefix}/task_{tid}/success_rate'])
+            for tid in task_ids
+            if f'{prefix}/task_{tid}/success_rate' in metrics
+        }
+
+    idm_tasks = _task_rates('eval_idm')
+    actor_tasks = _task_rates('eval')
+    four_way_prefixes = (
+        'eval_flow_idm',
+        'eval_flow_actor',
+        'eval_spi_subgoal_idm',
+        'eval_spi_subgoal_actor',
+    )
+    four_way_means = {
+        prefix: float(metrics[f'{prefix}/success_rate_mean'])
+        for prefix in four_way_prefixes
+        if f'{prefix}/success_rate_mean' in metrics
     }
-    actor_tasks = {
-        str(tid): float(metrics[f'eval/task_{tid}/success_rate'])
-        for tid in task_ids
-        if f'eval/task_{tid}/success_rate' in metrics
+    four_way_tasks = {
+        prefix: _task_rates(prefix)
+        for prefix in four_way_prefixes
+        if any(f'{prefix}/task_{tid}/success_rate' in metrics for tid in task_ids)
     }
     dyn = root.get('dynamics', {})
     record: dict[str, Any] = {
@@ -73,6 +88,8 @@ def save_eval_results(
         'actor_success_rate_mean': float(metrics.get('eval/success_rate_mean', float('nan'))),
         'idm_task_success_rates': idm_tasks,
         'actor_task_success_rates': actor_tasks,
+        'four_way_success_rate_means': four_way_means,
+        'four_way_task_success_rates': four_way_tasks,
     }
     out_dir = run_dir / 'eval_results'
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +113,11 @@ def save_eval_results(
         'idm_tasks': ','.join(f'{k}:{v:.4f}' for k, v in sorted(idm_tasks.items())),
         'actor_tasks': ','.join(f'{k}:{v:.4f}' for k, v in sorted(actor_tasks.items())),
     }
+    for prefix in four_way_prefixes:
+        row[f'{prefix}_mean'] = four_way_means.get(prefix, '')
+        row[f'{prefix}_tasks'] = ','.join(
+            f'{k}:{v:.4f}' for k, v in sorted(four_way_tasks.get(prefix, {}).items())
+        )
     write_header = not csv_path.is_file()
     with open(csv_path, 'a', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))

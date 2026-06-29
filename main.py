@@ -45,6 +45,10 @@ FLAGS = flags.FLAGS
 _DEFAULT_HORIZON = 25
 
 
+def _subgoal_spi_enabled_config(config: Any) -> bool:
+    return bool(config.get('subgoal_spi_enabled', False)) or str(config.get('subgoal_distribution', '')).lower() == 'deterministic_spi'
+
+
 def _impl_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -1029,6 +1033,20 @@ def _log_eval_run_logger(
         task_key = f'eval/task_{task_id}/success_rate'
         if task_key in metrics:
             run_logger.info('actor task_%d env=%.2f', task_id, metrics[task_key])
+    for prefix, label in (
+        ('eval_flow_idm', 'flow+idm'),
+        ('eval_flow_actor', 'flow+actor'),
+        ('eval_spi_subgoal_idm', 'spi_subgoal+idm'),
+        ('eval_spi_subgoal_actor', 'spi_subgoal+actor'),
+    ):
+        mean_key = f'{prefix}/success_rate_mean'
+        if mean_key not in metrics:
+            continue
+        run_logger.info('[%s] env_success_rate_mean=%.2f', label, metrics[mean_key])
+        for task_id in eval_task_ids:
+            task_key = f'{prefix}/task_{task_id}/success_rate'
+            if task_key in metrics:
+                run_logger.info('%s task_%d env=%.2f', label, task_id, metrics[task_key])
 
 
 def _evaluate_env_tasks(
@@ -1055,8 +1073,6 @@ def _evaluate_env_tasks(
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     actor_horizon = int(actor_config['actor_chunk_horizon'])
     idm_horizon = int(critic_config['action_chunk_horizon'])
-    actor_task_successes: list[float] = []
-    idm_task_successes: list[float] = []
     metrics: dict[str, Any] = {}
     wandb_media: dict[str, Any] = {}
 
@@ -1074,8 +1090,40 @@ def _evaluate_env_tasks(
     # 'sample' and 'best_of_n_goal_l2' do not need a critic; 'best_of_n_value' does.
     use_eval_bon = eval_selection in ('best_of_n_value', 'best_of_n_goal_l2', 'sample')
     eval_seed_base = int(dynamics_agent.config.get('subgoal_eval_seed', 0))
+    eval_four_way = _subgoal_spi_enabled_config(dynamics_agent.config)
+    primary_subgoal_source = 'spi' if eval_four_way else 'flow'
+    variants = [
+        ('flow', 'idm', 'eval_flow_idm'),
+        ('flow', 'actor', 'eval_flow_actor'),
+    ]
+    if eval_four_way:
+        variants.extend(
+            [
+                ('spi', 'idm', 'eval_spi_subgoal_idm'),
+                ('spi', 'actor', 'eval_spi_subgoal_actor'),
+            ]
+        )
+    task_successes_by_key: dict[str, list[float]] = {metric_key: [] for _, _, metric_key in variants}
 
-    def _eval_subgoal(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
+    def _eval_subgoal(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int, source: str) -> np.ndarray:
+        if source == 'flow' and eval_four_way:
+            rng = jax.random.PRNGKey(eval_seed_base + int(ep_ix)) if use_eval_bon else None
+            pred = dynamics_agent.infer_proposal_subgoal_for_eval(
+                jnp.asarray(obs, dtype=jnp.float32),
+                jnp.asarray(goal, dtype=jnp.float32),
+                critic_agent=critic_agent,
+                rng=rng,
+            )
+            return np.asarray(pred, dtype=np.float32).reshape(-1)
+        if source == 'spi' and eval_four_way:
+            rng = jax.random.PRNGKey(eval_seed_base + int(ep_ix)) if use_eval_bon else None
+            pred = dynamics_agent.infer_subgoal_for_eval(
+                jnp.asarray(obs, dtype=jnp.float32),
+                jnp.asarray(goal, dtype=jnp.float32),
+                critic_agent=critic_agent,
+                rng=rng,
+            )
+            return np.asarray(pred, dtype=np.float32).reshape(-1)
         if use_eval_bon:
             rng = jax.random.PRNGKey(eval_seed_base + int(ep_ix))
             pred = dynamics_agent.infer_subgoal_for_eval(
@@ -1090,98 +1138,88 @@ def _evaluate_env_tasks(
             dtype=np.float32,
         ).reshape(-1)
 
-    def _actor_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
+    def _actor_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int, source: str) -> np.ndarray:
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
-            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix)
+            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix, source=source)
         return np.asarray(actor_agent.sample_actions(obs, pred), dtype=np.float32).reshape(actor_horizon, -1)
 
-    def _idm_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
+    def _idm_chunk(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int, source: str) -> np.ndarray:
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
-            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix)
+            pred = _eval_subgoal(obs, goal, ep_ix=ep_ix, source=source)
         return _idm_action_chunk(dynamics_agent, obs, pred, idm_horizon)
 
     for task_id in task_ids:
-        actor_episode_successes: list[float] = []
-        idm_episode_successes: list[float] = []
+        episode_successes_by_key: dict[str, list[float]] = {metric_key: [] for _, _, metric_key in variants}
 
         for ep_ix in range(total_eps):
             should_render = ep_ix >= num_eval
             count_stats = ep_ix < num_eval
             render_goal = bool(should_render)
-            ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=render_goal))
-            if 'goal' not in info:
-                raise RuntimeError(f'Env reset(task_id={task_id}) did not provide info["goal"].')
-            obs = np.asarray(ob, dtype=np.float32).reshape(-1)
-            goal = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
-            goal_frame = info.get('goal_rendered')
-            if goal_frame is not None:
-                goal_frame = np.asarray(goal_frame, dtype=np.uint8)
-
             record_wb = bool(wandb_enabled and should_render and num_video > 0 and ep_ix == num_eval)
-            actor_buf: list[np.ndarray] = [] if record_wb else []
 
-            ok_env = rollout_chunked_eval_episode(
-                env,
-                obs,
-                goal,
-                low,
-                high,
-                sample_action_chunk=lambda o, g: _actor_chunk(o, g, ep_ix=ep_ix),
-                render_buf=actor_buf if record_wb else None,
-                goal_frame=goal_frame,
-                should_render=bool(record_wb),
-                video_frame_skip=video_frame_skip,
-            )
-            if count_stats:
-                actor_episode_successes.append(1.0 if ok_env else 0.0)
-            if record_wb and actor_buf:
-                actor_video_by_task[int(task_id)] = np.stack(actor_buf, axis=0)
+            for subgoal_source, policy, metric_key in variants:
+                ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=render_goal))
+                if 'goal' not in info:
+                    raise RuntimeError(f'Env reset(task_id={task_id}) did not provide info["goal"].')
+                obs = np.asarray(ob, dtype=np.float32).reshape(-1)
+                goal = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+                goal_frame = info.get('goal_rendered')
+                if goal_frame is not None:
+                    goal_frame = np.asarray(goal_frame, dtype=np.uint8)
 
-            ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=render_goal))
-            if 'goal' not in info:
-                raise RuntimeError(f'Env reset(task_id={task_id}) did not provide info["goal"].')
-            obs = np.asarray(ob, dtype=np.float32).reshape(-1)
-            goal = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
-            goal_frame = info.get('goal_rendered')
-            if goal_frame is not None:
-                goal_frame = np.asarray(goal_frame, dtype=np.uint8)
+                is_primary_video = subgoal_source == primary_subgoal_source
+                buf: list[np.ndarray] = [] if record_wb and is_primary_video else []
+                if policy == 'actor':
+                    sampler = lambda o, g, source=subgoal_source: _actor_chunk(o, g, ep_ix=ep_ix, source=source)
+                else:
+                    sampler = lambda o, g, source=subgoal_source: _idm_chunk(o, g, ep_ix=ep_ix, source=source)
+                ok_env = rollout_chunked_eval_episode(
+                    env,
+                    obs,
+                    goal,
+                    low,
+                    high,
+                    sample_action_chunk=sampler,
+                    render_buf=buf if record_wb and is_primary_video else None,
+                    goal_frame=goal_frame,
+                    should_render=bool(record_wb and is_primary_video),
+                    video_frame_skip=video_frame_skip,
+                )
+                if count_stats:
+                    episode_successes_by_key[metric_key].append(1.0 if ok_env else 0.0)
+                if record_wb and is_primary_video and buf:
+                    if policy == 'actor':
+                        actor_video_by_task[int(task_id)] = np.stack(buf, axis=0)
+                    else:
+                        idm_video_by_task[int(task_id)] = np.stack(buf, axis=0)
 
-            idm_buf: list[np.ndarray] = [] if record_wb else []
-            ok_env_i = rollout_chunked_eval_episode(
-                env,
-                obs,
-                goal,
-                low,
-                high,
-                sample_action_chunk=lambda o, g: _idm_chunk(o, g, ep_ix=ep_ix),
-                render_buf=idm_buf if record_wb else None,
-                goal_frame=goal_frame,
-                should_render=bool(record_wb),
-                video_frame_skip=video_frame_skip,
-            )
-            if count_stats:
-                idm_episode_successes.append(1.0 if ok_env_i else 0.0)
-            if record_wb and idm_buf:
-                idm_video_by_task[int(task_id)] = np.stack(idm_buf, axis=0)
+        for _source, _policy, metric_key in variants:
+            task_success_rate = float(np.mean(episode_successes_by_key[metric_key]))
+            metrics[f'{metric_key}/task_{task_id}/success_rate'] = task_success_rate
+            task_successes_by_key[metric_key].append(task_success_rate)
 
-        task_success_rate = float(np.mean(actor_episode_successes))
-        metrics[f'eval/task_{task_id}/success_rate'] = task_success_rate
-        metrics[f'evaluation/task_{task_id}_success'] = task_success_rate
-        actor_task_successes.append(task_success_rate)
-
-        idm_task_success_rate = float(np.mean(idm_episode_successes))
+        primary_actor_key = 'eval_spi_subgoal_actor' if eval_four_way else 'eval_flow_actor'
+        primary_idm_key = 'eval_spi_subgoal_idm' if eval_four_way else 'eval_flow_idm'
+        actor_task_success_rate = metrics[f'{primary_actor_key}/task_{task_id}/success_rate']
+        idm_task_success_rate = metrics[f'{primary_idm_key}/task_{task_id}/success_rate']
+        metrics[f'eval/task_{task_id}/success_rate'] = actor_task_success_rate
+        metrics[f'evaluation/task_{task_id}_success'] = actor_task_success_rate
         metrics[f'eval_idm/task_{task_id}/success_rate'] = idm_task_success_rate
         metrics[f'evaluation/idm_task_{task_id}_success'] = idm_task_success_rate
-        idm_task_successes.append(idm_task_success_rate)
 
-    metrics['eval/success_rate_mean'] = float(np.mean(actor_task_successes))
-    metrics['eval_idm/success_rate_mean'] = float(np.mean(idm_task_successes))
+    for _source, _policy, metric_key in variants:
+        metrics[f'{metric_key}/success_rate_mean'] = float(np.mean(task_successes_by_key[metric_key]))
+    primary_actor_key = 'eval_spi_subgoal_actor' if eval_four_way else 'eval_flow_actor'
+    primary_idm_key = 'eval_spi_subgoal_idm' if eval_four_way else 'eval_flow_idm'
+    metrics['eval/success_rate_mean'] = metrics[f'{primary_actor_key}/success_rate_mean']
+    metrics['eval_idm/success_rate_mean'] = metrics[f'{primary_idm_key}/success_rate_mean']
     metrics['evaluation/overall_success'] = metrics['eval/success_rate_mean']
     metrics['evaluation/overall_idm_success'] = metrics['eval_idm/success_rate_mean']
+    metrics['eval/four_way_enabled'] = float(1.0 if eval_four_way else 0.0)
     metrics['eval/num_tasks'] = float(len(task_ids))
     metrics['eval/episodes_per_task'] = float(num_eval)
     metrics['eval/video_episodes_per_task'] = float(num_video)
@@ -1395,8 +1433,9 @@ def main(_):
         float(dynamics_config.get('dynamics_beta_max', 0.0)),
     )
     run_logger.info(
-        'subgoal mode=%s stochastic_loss=%s target_mode=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_style=%s value_expectile=%.4g value_gap_scale=%.4g value_weight_max=%.4g use_mean_for_actor_goal=%s',
+        'subgoal distribution=%s spi_enabled=%s stochastic_loss=%s target_mode=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_style=%s value_expectile=%.4g value_gap_scale=%.4g value_weight_max=%.4g use_mean_for_actor_goal=%s',
         str(dynamics_config.get('subgoal_distribution', '')),
+        _subgoal_spi_enabled_config(dynamics_config),
         str(dynamics_config.get('subgoal_stochastic_loss', 'mse')),
         str(dynamics_config.get('subgoal_target_mode', 'absolute')),
         int(dynamics_config.get('subgoal_steps', 0)),
@@ -1418,6 +1457,17 @@ def main(_):
         int(dynamics_config.get('subgoal_eval_num_samples', 1)),
         str(final_eval_n_values) if final_eval_n_values else 'off',
         bool(dynamics_config.get('subgoal_eval_include_zero_candidate', True)),
+    )
+    run_logger.info(
+        'subgoal_spi proposal=%s samples=%d beta=%.4g tau=%.4g energy_norm_eps=%.4g include_mean=%s loss_w=%.4g proposal_loss_w=%.4g',
+        str(dynamics_config.get('subgoal_spi_proposal_distribution', 'flow')),
+        int(dynamics_config.get('subgoal_spi_num_samples', 0)),
+        float(dynamics_config.get('subgoal_spi_beta', 0.0)),
+        float(dynamics_config.get('subgoal_spi_tau', 0.0)),
+        float(dynamics_config.get('subgoal_spi_energy_norm_eps', 0.0)),
+        bool(dynamics_config.get('subgoal_spi_include_mean_candidate', True)),
+        float(dynamics_config.get('subgoal_spi_loss_weight', 0.0)),
+        float(dynamics_config.get('subgoal_spi_proposal_loss_weight', 0.0)),
     )
     run_logger.info(
         'planner_sampling plan_noise_scale=%.4g forward_bridge_mode=%s forward_bridge_use_path_loss=%s path_loss_weight=%.4g rollout_horizon=%d rollout_loss_weight=%.4g',

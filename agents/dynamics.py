@@ -221,7 +221,31 @@ class SubgoalFlowNet(nn.Module):
 
 
 def _subgoal_mode(config) -> str:
-    return str(config.get('subgoal_distribution', 'deterministic')).lower()
+    mode = str(config.get('subgoal_distribution', 'deterministic')).lower()
+    if mode == 'deterministic_spi':
+        # Backward-compatible alias from early experiments: use the configured
+        # proposal distribution as the actual subgoal distribution, and enable
+        # the separate deterministic SPI net below.
+        return str(config.get('subgoal_spi_proposal_distribution', 'flow')).lower()
+    return mode
+
+
+def _subgoal_base_mode(config) -> str:
+    return _subgoal_mode(config)
+
+
+def _subgoal_spi_enabled(config) -> bool:
+    return bool(config.get('subgoal_spi_enabled', False)) or _subgoal_mode(config) == 'deterministic_spi'
+
+
+def _subgoal_spi_proposal_mode(config) -> str:
+    mode = _subgoal_mode(config)
+    if mode not in ('flow', 'diag_gaussian'):
+        raise ValueError(
+            "subgoal SPI requires subgoal_distribution to be 'flow' or 'diag_gaussian', "
+            f"got {mode!r}."
+        )
+    return mode
 
 
 def _subgoal_stochastic_loss(config) -> str:
@@ -721,20 +745,29 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             out = out[0]
         return out
 
-    def _subgoal_forward(self, observations, high_actor_goals, params=None):
+    def _subgoal_forward(self, observations, high_actor_goals, params=None, network_name: str = 'subgoal_net'):
         """Raw subgoal-net forward.
 
         Returns either a single tensor (deterministic mode) or a ``(mu, log_std)``
         tuple (diag_gaussian mode).  Used internally; external callers should
         prefer ``infer_subgoal`` / ``infer_subgoal_distribution``.
         """
-        return self.network.select('subgoal_net')(
+        return self.network.select(network_name)(
             self._normalize_abs_state(observations),
             self._normalize_abs_state(high_actor_goals),
             params=params,
         )
 
-    def _subgoal_flow_sample_raw(self, observations, high_actor_goals, noise, *, params=None, steps=None):
+    def _subgoal_flow_sample_raw(
+        self,
+        observations,
+        high_actor_goals,
+        noise,
+        *,
+        params=None,
+        steps=None,
+        network_name: str = 'subgoal_net',
+    ):
         """Euler-sample the rectified-flow subgoal endpoint in raw subgoal frame."""
         steps = int(steps or self.config.get('subgoal_flow_steps', 8))
         if steps < 1:
@@ -745,18 +778,27 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
         def body(k, x):
             u = jnp.full((x.shape[0], 1), k.astype(jnp.float32) / jnp.asarray(steps, dtype=jnp.float32))
-            v = self.network.select('subgoal_net')(obs_n, goal_n, x, u, params=params)
+            v = self.network.select(network_name)(obs_n, goal_n, x, u, params=params)
             return x + dt * v
 
         return jax.lax.fori_loop(0, steps, body, jnp.asarray(noise, dtype=jnp.float32))
 
-    def _subgoal_flow_predict_abs(self, observations, high_actor_goals, *, params=None, steps=None):
+    def _subgoal_flow_predict_abs(
+        self,
+        observations,
+        high_actor_goals,
+        *,
+        params=None,
+        steps=None,
+        network_name: str = 'subgoal_net',
+    ):
         raw = self._subgoal_flow_sample_raw(
             observations,
             high_actor_goals,
             jnp.zeros_like(jnp.asarray(observations, dtype=jnp.float32)),
             params=params,
             steps=steps,
+            network_name=network_name,
         )
         return self._subgoal_abs_from_raw(observations, raw)
 
@@ -788,6 +830,23 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         """Backward-compatible alias for :meth:`predict_subgoal`."""
         return self.predict_subgoal(observations, high_actor_goals)
 
+    @jax.jit
+    def predict_spi_subgoal(self, observations, high_actor_goals):
+        """Return the deterministic SPI subgoal endpoint from ``subgoal_spi_net``."""
+        squeeze = observations.ndim == 1
+        if squeeze:
+            observations = observations[None]
+            high_actor_goals = high_actor_goals[None]
+        raw = self._subgoal_forward(
+            observations,
+            high_actor_goals,
+            network_name='subgoal_spi_net',
+        )
+        out = self._subgoal_abs_from_raw(observations, raw)
+        if squeeze:
+            out = out[0]
+        return out
+
     def infer_subgoal_for_eval(
         self,
         observations,
@@ -808,6 +867,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
           to ``high_actor_goals`` (no critic needed).
         """
         selection = str(self.config.get('subgoal_eval_selection', 'zero_noise')).lower()
+        sub_mode = _subgoal_base_mode(self.config)
+        if _subgoal_spi_enabled(self.config):
+            return self.predict_spi_subgoal(observations, high_actor_goals)
+        if sub_mode == 'deterministic':
+            return self.predict_subgoal(observations, high_actor_goals)
         if selection in ('zero', 'zero_noise', 'mean', 'deterministic'):
             return self.predict_subgoal(observations, high_actor_goals)
 
@@ -817,6 +881,12 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             high_actor_goals = high_actor_goals[None]
         if rng is None:
             rng = jax.random.PRNGKey(int(self.config.get('subgoal_eval_seed', 0)))
+        score_mode = str(
+            self.config.get(
+                'subgoal_eval_score_mode',
+                'product' if _subgoal_spi_enabled(self.config) else 'ratio',
+            )
+        ).lower()
 
         if selection == 'sample':
             candidates, _ = self.sample_subgoal_candidates(
@@ -855,6 +925,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 candidates,
                 high_actor_goals,
                 network_params=critic_agent.network.params,
+                score_mode=score_mode,
             )
         else:
             return self.predict_subgoal(
@@ -867,6 +938,88 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             best_idx[:, None, None],
             axis=1,
         )[:, 0, :]
+        if squeeze:
+            best = best[0]
+        return best
+
+    def infer_proposal_subgoal_for_eval(
+        self,
+        observations,
+        high_actor_goals,
+        critic_agent=None,
+        rng=None,
+    ):
+        """Eval-time endpoint selection from the SPI proposal subgoal net.
+
+        This is used only when ``subgoal_spi_enabled`` is true so eval can
+        report both proposal-flow and deterministic-SPI subgoal paths.
+        """
+        if not _subgoal_spi_enabled(self.config):
+            return self.infer_subgoal_for_eval(observations, high_actor_goals, critic_agent=critic_agent, rng=rng)
+
+        selection = str(self.config.get('subgoal_eval_selection', 'zero_noise')).lower()
+        squeeze = observations.ndim == 1
+        if squeeze:
+            observations = observations[None]
+            high_actor_goals = high_actor_goals[None]
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        goals = jnp.asarray(high_actor_goals, dtype=jnp.float32)
+        if rng is None:
+            rng = jax.random.PRNGKey(int(self.config.get('subgoal_eval_seed', 0)))
+        score_mode = str(self.config.get('subgoal_eval_score_mode', 'product')).lower()
+
+        if selection in ('zero', 'zero_noise', 'mean', 'deterministic'):
+            candidates_raw, mu_raw = self._sample_spi_proposal_candidates_raw(
+                obs,
+                goals,
+                rng,
+                params=self.network.params,
+                num_candidates=1,
+                include_mean=True,
+            )
+            del candidates_raw
+            out = self._subgoal_abs_from_raw(obs, mu_raw)
+            if squeeze:
+                out = out[0]
+            return out
+
+        num_samples = max(1, int(self.config.get('subgoal_eval_num_samples', 4)))
+        include_zero = bool(self.config.get('subgoal_eval_include_zero_candidate', True))
+        candidates_raw, _ = self._sample_spi_proposal_candidates_raw(
+            obs,
+            goals,
+            rng,
+            params=self.network.params,
+            num_candidates=num_samples,
+            include_mean=include_zero,
+        )
+        candidates = self._subgoal_candidates_abs_from_raw(obs, candidates_raw)
+        if selection == 'sample':
+            best = candidates[:, 0, :]
+        elif selection == 'best_of_n_goal_l2':
+            scores = -jnp.mean((candidates - goals[:, None, :]) ** 2, axis=-1)
+            best_idx = jnp.argmax(scores, axis=1)
+            best = jnp.take_along_axis(candidates, best_idx[:, None, None], axis=1)[:, 0, :]
+        elif selection == 'best_of_n_value':
+            if critic_agent is None:
+                raise RuntimeError(
+                    "subgoal_eval_selection='best_of_n_value' requires a critic "
+                    'agent providing value params (score_transitive_subgoals).'
+                )
+            scores = critic_agent.score_transitive_subgoals(
+                obs,
+                candidates,
+                goals,
+                network_params=critic_agent.network.params,
+                score_mode=score_mode,
+            )
+            best_idx = jnp.argmax(scores, axis=1)
+            best = jnp.take_along_axis(candidates, best_idx[:, None, None], axis=1)[:, 0, :]
+        else:
+            out = self._subgoal_abs_from_raw(obs, candidates_raw[:, 0, :])
+            if squeeze:
+                out = out[0]
+            return out
         if squeeze:
             best = best[0]
         return best
@@ -1231,7 +1384,13 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             progress_alpha=float(config.get('progress_alpha', 0.8)),
         )
 
-        sub_mode = _subgoal_mode(config)
+        sub_mode = _subgoal_base_mode(config)
+        spi_enabled = _subgoal_spi_enabled(config)
+        if spi_enabled and sub_mode not in ('flow', 'diag_gaussian'):
+            raise ValueError(
+                "subgoal_spi_enabled adds a deterministic SPI net on top of a stochastic proposal; "
+                "set subgoal_distribution to 'flow' or 'diag_gaussian'."
+            )
         stochastic_loss = _subgoal_stochastic_loss(config)
         if stochastic_loss not in ('mse', 'nll'):
             raise ValueError(
@@ -1248,6 +1407,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 phi_goal_obs_indices=phi_idxs,
                 env_name=env_name_for_phi,
             )
+            if spi_enabled:
+                raise ValueError(
+                    "subgoal_spi_enabled adds a deterministic SPI net on top of a stochastic proposal; "
+                    "set subgoal_distribution to 'flow' or 'diag_gaussian'."
+                )
         elif sub_mode == 'diag_gaussian':
             subgoal_def = DistributionalSubgoalEstimatorNet(
                 hidden_dims=tuple(config['subgoal_hidden_dims']),
@@ -1276,7 +1440,19 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             )
         else:
             raise ValueError(
-                "subgoal_distribution must be 'deterministic', 'diag_gaussian', or 'flow'"
+                "subgoal_distribution must be 'deterministic', 'diag_gaussian', or 'flow' "
+                "(legacy 'deterministic_spi' is accepted as flow proposal + SPI)."
+            )
+        if spi_enabled:
+            subgoal_spi_def = SubgoalEstimatorNet(
+                hidden_dims=tuple(config['subgoal_hidden_dims']),
+                state_dim=state_dim,
+                layer_norm=config['layer_norm'],
+                goal_representation=str(
+                    config.get('subgoal_goal_representation', config.get('goal_representation', 'full')),
+                ),
+                phi_goal_obs_indices=phi_idxs,
+                env_name=env_name_for_phi,
             )
         idm_def = InverseDynamicsMLP(
             obs_dim=state_dim,
@@ -1312,11 +1488,15 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         dummy_t = jnp.zeros((batch_size, horizon), dtype=jnp.float32)
 
         subgoal_args = (dummy_x, dummy_g, dummy_sub_x, dummy_u) if sub_mode == 'flow' else (dummy_x, dummy_g)
+        if spi_enabled:
+            subgoal_spi_args = (dummy_x, dummy_g)
         network_info = dict(
             path_residual_net=(path_residual_def, (dummy_x, dummy_x, dummy_t)),
             subgoal_net=(subgoal_def, subgoal_args),
             idm_net=(idm_def, (dummy_x, dummy_next)),
         )
+        if spi_enabled:
+            network_info['subgoal_spi_net'] = (subgoal_spi_def, subgoal_spi_args)
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -1437,6 +1617,105 @@ class DynamicsAgent(_DynamicsAgentCore):
         value_logits = value_def.apply({'params': frozen_value_params}, states, high_actor_goals)
         return jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
 
+    def _subgoal_product_energy(
+        self,
+        observations: jnp.ndarray,
+        subgoals: jnp.ndarray,
+        high_actor_goals: jnp.ndarray,
+        critic_value_params: Any | None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Score subgoal candidates with E(s,z,g)=V(s,z)*V(z,g)."""
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        z = jnp.asarray(subgoals, dtype=jnp.float32)
+        g = jnp.asarray(high_actor_goals, dtype=jnp.float32)
+        num_candidates = z.shape[1] if z.ndim == 3 else 1
+        obs_rep = jnp.repeat(obs[:, None, :], num_candidates, axis=1).reshape(obs.shape[0] * num_candidates, -1)
+        if z.ndim == 3:
+            z_flat = z.reshape(z.shape[0] * num_candidates, -1)
+        else:
+            z_flat = z
+        if g.ndim == 3:
+            g_flat = g.reshape(g.shape[0] * num_candidates, -1)
+        else:
+            g_flat = jnp.repeat(g[:, None, :], num_candidates, axis=1).reshape(obs.shape[0] * num_candidates, -1)
+        v_s_z = self._subgoal_values(obs_rep, z_flat, critic_value_params)
+        v_z_g = self._subgoal_values(z_flat, g_flat, critic_value_params)
+        energy = v_s_z * v_z_g
+        out_shape = (obs.shape[0], num_candidates)
+        return energy.reshape(out_shape), v_s_z.reshape(out_shape), v_z_g.reshape(out_shape)
+
+    def _subgoal_raw_from_abs_candidates(self, observations: jnp.ndarray, candidates_abs: jnp.ndarray) -> jnp.ndarray:
+        """Map absolute candidates ``[B,N,D]`` into the subgoal loss raw frame."""
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        cand = jnp.asarray(candidates_abs, dtype=jnp.float32)
+        if self._is_displacement_mode():
+            return self._normalize_delta_state(cand - obs[:, None, :])
+        return self._normalize_abs_state(cand)
+
+    def _sample_spi_proposal_candidates_raw(
+        self,
+        observations: jnp.ndarray,
+        high_actor_goals: jnp.ndarray,
+        rng,
+        *,
+        params,
+        num_candidates: int,
+        include_mean: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Sample raw-frame candidates from the SPI proposal network."""
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        goals = jnp.asarray(high_actor_goals, dtype=jnp.float32)
+        proposal_mode = _subgoal_spi_proposal_mode(self.config)
+        if proposal_mode == 'flow':
+            B, D = obs.shape
+            noise_scale = float(self.config.get('subgoal_flow_noise_scale', 1.0))
+            temperature = float(self.config.get('subgoal_temperature', 1.0))
+            n_rand = num_candidates - 1 if include_mean else num_candidates
+            z0 = jnp.zeros((B, 1 if include_mean else 0, D), dtype=jnp.float32)
+            z_rand = jax.random.normal(rng, (B, n_rand, D), dtype=jnp.float32) * (noise_scale * temperature)
+            z = jnp.concatenate([z0, z_rand], axis=1)
+            flat_obs = jnp.repeat(obs[:, None, :], num_candidates, axis=1).reshape(B * num_candidates, D)
+            flat_goals = jnp.repeat(goals[:, None, :], num_candidates, axis=1).reshape(B * num_candidates, D)
+            flat_z = z.reshape(B * num_candidates, D)
+            flat_raw = self._subgoal_flow_sample_raw(
+                flat_obs,
+                flat_goals,
+                flat_z,
+                params=params,
+                steps=int(self.config.get('subgoal_flow_steps', 8)),
+                network_name='subgoal_net',
+            )
+            candidates_raw = flat_raw.reshape(B, num_candidates, D)
+            mu_raw = candidates_raw[:, 0, :] if include_mean else self._subgoal_flow_sample_raw(
+                obs,
+                goals,
+                jnp.zeros_like(obs),
+                params=params,
+                steps=int(self.config.get('subgoal_flow_steps', 8)),
+                network_name='subgoal_net',
+            )
+            return candidates_raw, mu_raw
+
+        mu_raw, log_std = self._subgoal_forward(
+            obs,
+            goals,
+            params=params,
+            network_name='subgoal_net',
+        )
+        std = jnp.exp(log_std) * float(self.config.get('subgoal_temperature', 1.0))
+        n_sample = num_candidates - 1 if include_mean else num_candidates
+        if n_sample > 0:
+            eps = jax.random.normal(rng, (n_sample, mu_raw.shape[0], mu_raw.shape[-1]))
+            sampled = mu_raw[None, :, :] + eps * std[None, :, :]
+            sampled = jnp.swapaxes(sampled, 0, 1)
+        else:
+            sampled = jnp.zeros((mu_raw.shape[0], 0, mu_raw.shape[-1]), dtype=mu_raw.dtype)
+        if include_mean:
+            candidates_raw = jnp.concatenate([mu_raw[:, None, :], sampled], axis=1)
+        else:
+            candidates_raw = sampled
+        return candidates_raw, mu_raw
+
     def _subgoal_value_terms(
         self,
         observations: jnp.ndarray,
@@ -1547,9 +1826,215 @@ class DynamicsAgent(_DynamicsAgentCore):
         g_high = batch['high_actor_goals']
         target_abs = batch['high_actor_targets']
         target = self._subgoal_target_for_loss(s, target_abs)
-        sub_mode = _subgoal_mode(self.config)
+        sub_mode = _subgoal_base_mode(self.config)
 
-        if sub_mode == 'flow':
+        if _subgoal_spi_enabled(self.config):
+            proposal_rng, aux_rng = jax.random.split(rng_fr, 2)
+            pred_sg = self.network.select('subgoal_spi_net')(
+                self._normalize_abs_state(s),
+                self._normalize_abs_state(g_high),
+                params=grad_params,
+            )
+            pred_sg_abs = self._subgoal_abs_from_raw(s, pred_sg)
+            subgoal_mse = jnp.mean((pred_sg - target) ** 2, axis=-1)
+
+            num_candidates = max(1, int(self.config.get('subgoal_spi_num_samples', 16)))
+            include_mean = bool(self.config.get('subgoal_spi_include_mean_candidate', True))
+            candidate_raw, proposal_mu_raw = self._sample_spi_proposal_candidates_raw(
+                s,
+                g_high,
+                proposal_rng,
+                params=grad_params,
+                num_candidates=num_candidates,
+                include_mean=include_mean,
+            )
+            candidate_abs = self._subgoal_candidates_abs_from_raw(s, candidate_raw)
+            candidate_energy, candidate_v_s_z, candidate_v_z_g = self._subgoal_product_energy(
+                s, candidate_abs, g_high, critic_value_params,
+            )
+            candidate_energy_sg = jax.lax.stop_gradient(candidate_energy)
+            rho = jax.nn.softmax(float(self.config.get('subgoal_spi_beta', 1.0)) * candidate_energy_sg, axis=1)
+            rho = jax.lax.stop_gradient(rho)
+            prox = jnp.sum(
+                rho * jnp.mean((pred_sg[:, None, :] - jax.lax.stop_gradient(candidate_raw)) ** 2, axis=-1),
+                axis=1,
+            )
+
+            det_energy, det_v_s_z, det_v_z_g = self._subgoal_product_energy(
+                s, pred_sg_abs, g_high, critic_value_params,
+            )
+            det_energy = det_energy[:, 0]
+            det_v_s_z = det_v_s_z[:, 0]
+            det_v_z_g = det_v_z_g[:, 0]
+            energy_eps = jnp.asarray(float(self.config.get('subgoal_spi_energy_norm_eps', 1e-6)), dtype=jnp.float32)
+            energy_scale = jax.lax.stop_gradient(jnp.mean(jnp.abs(det_energy)) + energy_eps)
+            spi_tau = jnp.asarray(float(self.config.get('subgoal_spi_tau', 5.0)), dtype=jnp.float32)
+            loss_spi = jnp.mean(-det_energy / energy_scale + prox / (2.0 * spi_tau))
+
+            proposal_mode = _subgoal_spi_proposal_mode(self.config)
+            zero = jnp.asarray(0.0, dtype=jnp.float32)
+            if proposal_mode == 'flow':
+                eps_rng, u_rng, sample_rng = jax.random.split(aux_rng, 3)
+                eps = jax.random.normal(eps_rng, target.shape, dtype=target.dtype)
+                t_min = float(self.config.get('subgoal_flow_t_min', 1e-4))
+                u = jax.random.uniform(
+                    u_rng,
+                    (target.shape[0], 1),
+                    minval=t_min,
+                    maxval=1.0 - t_min,
+                    dtype=target.dtype,
+                )
+                x_u = (1.0 - u) * eps + u * target
+                v_target = target - eps
+                v_pred = self.network.select('subgoal_net')(
+                    self._normalize_abs_state(s),
+                    self._normalize_abs_state(g_high),
+                    x_u,
+                    u,
+                    params=grad_params,
+                )
+                proposal_per = jnp.mean((v_pred - v_target) ** 2, axis=-1)
+                sample_noise = jax.random.normal(sample_rng, target.shape, dtype=target.dtype)
+                proposal_sample_raw = self._subgoal_flow_sample_raw(
+                    s,
+                    g_high,
+                    sample_noise,
+                    params=grad_params,
+                    network_name='subgoal_net',
+                )
+                proposal_sample_abs = self._subgoal_abs_from_raw(s, proposal_sample_raw)
+                (
+                    proposal_value,
+                    current_value,
+                    target_value,
+                    proposal_value_bonus,
+                    proposal_mse_weight,
+                    subgoal_value_gap,
+                    subgoal_adv_logit,
+                    proposal_v_s_z,
+                    proposal_v_z_g,
+                ) = self._subgoal_value_terms(s, proposal_sample_abs, target_abs, g_high, critic_value_params)
+                proposal_weighted_mse = jax.lax.stop_gradient(proposal_mse_weight) * proposal_per
+                velocity_reg = float(self.config.get('subgoal_flow_velocity_reg', 0.0))
+                velocity_norm_sq = jnp.sum(v_pred ** 2, axis=-1)
+                proposal_loss = (
+                    jnp.mean(proposal_weighted_mse)
+                    - jnp.mean(proposal_value_bonus)
+                    + velocity_reg * jnp.mean(velocity_norm_sq)
+                )
+                proposal_nll = zero
+                proposal_std_mean = zero
+                proposal_std_max = zero
+                proposal_stochastic_mode = jnp.asarray(2.0, dtype=jnp.float32)
+                proposal_sample_mse = jnp.mean(proposal_per)
+                proposal_mean_mse = jnp.mean((proposal_mu_raw - target) ** 2)
+                proposal_weighted_nll = zero
+            else:
+                pred_mu, pred_log_std = self.network.select('subgoal_net')(
+                    self._normalize_abs_state(s),
+                    self._normalize_abs_state(g_high),
+                    params=grad_params,
+                )
+                pred_std = jnp.exp(pred_log_std)
+                inv_var = jnp.exp(-2.0 * pred_log_std)
+                mean_diff = target - pred_mu
+                proposal_nll_per = 0.5 * jnp.sum(
+                    mean_diff ** 2 * inv_var + 2.0 * pred_log_std + jnp.log(2.0 * jnp.pi), axis=-1
+                )
+                eps = jax.random.normal(aux_rng, pred_mu.shape, dtype=pred_mu.dtype)
+                proposal_sample_raw = pred_mu + eps * pred_std
+                proposal_sample_abs = self._subgoal_abs_from_raw(s, proposal_sample_raw)
+                proposal_per = jnp.mean((target - proposal_sample_raw) ** 2, axis=-1)
+                proposal_mean_mse_per = jnp.mean(mean_diff ** 2, axis=-1)
+                (
+                    proposal_value,
+                    current_value,
+                    target_value,
+                    proposal_value_bonus,
+                    proposal_mse_weight,
+                    subgoal_value_gap,
+                    subgoal_adv_logit,
+                    proposal_v_s_z,
+                    proposal_v_z_g,
+                ) = self._subgoal_value_terms(s, proposal_sample_abs, target_abs, g_high, critic_value_params)
+                proposal_weighted_mse = jax.lax.stop_gradient(proposal_mse_weight) * proposal_per
+                proposal_weighted_nll = jax.lax.stop_gradient(proposal_mse_weight) * proposal_nll_per
+                stochastic_loss = _subgoal_stochastic_loss(self.config)
+                if stochastic_loss == 'mse':
+                    proposal_stochastic_term = jnp.mean(proposal_weighted_mse)
+                    proposal_stochastic_mode = jnp.asarray(0.0, dtype=jnp.float32)
+                elif stochastic_loss == 'nll':
+                    proposal_stochastic_term = jnp.mean(proposal_weighted_nll)
+                    proposal_stochastic_mode = jnp.asarray(1.0, dtype=jnp.float32)
+                else:
+                    raise ValueError(
+                        f"subgoal_stochastic_loss must be 'mse' or 'nll', got {stochastic_loss!r}."
+                    )
+                proposal_loss = proposal_stochastic_term - jnp.mean(proposal_value_bonus)
+                proposal_nll = jnp.mean(proposal_nll_per)
+                proposal_std_mean = jnp.mean(pred_std)
+                proposal_std_max = jnp.max(pred_std)
+                proposal_sample_mse = jnp.mean(proposal_per)
+                proposal_mean_mse = jnp.mean(proposal_mean_mse_per)
+
+            proposal_product = proposal_v_s_z * proposal_v_z_g
+            proposal_ratio = proposal_product / (
+                current_value + jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-6)), dtype=jnp.float32)
+            )
+            loss_sub = (
+                float(self.config.get('subgoal_spi_loss_weight', 1.0)) * loss_spi
+                + float(self.config.get('subgoal_spi_proposal_loss_weight', 1.0)) * proposal_loss
+            )
+            pred_sg_out = pred_sg
+            subgoal_value = det_energy
+            subgoal_value_bonus = det_energy
+            subgoal_extra_info = {
+                'phase1/subgoal_nll': proposal_nll,
+                'phase1/subgoal_stochastic_loss': proposal_loss,
+                'phase1/subgoal_stochastic_loss_mode': proposal_stochastic_mode,
+                'phase1/subgoal_mean_mse': proposal_mean_mse,
+                'phase1/subgoal_sample_mse': proposal_sample_mse,
+                'phase1/subgoal_weighted_mse': jnp.mean(proposal_weighted_mse),
+                'phase1/subgoal_weighted_nll': jnp.mean(proposal_weighted_nll),
+                'phase1/subgoal_std_mean': proposal_std_mean,
+                'phase1/subgoal_std_max': proposal_std_max,
+                'phase1/subgoal_mode': jnp.asarray(3.0, dtype=jnp.float32),
+                'phase1/subgoal_current_value_mean': jnp.mean(current_value),
+                'phase1/subgoal_target_value_mean': jnp.mean(target_value),
+                'phase1/subgoal_mse_weight_mean': jnp.mean(proposal_mse_weight),
+                'phase1/subgoal_value_gap_mean': jnp.mean(subgoal_value_gap),
+                'phase1/subgoal_value_gap_min': jnp.min(subgoal_value_gap),
+                'phase1/subgoal_value_gap_max': jnp.max(subgoal_value_gap),
+                'phase1/subgoal_adv_logit_mean': jnp.mean(subgoal_adv_logit),
+                'phase1/subgoal_adv_logit_min': jnp.min(subgoal_adv_logit),
+                'phase1/subgoal_adv_logit_max': jnp.max(subgoal_adv_logit),
+                'phase1/subgoal_value_bonus_style': jnp.asarray(1.0, dtype=jnp.float32),
+                'phase1/subgoal_trl_v_s_sg_mean': jnp.mean(proposal_v_s_z),
+                'phase1/subgoal_trl_v_sg_g_mean': jnp.mean(proposal_v_z_g),
+                'phase1/subgoal_bonus_type_id': self._subgoal_bonus_type_id(),
+                'phase1/subgoal_v_s_z_mean': jnp.mean(det_v_s_z),
+                'phase1/subgoal_v_z_g_mean': jnp.mean(det_v_z_g),
+                'phase1/subgoal_v_s_g_mean': jnp.mean(current_value),
+                'phase1/subgoal_transitive_product_mean': jnp.mean(proposal_product),
+                'phase1/subgoal_transitive_ratio_mean': jnp.mean(proposal_ratio),
+                'phase1/subgoal_spi_loss': loss_spi,
+                'phase1/subgoal_spi_proposal_loss': proposal_loss,
+                'phase1/subgoal_spi_energy_mean': jnp.mean(det_energy),
+                'phase1/subgoal_spi_candidate_energy_mean': jnp.mean(candidate_energy),
+                'phase1/subgoal_spi_candidate_energy_max': jnp.max(candidate_energy),
+                'phase1/subgoal_spi_prox_mean': jnp.mean(prox),
+                'phase1/subgoal_spi_rho_entropy': -jnp.mean(
+                    jnp.sum(rho * jnp.log(rho + jnp.asarray(1e-8, dtype=jnp.float32)), axis=1)
+                ),
+                'phase1/subgoal_spi_rho_max_mean': jnp.max(rho, axis=1).mean(),
+                'phase1/subgoal_spi_num_candidates': jnp.asarray(float(num_candidates), dtype=jnp.float32),
+                'phase1/subgoal_spi_proposal_mode': jnp.asarray(
+                    2.0 if proposal_mode == 'flow' else 1.0, dtype=jnp.float32,
+                ),
+                'phase1/subgoal_spi_candidate_v_s_z_mean': jnp.mean(candidate_v_s_z),
+                'phase1/subgoal_spi_candidate_v_z_g_mean': jnp.mean(candidate_v_z_g),
+            }
+        elif sub_mode == 'flow':
             eps_rng, u_rng, sample_rng = jax.random.split(rng_fr, 3)
             eps = jax.random.normal(eps_rng, target.shape, dtype=target.dtype)
             t_min = float(self.config.get('subgoal_flow_t_min', 1e-4))
@@ -2142,9 +2627,21 @@ def _get_common_config():
             subgoal_flow_time_embed_dim=64,
             subgoal_flow_use_time_embedding=True,
             subgoal_flow_velocity_reg=0.0,
+            # Deterministic subgoal SPI: train a point subgoal policy against
+            # flow/Gaussian proposal candidates scored by V(s,z) * V(z,g).
+            subgoal_spi_enabled=False,
+            subgoal_spi_proposal_distribution='flow',
+            subgoal_spi_num_samples=16,
+            subgoal_spi_beta=1.0,
+            subgoal_spi_tau=5.0,
+            subgoal_spi_energy_norm_eps=1e-6,
+            subgoal_spi_include_mean_candidate=True,
+            subgoal_spi_loss_weight=1.0,
+            subgoal_spi_proposal_loss_weight=1.0,
             subgoal_eval_selection='zero_noise',
             subgoal_eval_num_samples=4,
             subgoal_eval_include_zero_candidate=True,
+            subgoal_eval_score_mode='ratio',
             subgoal_eval_seed=0,
             discount=0.99,
             subgoal_steps=25,

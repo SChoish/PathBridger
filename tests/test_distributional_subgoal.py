@@ -33,7 +33,7 @@ from agents.dynamics import (
     get_dynamics_config,
 )
 from agents.critic import CriticAgent, get_config as get_critic_config
-from main import _rescore_actor_batch_for_update
+from main import _evaluate_env_tasks, _rescore_actor_batch_for_update
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +202,23 @@ def test_critic_score_action_chunks_with_per_candidate_goals():
     assert raised, 'expected per-candidate goal/chunk mismatch to raise'
 
 
+def test_critic_transitive_subgoal_score_product_mode():
+    critic = _make_critic_agent()
+    zero_params = jax.tree_util.tree_map(jnp.zeros_like, critic.network.params)
+    critic = critic.replace(network=critic.network.replace(params=zero_params))
+    obs = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
+    cand = jnp.zeros((BATCH, 3, STATE_DIM), dtype=jnp.float32)
+    goals = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
+
+    product = critic.score_transitive_subgoals(obs, cand, goals, score_mode='product')
+    ratio = critic.score_transitive_subgoals(obs, cand, goals, score_mode='ratio')
+
+    assert product.shape == (BATCH, 3)
+    assert ratio.shape == (BATCH, 3)
+    np.testing.assert_allclose(np.asarray(product), 0.25, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(ratio), 0.5, rtol=1e-4, atol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # 5. plan_candidates=1 and >1 both succeed (deterministic + diag_gaussian)
 # ---------------------------------------------------------------------------
@@ -360,6 +377,137 @@ def test_deterministic_subgoal_loss_is_finite_and_logs_are_stable():
     assert float(info['phase1/subgoal_stochastic_loss_mode']) == 0.0
 
 
+def test_deterministic_spi_subgoal_loss_is_finite_with_flow_proposals():
+    agent = _make_dynamics_agent(
+        'flow',
+        config_updates={
+            'subgoal_spi_enabled': True,
+            'subgoal_spi_proposal_distribution': 'flow',
+            'subgoal_spi_num_samples': 4,
+        },
+    )
+    batch = _make_phase1_batch()
+    _, info = agent.update(batch, critic_value_params=None)
+    for k, v in info.items():
+        assert np.all(np.isfinite(np.asarray(v))), f'non-finite log value at {k}: {v}'
+    assert float(info['phase1/subgoal_mode']) == 3.0
+    assert float(info['phase1/subgoal_spi_num_candidates']) == 4.0
+    assert float(info['phase1/subgoal_spi_proposal_mode']) == 2.0
+    assert 'phase1/subgoal_spi_loss' in info
+    assert 'phase1/subgoal_spi_proposal_loss' in info
+
+
+def test_deterministic_spi_subgoal_loss_is_finite_with_gaussian_proposals():
+    agent = _make_dynamics_agent(
+        'diag_gaussian',
+        config_updates={
+            'subgoal_spi_enabled': True,
+            'subgoal_spi_proposal_distribution': 'diag_gaussian',
+            'subgoal_spi_num_samples': 4,
+        },
+    )
+    batch = _make_phase1_batch()
+    _, info = agent.update(batch, critic_value_params=None)
+    for k, v in info.items():
+        assert np.all(np.isfinite(np.asarray(v))), f'non-finite log value at {k}: {v}'
+    assert float(info['phase1/subgoal_mode']) == 3.0
+    assert float(info['phase1/subgoal_spi_proposal_mode']) == 1.0
+
+
+def test_deterministic_spi_eval_uses_point_subgoal_without_best_of_n(monkeypatch):
+    agent = _make_dynamics_agent(
+        'flow',
+        config_updates={
+            'subgoal_spi_enabled': True,
+            'subgoal_eval_selection': 'best_of_n_value',
+            'subgoal_eval_num_samples': 16,
+        },
+    )
+
+    def fail_sample_candidates(*_args, **_kwargs):
+        raise AssertionError('deterministic SPI eval should not sample candidate subgoals')
+
+    class FailCritic:
+        network = type('Network', (), {'params': {}})()
+
+        def score_transitive_subgoals(self, *_args, **_kwargs):
+            raise AssertionError('deterministic SPI eval should not score duplicate candidates')
+
+    monkeypatch.setattr(DynamicsAgent, 'sample_subgoal_candidates', fail_sample_candidates)
+    obs = jnp.zeros((STATE_DIM,), dtype=jnp.float32)
+    goal = jnp.ones((STATE_DIM,), dtype=jnp.float32)
+
+    out = agent.infer_subgoal_for_eval(obs, goal, critic_agent=FailCritic(), rng=jax.random.PRNGKey(0))
+    expected = agent.predict_spi_subgoal(obs, goal)
+    np.testing.assert_allclose(np.asarray(out), np.asarray(expected), rtol=1e-6, atol=1e-6)
+
+
+class _FourWayEvalEnv:
+    action_space = type('ActionSpace', (), {
+        'low': np.array([-1.0], dtype=np.float32),
+        'high': np.array([1.0], dtype=np.float32),
+    })()
+    _max_episode_steps = 1
+
+    def reset(self, *, seed=None, options=None):
+        self.t = 0
+        return np.zeros((STATE_DIM,), dtype=np.float32), {'goal': np.ones((STATE_DIM,), dtype=np.float32)}
+
+    def step(self, action):
+        self.t += 1
+        return np.zeros((STATE_DIM,), dtype=np.float32), 0.0, True, False, {'success': True}
+
+
+class _FourWayDynamics:
+    config = {
+        'subgoal_distribution': 'flow',
+        'subgoal_spi_enabled': True,
+        'subgoal_eval_selection': 'zero_noise',
+        'subgoal_eval_seed': 0,
+    }
+
+    def infer_subgoal(self, obs, goal):
+        return np.asarray(goal, dtype=np.float32)
+
+    def infer_subgoal_for_eval(self, obs, goal, critic_agent=None, rng=None):
+        return np.asarray(goal, dtype=np.float32)
+
+    def infer_proposal_subgoal_for_eval(self, obs, goal, critic_agent=None, rng=None):
+        return np.zeros_like(np.asarray(goal, dtype=np.float32))
+
+
+class _FourWayActor:
+    def sample_actions(self, obs, goal):
+        return np.zeros((2, ACTION_DIM), dtype=np.float32)
+
+
+def test_eval_reports_flow_and_spi_subgoal_policy_pairs(monkeypatch):
+    def fake_idm_chunk(_dynamics_agent, _obs, _predicted_subgoal, horizon):
+        return np.zeros((int(horizon), ACTION_DIM), dtype=np.float32)
+
+    monkeypatch.setattr('main._idm_action_chunk', fake_idm_chunk)
+    metrics = _evaluate_env_tasks(
+        _FourWayEvalEnv(),
+        _FourWayDynamics(),
+        _FourWayActor(),
+        {'actor_chunk_horizon': 2},
+        {'action_chunk_horizon': 2},
+        critic_agent=None,
+        task_ids=(1,),
+        episodes_per_task=1,
+    )
+    for prefix in (
+        'eval_flow_idm',
+        'eval_flow_actor',
+        'eval_spi_subgoal_idm',
+        'eval_spi_subgoal_actor',
+    ):
+        assert metrics[f'{prefix}/success_rate_mean'] == 1.0
+        assert metrics[f'{prefix}/task_1/success_rate'] == 1.0
+    assert metrics['eval_idm/success_rate_mean'] == metrics['eval_spi_subgoal_idm/success_rate_mean']
+    assert metrics['eval/success_rate_mean'] == metrics['eval_spi_subgoal_actor/success_rate_mean']
+
+
 def test_subgoal_expectile_value_style_weights_by_gap_sign():
     agent = _make_dynamics_agent(
         'deterministic',
@@ -390,6 +538,9 @@ def test_dynamics_config_defaults_are_usable():
     assert float(cfg.subgoal_value_weight_max) == 5.0
     assert float(cfg.subgoal_value_alpha) == 0.0
     assert str(cfg.subgoal_target_mode) == 'displacement'
+    assert float(cfg.subgoal_spi_beta) == 1.0
+    assert float(cfg.subgoal_spi_tau) == 5.0
+    assert float(cfg.subgoal_spi_energy_norm_eps) == 1e-6
     assert bool(cfg.max_goal_steps_from_env) is False
 
 
