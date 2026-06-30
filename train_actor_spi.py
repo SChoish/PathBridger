@@ -162,6 +162,30 @@ def _best_idm_eval_from_runs(env_name: str, runs_root: Path) -> dict[str, Any]:
     return best
 
 
+def _best_idm_eval_from_checkpoint_meta(env_name: str, run_dir: Path) -> dict[str, Any] | None:
+    meta_path = run_dir / 'best_eval_meta.yaml'
+    if not meta_path.is_file():
+        return None
+    with open(meta_path, encoding='utf-8') as f:
+        meta = yaml.safe_load(f) or {}
+    candidate_env = str(meta.get('env') or env_name)
+    if not _matches_env(env_name, candidate_env):
+        raise ValueError(f'best_eval_meta env={candidate_env!r} does not match requested env={env_name!r}')
+    best_eval = meta.get('best_eval') or {}
+    if not best_eval:
+        return None
+    return {
+        'env_name': candidate_env,
+        'run_dir': run_dir,
+        'epoch': int(meta.get('checkpoint_epoch', 0) or 0),
+        'eval_n': int(best_eval.get('eval_N', 0) or 0),
+        'subgoal_temperature': best_eval.get('temp', None),
+        'eval_json': run_dir / str(best_eval.get('eval_json', '')),
+        'idm': float(best_eval.get('IDM', float('nan'))),
+        'actor': float(best_eval.get('ACTOR', float('nan'))),
+    }
+
+
 def _resolve_pretrained(env_name: str, explicit: str) -> tuple[str, Path, dict[str, Any] | None]:
     if explicit:
         run_dir = Path(explicit)
@@ -174,7 +198,8 @@ def _resolve_pretrained(env_name: str, explicit: str) -> tuple[str, Path, dict[s
         if flags_path.is_file():
             with open(flags_path, encoding='utf-8') as f:
                 resolved_env = json.load(f).get('flags', {}).get('env_name', env_name)
-        return resolved_env, run_dir, None
+        best = _best_idm_eval_from_checkpoint_meta(resolved_env, run_dir)
+        return resolved_env, run_dir, best
 
     runs_root = Path(FLAGS.best_runs_root)
     if not runs_root.is_absolute():
@@ -195,6 +220,68 @@ def _to_floats(info: dict[str, Any]) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _write_effective_metadata(
+    *,
+    root: dict[str, Any],
+    cfg_used: Path,
+    out_dir: Path,
+    dynamics_config: Any,
+    critic_config: Any,
+    actor_config: Any,
+    spi_tau: float,
+    batch_size: int,
+    best_eval: dict[str, Any] | None,
+) -> None:
+    effective_root = json.loads(json.dumps(root))
+    effective_root.setdefault('dynamics', {})['subgoal_eval_num_samples'] = int(
+        dynamics_config.get('subgoal_eval_num_samples', 1)
+    )
+    effective_root['dynamics']['subgoal_temperature'] = float(dynamics_config.get('subgoal_temperature', 1.0))
+    effective_root['dynamics']['batch_size'] = int(batch_size)
+    effective_root.setdefault('critic_agent', {})['batch_size'] = int(batch_size)
+    effective_root.setdefault('actor', {})['batch_size'] = int(batch_size)
+    effective_root['actor']['lr'] = float(actor_config.get('lr', 0.0))
+    effective_root['actor']['spi_tau'] = float(spi_tau)
+    effective_root.setdefault('flags', {})['batch_size'] = int(batch_size)
+    effective_root['flags']['actor_spi_source_best_eval_json'] = (
+        str(best_eval['eval_json']) if best_eval is not None else ''
+    )
+    effective_root['flags']['actor_spi_source_best_eval_idm'] = (
+        float(best_eval['idm']) if best_eval is not None else None
+    )
+    effective_root['flags']['actor_spi_source_best_eval_actor'] = (
+        float(best_eval['actor']) if best_eval is not None else None
+    )
+    effective_root['flags']['actor_spi_spi_tau'] = float(spi_tau)
+    effective_root['flags']['actor_spi_lr'] = float(actor_config.get('lr', 0.0))
+    (out_dir / 'flags.json').write_text(json.dumps(effective_root, indent=2, sort_keys=True), encoding='utf-8')
+
+    if cfg_used.is_file():
+        with open(cfg_used, encoding='utf-8') as f:
+            cfg = yaml.safe_load(f) or {}
+    else:
+        cfg = {}
+    cfg.setdefault('dynamics', {})['subgoal_eval_num_samples'] = int(
+        dynamics_config.get('subgoal_eval_num_samples', 1)
+    )
+    cfg['dynamics']['subgoal_temperature'] = float(dynamics_config.get('subgoal_temperature', 1.0))
+    cfg.setdefault('actor', {})['spi_tau'] = float(spi_tau)
+    cfg['actor']['lr'] = float(actor_config.get('lr', 0.0))
+    cfg['batch_size'] = int(batch_size)
+    cfg['actor_spi'] = {
+        'source_best_eval_json': str(best_eval['eval_json']) if best_eval is not None else '',
+        'source_best_eval_idm': float(best_eval['idm']) if best_eval is not None else None,
+        'source_best_eval_actor': float(best_eval['actor']) if best_eval is not None else None,
+        'spi_tau': float(spi_tau),
+        'actor_spi_lr': float(actor_config.get('lr', 0.0)),
+        'subgoal_eval_num_samples': int(dynamics_config.get('subgoal_eval_num_samples', 1)),
+        'subgoal_temperature': float(dynamics_config.get('subgoal_temperature', 1.0)),
+    }
+    (out_dir / 'config_used.yaml').write_text(
+        yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False), encoding='utf-8'
+    )
 
 
 def main(_):
@@ -294,10 +381,18 @@ def main(_):
     actor_out_dir = out_dir / 'checkpoints' / 'actor'
     actor_out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / 'eval_results').mkdir(parents=True, exist_ok=True)
-    shutil.copy2(flags_path, out_dir / 'flags.json')
     cfg_used = ckpt_dir / 'config_used.yaml'
-    if cfg_used.is_file():
-        shutil.copy2(cfg_used, out_dir / 'config_used.yaml')
+    _write_effective_metadata(
+        root=root,
+        cfg_used=cfg_used,
+        out_dir=out_dir,
+        dynamics_config=dynamics_config,
+        critic_config=critic_config,
+        actor_config=actor_config,
+        spi_tau=spi_tau,
+        batch_size=batch_size,
+        best_eval=best_eval,
+    )
 
     total_steps = int(FLAGS.debug_num_steps) if int(FLAGS.debug_num_steps) > 0 else int(FLAGS.actor_spi_steps)
     log_interval = max(1, int(FLAGS.actor_spi_log_interval))
