@@ -33,6 +33,7 @@ class _FakeEnvA:
         self.t = 0
         self._obs = np.zeros((2,), dtype=np.float32)
         self.goal = np.zeros((2,), dtype=np.float32)
+        self.spec = type('Spec', (), {'max_episode_steps': 10})()
 
     def reset(self, *, seed=None, options=None):
         self.t = 0
@@ -78,6 +79,7 @@ class _FakeEnvB:
     def __init__(self) -> None:
         self.t = 0
         self.goal = np.array([0.0, 0.0], dtype=np.float32)
+        self.spec = type('Spec', (), {'max_episode_steps': 10})()
 
     def reset(self, *, seed=None, options=None):
         self.t = 0

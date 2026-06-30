@@ -115,12 +115,24 @@ class ActorAgent(flax.struct.PyTreeNode):
         q_eps = jnp.asarray(float(self.config.get('spi_q_norm_eps', 1e-6)), dtype=jnp.float32)
         q_scale = jax.lax.stop_gradient(jnp.mean(jnp.abs(actor_q)) + q_eps)
         actor_q_scaled = actor_q / q_scale
-        actor_loss = jnp.mean(-actor_q_scaled + prox / (2.0 * float(self.config['spi_tau'])))
+        spi_tau = float(self.config['spi_tau'])
+        q_term = -actor_q_scaled
+        prox_term = prox / (2.0 * spi_tau)
+        actor_loss = jnp.mean(q_term + prox_term)
 
         rho_eps = 1e-8
         rho_entropy = -jnp.sum(rho * jnp.log(rho + rho_eps), axis=1).mean()
+        idm_ref_chunk = jnp.sum(rho[:, :, None] * proposal_chunks, axis=1)
+        actor_action_norm = jnp.sqrt(jnp.sum(actor_chunk**2, axis=-1) + 1e-12).mean()
+        idm_action_norm = jnp.sqrt(jnp.sum(idm_ref_chunk**2, axis=-1) + 1e-12).mean()
         return actor_loss, {
             'spi_actor/actor_loss': actor_loss,
+            'spi_actor/q_term': q_term.mean(),
+            'spi_actor/prox_term': prox_term.mean(),
+            'spi_actor/spi_tau': jnp.asarray(spi_tau, dtype=jnp.float32),
+            'spi_actor/actor_action_norm': actor_action_norm,
+            'spi_actor/idm_action_norm': idm_action_norm,
+            'spi_actor/action_l2_to_idm': prox.mean(),
             'spi_actor/q_mean': actor_q.mean(),
             'spi_actor/q_max': actor_q.max(),
             'spi_actor/q_min': actor_q.min(),

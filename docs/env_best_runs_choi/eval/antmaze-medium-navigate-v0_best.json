@@ -1,0 +1,38 @@
+{
+  "timestamp": "2026-06-22T03:28:40Z",
+  "run_dir": "/home/choi/Pathbridger_flow/checkpoints/flow_trl_best_epoch600/antmaze_medium_amm_g3_w5_n1_evalN8",
+  "run_group": "flow_trl_feval_amm_g3_w5_n1",
+  "env_name": "antmaze-medium-navigate-v0",
+  "epoch": 600,
+  "subgoal_eval_num_samples": 8,
+  "subgoal_eval_score_type": "transitive_ratio",
+  "subgoal_num_samples_train": 1,
+  "subgoal_value_gap_scale": 3.0,
+  "subgoal_value_weight_max": 5.0,
+  "subgoal_flow_steps": 8,
+  "subgoal_temperature": 0.5,
+  "eval_episodes_per_task": 25,
+  "eval_task_ids": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "idm_success_rate_mean": 0.96,
+  "actor_success_rate_mean": 0.968,
+  "idm_task_success_rates": {
+    "1": 0.96,
+    "2": 1.0,
+    "3": 0.96,
+    "4": 0.96,
+    "5": 0.92
+  },
+  "actor_task_success_rates": {
+    "1": 0.96,
+    "2": 1.0,
+    "3": 1.0,
+    "4": 0.88,
+    "5": 1.0
+  }
+}

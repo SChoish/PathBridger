@@ -1,0 +1,38 @@
+{
+  "timestamp": "2026-06-24T14:09:18Z",
+  "run_dir": "/home/choi/Pathbridger_flow/runs/20260623_225006_seed0_puzzle-3x3-play-v0",
+  "run_group": "flow_trl_gap_tune_p3_g0p5_w5_n1",
+  "env_name": "puzzle-3x3-play-v0",
+  "epoch": 600,
+  "subgoal_eval_num_samples": 32,
+  "subgoal_eval_score_type": "transitive_ratio",
+  "subgoal_num_samples_train": 1,
+  "subgoal_value_gap_scale": 0.5,
+  "subgoal_value_weight_max": 5.0,
+  "subgoal_flow_steps": 8,
+  "subgoal_temperature": 0.5,
+  "eval_episodes_per_task": 25,
+  "eval_task_ids": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "idm_success_rate_mean": 0.656,
+  "actor_success_rate_mean": 0.656,
+  "idm_task_success_rates": {
+    "1": 1.0,
+    "2": 0.52,
+    "3": 0.64,
+    "4": 0.52,
+    "5": 0.6
+  },
+  "actor_task_success_rates": {
+    "1": 0.84,
+    "2": 0.68,
+    "3": 0.68,
+    "4": 0.52,
+    "5": 0.56
+  }
+}

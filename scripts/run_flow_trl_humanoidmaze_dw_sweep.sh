@@ -67,21 +67,26 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))
-from flow_trl_sweep_common import find_run_dir_for_config
+from flow_trl_sweep_common import find_run_dir_for_config, resolve_train_target
+import yaml
 
-run_dir, latest_epoch = find_run_dir_for_config(
+cfg = yaml.safe_load(open(os.environ['CONFIG_PATH'], encoding='utf-8'))
+target_step = resolve_train_target(cfg)
+if int(cfg.get('train_steps', 0) or 0) <= 0:
+    target_step = int(os.environ.get('FINAL_EPOCH', target_step))
+
+run_dir, latest_step = find_run_dir_for_config(
     config_path=os.environ['CONFIG_PATH'],
     runs_root=os.environ['RUNS_ROOT'],
     seed=int(os.environ['SEED']),
-    final_epoch=int(os.environ['FINAL_EPOCH']),
+    final_step=target_step,
 )
-final_epoch = int(os.environ['FINAL_EPOCH'])
 if not run_dir:
     print('fresh||0')
-elif latest_epoch >= final_epoch:
-    print(f'finished|{run_dir}|{latest_epoch}')
+elif latest_step >= target_step:
+    print(f'finished|{run_dir}|{latest_step}')
 else:
-    print(f'resume|{run_dir}|{latest_epoch}')
+    print(f'resume|{run_dir}|{latest_step}')
 PY
 }
 

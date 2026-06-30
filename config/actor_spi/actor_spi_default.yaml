@@ -1,0 +1,19 @@
+# Actor-only SPI finetuning defaults.
+#
+# train_actor_spi.py auto-selects the requested env's best-IDM eval checkpoint
+# from runs/*/eval_results/*.json when pretrained_ckpt_dir is empty.
+
+pretrained_ckpt_dir: ''
+
+actor_spi_steps: 100000
+actor_spi_lr: 0.0003
+spi_tau: 1.0
+actor_spi_batch_size: 0
+
+# Eval and save at 50K and 100K by default.
+eval_interval: 50000
+save_interval: 50000
+actor_spi_eval_episodes: 25
+
+freeze_non_actor: true
+reset_actor_optimizer: true

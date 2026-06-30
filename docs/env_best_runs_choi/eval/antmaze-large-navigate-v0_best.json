@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-06-21T12:07:50Z",
+  "run_dir": "/home/svcho/Pathbridger_flow/runs/20260621_183619_seed0_antmaze-large-navigate-v0",
+  "run_group": "flow_trl_feval_aml_g10_w5_n1",
+  "env_name": "antmaze-large-navigate-v0",
+  "epoch": 600,
+  "subgoal_eval_num_samples": 16,
+  "subgoal_num_samples_train": 1,
+  "subgoal_value_gap_scale": 10.0,
+  "subgoal_value_weight_max": 5.0,
+  "eval_episodes_per_task": 25,
+  "eval_task_ids": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "idm_success_rate_mean": 0.768,
+  "actor_success_rate_mean": 0.728,
+  "idm_task_success_rates": {
+    "1": 0.68,
+    "2": 0.72,
+    "3": 0.96,
+    "4": 0.76,
+    "5": 0.72
+  },
+  "actor_task_success_rates": {
+    "1": 0.48,
+    "2": 0.48,
+    "3": 0.92,
+    "4": 0.92,
+    "5": 0.84
+  }
+}

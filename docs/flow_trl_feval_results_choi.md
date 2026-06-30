@@ -1,6 +1,6 @@
 # Flow TRL final eval (N sweep) 결과
 
-자동 생성: 2026-06-27 16:53 · `scripts/summarize_feval_results.py`
+자동 생성: 2026-06-27 21:00 · `scripts/summarize_feval_results.py`
 소스: `runs/*/eval_results/` + `checkpoints/flow_trl_best_epoch600/*/eval_results/`
 
 총 **205** eval records.

@@ -124,12 +124,16 @@ def build_trl_run_config(
     value_distance_weight_power: float,
     batch_size: int = 1024,
     train_epochs: int = 600,
+    train_steps: int = 0,
     log_every_n_epochs: int = 10,
+    log_every_n_steps: int = 0,
     save_every_n_epochs: int = 100,
+    save_every_n_steps: int = 0,
     horizon: int = 25,
     plan_candidates: int = 1,
     plan_noise_scale: float = 1.0,
     eval_freq: int = 100,
+    eval_every_n_steps: int = 0,
     eval_task_ids: str = '1,2,3,4,5',
     eval_episodes_per_task: int = 10,
     final_eval_episodes_per_task: int = 25,
@@ -147,7 +151,7 @@ def build_trl_run_config(
     if actor_overrides:
         actor_block.update(actor_overrides)
 
-    return {
+    cfg: dict[str, Any] = {
         'env_name': str(env_name),
         'run_group': str(run_group),
         'train_epochs': int(train_epochs),
@@ -176,6 +180,15 @@ def build_trl_run_config(
         'actor': actor_block,
         'batch_size': int(batch_size),
     }
+    if int(train_steps) > 0:
+        cfg['train_steps'] = int(train_steps)
+    if int(log_every_n_steps) > 0:
+        cfg['log_every_n_steps'] = int(log_every_n_steps)
+    if int(save_every_n_steps) > 0:
+        cfg['save_every_n_steps'] = int(save_every_n_steps)
+    if int(eval_every_n_steps) > 0:
+        cfg['eval_every_n_steps'] = int(eval_every_n_steps)
+    return cfg
 
 
 def dump_run_config_yaml(path, cfg: dict[str, Any], header: str = '') -> None:
