@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
-"""Actor-only SPI finetuning from an existing run checkpoint.
+"""Subgoal SPI finetuning from an existing run checkpoint.
 
-By default this script scans ``runs/*/eval_results/*.json`` for the requested
-environment's best IDM eval, loads the matching checkpoint suffix, freezes
-dynamics/IDM/critic, and finetunes only the deterministic SPI actor.
+Loads a flow-trained dynamics/critic/actor checkpoint, adds a random-init
+``subgoal_spi_net``, freezes everything else, and finetunes only the
+deterministic subgoal SPI net against the frozen critic.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
+import pickle
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
+import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import yaml
-import flax
 from absl import app, flags
 
-# Import main first so its flags and helper functions are registered.
 import main as M  # noqa: F401
 from eval_checkpoint import _build_configs
 from main import (
     FLAGS,
-    _build_actor_batch_from_dynamics,
-    _build_spi_actor_batch_from_dynamics,
     _create_actor_agent,
     _create_critic_agent,
     _evaluate_env_tasks,
+    _extract_critic_value_params,
     _intersect_valid_starts,
     _make_critic_dataset,
-    _rescore_actor_batch_for_update,
-    _rescore_spi_actor_batch_for_update,
     _sample_shared_idxs,
 )
 from agents.dynamics import DynamicsAgent
@@ -56,30 +54,35 @@ from utils.run_io import (
     resolve_dynamics_checkpoint_dir,
 )
 
-
 _REPO = Path(__file__).resolve().parent
 
 flags.DEFINE_string('pretrained_ckpt_dir', '', 'Pretrained run dir. Empty -> select runs/ best-IDM eval.')
 flags.DEFINE_integer('pretrained_epoch', -1, 'Checkpoint suffix to load; -1 = best eval epoch or latest.')
-flags.DEFINE_integer('actor_spi_steps', 100000, 'Number of actor SPI gradient steps.')
-flags.DEFINE_float('actor_spi_lr', 3e-4, 'Adam learning rate for actor SPI finetuning.')
-flags.DEFINE_float('spi_tau', -1.0, 'Override actor SPI tau; < 0 keeps the checkpoint value.')
-flags.DEFINE_integer('actor_spi_batch_size', 0, 'Batch size; 0 = use checkpoint batch_size.')
-flags.DEFINE_integer('eval_interval', 50000, 'Eval every N actor SPI steps; 0 disables intermediate eval.')
-flags.DEFINE_integer('save_interval', 50000, 'Save actor every N steps; 0 = final only.')
-flags.DEFINE_boolean('freeze_non_actor', True, 'Assert dynamics/critic params do not change.')
-flags.DEFINE_boolean('reset_actor_optimizer', True, 'Reinitialize actor optimizer before finetuning.')
+flags.DEFINE_integer('subgoal_spi_steps', 100000, 'Number of subgoal SPI gradient steps.')
+flags.DEFINE_float('subgoal_spi_lr', 3e-4, 'Adam learning rate for subgoal SPI finetuning.')
+flags.DEFINE_float('subgoal_spi_tau', -1.0, 'Override subgoal_spi_tau; < 0 keeps the default (5.0).')
+flags.DEFINE_integer('subgoal_spi_batch_size', 0, 'Batch size; 0 = use checkpoint batch_size.')
+flags.DEFINE_integer('eval_interval', 50000, 'Eval every N steps; 0 disables intermediate eval.')
+flags.DEFINE_integer('save_interval', 50000, 'Save dynamics every N steps; 0 = final only.')
+flags.DEFINE_boolean(
+    'subgoal_spi_select_best',
+    True,
+    'Best-of-N: score N flow candidates with the critic and use only the single '
+    'highest-energy candidate as the proximal target (one-hot rho), matching actor SPI.',
+)
+flags.DEFINE_boolean('freeze_non_subgoal_spi', True, 'Assert non-SPI params do not change.')
+flags.DEFINE_boolean('reset_dynamics_optimizer', True, 'Reinitialize dynamics optimizer before finetuning.')
 flags.DEFINE_integer('debug_num_steps', 0, 'If > 0, override total steps for a smoke test.')
-flags.DEFINE_string('actor_spi_out_root', 'checkpoints/actor_spi', 'Root dir for actor SPI outputs.')
-flags.DEFINE_integer('actor_spi_eval_episodes', 25, 'Episodes per task for actor SPI eval.')
-flags.DEFINE_integer('actor_spi_log_interval', 500, 'Log every N actor SPI steps.')
+flags.DEFINE_string('subgoal_spi_out_root', 'checkpoints/subgoal_spi', 'Root dir for subgoal SPI outputs.')
+flags.DEFINE_integer('subgoal_spi_eval_episodes', 25, 'Episodes per task for eval.')
+flags.DEFINE_integer('subgoal_spi_log_interval', 500, 'Log every N steps.')
 flags.DEFINE_string('mujoco_gl', '', 'Optional MuJoCo GL backend, e.g. egl.')
-flags.DEFINE_string('actor_spi_config', '', 'Optional YAML setting actor SPI flags; CLI args win.')
+flags.DEFINE_string('subgoal_spi_config', '', 'Optional YAML setting subgoal SPI flags; CLI args win.')
 flags.DEFINE_string('best_runs_root', 'runs', 'Root containing training runs for best-IDM auto selection.')
 flags.DEFINE_string(
     'best_params_json',
     'docs/env_best_runs_choi/env_best_params.json',
-    'JSON manifest for env best params (eval N/T, checkpoint bundle). Empty disables.',
+    'JSON manifest for env best params. Empty disables.',
 )
 flags.DEFINE_string(
     'checkpoint_bundle_root',
@@ -89,17 +92,12 @@ flags.DEFINE_string(
 flags.DEFINE_boolean(
     'use_best_params_bundle',
     True,
-    'Load dynamics/critic from checkpoint_bundle_root/<env> and N/T from best_params_json.',
+    'Load from checkpoint_bundle_root/<env> and N/T from best_params_json.',
 )
-flags.DEFINE_boolean(
-    'init_actor',
-    True,
-    'Random-init actor (skip actor checkpoint restore). False = load actor from checkpoint.',
-)
-flags.DEFINE_boolean(
-    'use_spi_subgoal_pipeline',
-    True,
-    'sample_subgoal(N,T) → critic best → bridge/IDM → SPI rho (vs legacy build_actor_proposals).',
+flags.DEFINE_integer(
+    'subgoal_spi_num_samples',
+    0,
+    'Proposal candidates N for SPI update; 0 = use eval_n from best params (same as actor SPI).',
 )
 
 
@@ -120,7 +118,7 @@ def _apply_config_yaml(path: str) -> None:
         data = yaml.safe_load(f) or {}
     for key, value in data.items():
         if not hasattr(FLAGS, key):
-            raise ValueError(f'Unknown actor_spi_config key: {key!r}')
+            raise ValueError(f'Unknown subgoal_spi_config key: {key!r}')
         if not _argv_sets_flag(key):
             setattr(FLAGS, key, value)
 
@@ -286,6 +284,40 @@ def _to_floats(info: dict[str, Any]) -> dict[str, float]:
     return out
 
 
+def _deep_merge_params(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
+    out = dict(dst)
+    for key, value in src.items():
+        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
+            out[key] = _deep_merge_params(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _restore_dynamics_with_spi_net(agent: DynamicsAgent, restore_path: str, restore_epoch: int) -> DynamicsAgent:
+    """Restore flow checkpoint into an agent that also has random-init ``subgoal_spi_net``."""
+    candidates = glob.glob(restore_path)
+    assert len(candidates) == 1, f'Found {len(candidates)} candidates: {candidates}'
+    pkl_path = candidates[0] + f'/params_{restore_epoch}.pkl'
+    with open(pkl_path, 'rb') as f:
+        load_dict = pickle.load(f)
+    ckpt_agent = load_dict['agent']
+    merged = flax.serialization.to_state_dict(agent)
+    merged['network']['params'] = _deep_merge_params(
+        merged['network']['params'],
+        ckpt_agent['network']['params'],
+    )
+    if 'schedule' in ckpt_agent:
+        merged['schedule'] = ckpt_agent['schedule']
+    restored = flax.serialization.from_state_dict(agent, merged)
+    print(f'[subgoal_spi] partial dynamics restore from {pkl_path}', flush=True)
+    return restored
+
+
+def _module_params(params: dict[str, Any], module_key: str) -> dict[str, Any]:
+    return params.get(module_key, {})
+
+
 def _write_effective_metadata(
     *,
     root: dict[str, Any],
@@ -297,29 +329,25 @@ def _write_effective_metadata(
     spi_tau: float,
     batch_size: int,
     best_eval: dict[str, Any] | None,
+    spi_num_samples: int,
 ) -> None:
     effective_root = json.loads(json.dumps(root))
     effective_root.setdefault('dynamics', {})['subgoal_eval_num_samples'] = int(
         dynamics_config.get('subgoal_eval_num_samples', 1)
     )
     effective_root['dynamics']['subgoal_temperature'] = float(dynamics_config.get('subgoal_temperature', 1.0))
+    effective_root['dynamics']['subgoal_spi_enabled'] = True
+    effective_root['dynamics']['subgoal_spi_tau'] = float(spi_tau)
+    effective_root['dynamics']['subgoal_spi_num_samples'] = int(spi_num_samples)
     effective_root['dynamics']['batch_size'] = int(batch_size)
     effective_root.setdefault('critic_agent', {})['batch_size'] = int(batch_size)
     effective_root.setdefault('actor', {})['batch_size'] = int(batch_size)
-    effective_root['actor']['lr'] = float(actor_config.get('lr', 0.0))
-    effective_root['actor']['spi_tau'] = float(spi_tau)
     effective_root.setdefault('flags', {})['batch_size'] = int(batch_size)
-    effective_root['flags']['actor_spi_source_best_eval_json'] = (
+    effective_root['flags']['subgoal_spi_source_best_eval_json'] = (
         str(best_eval['eval_json']) if best_eval is not None else ''
     )
-    effective_root['flags']['actor_spi_source_best_eval_idm'] = (
-        float(best_eval['idm']) if best_eval is not None else None
-    )
-    effective_root['flags']['actor_spi_source_best_eval_actor'] = (
-        float(best_eval['actor']) if best_eval is not None else None
-    )
-    effective_root['flags']['actor_spi_spi_tau'] = float(spi_tau)
-    effective_root['flags']['actor_spi_lr'] = float(actor_config.get('lr', 0.0))
+    effective_root['flags']['subgoal_spi_spi_tau'] = float(spi_tau)
+    effective_root['flags']['subgoal_spi_lr'] = float(dynamics_config.get('lr', 0.0))
     (out_dir / 'flags.json').write_text(json.dumps(effective_root, indent=2, sort_keys=True), encoding='utf-8')
 
     if cfg_used.is_file():
@@ -331,15 +359,19 @@ def _write_effective_metadata(
         dynamics_config.get('subgoal_eval_num_samples', 1)
     )
     cfg['dynamics']['subgoal_temperature'] = float(dynamics_config.get('subgoal_temperature', 1.0))
-    cfg.setdefault('actor', {})['spi_tau'] = float(spi_tau)
-    cfg['actor']['lr'] = float(actor_config.get('lr', 0.0))
+    cfg['dynamics']['subgoal_spi_enabled'] = True
+    cfg['dynamics']['subgoal_spi_tau'] = float(spi_tau)
+    cfg['dynamics']['subgoal_spi_num_samples'] = int(spi_num_samples)
+    cfg['dynamics']['lr'] = float(dynamics_config.get('lr', 0.0))
     cfg['batch_size'] = int(batch_size)
-    cfg['actor_spi'] = {
+    cfg['subgoal_spi'] = {
         'source_best_eval_json': str(best_eval['eval_json']) if best_eval is not None else '',
         'source_best_eval_idm': float(best_eval['idm']) if best_eval is not None else None,
         'source_best_eval_actor': float(best_eval['actor']) if best_eval is not None else None,
-        'spi_tau': float(spi_tau),
-        'actor_spi_lr': float(actor_config.get('lr', 0.0)),
+        'subgoal_spi_tau': float(spi_tau),
+        'subgoal_spi_lr': float(dynamics_config.get('lr', 0.0)),
+        'proposal_num_samples': int(spi_num_samples),
+        'proposal_temperature': float(dynamics_config.get('subgoal_temperature', 1.0)),
         'subgoal_eval_num_samples': int(dynamics_config.get('subgoal_eval_num_samples', 1)),
         'subgoal_temperature': float(dynamics_config.get('subgoal_temperature', 1.0)),
     }
@@ -349,7 +381,7 @@ def _write_effective_metadata(
 
 
 def main(_):
-    _apply_config_yaml(FLAGS.actor_spi_config)
+    _apply_config_yaml(FLAGS.subgoal_spi_config)
 
     if str(FLAGS.mujoco_gl).strip():
         from rollout.env import configure_mujoco_gl
@@ -358,7 +390,6 @@ def main(_):
 
     seed = int(FLAGS.seed)
     requested_env = str(FLAGS.env_name)
-    params_entry: dict[str, Any] | None = None
     if bool(FLAGS.use_best_params_bundle) and str(FLAGS.best_params_json).strip():
         params_json = Path(FLAGS.best_params_json)
         if not params_json.is_absolute():
@@ -391,14 +422,28 @@ def main(_):
         if best_eval.get('subgoal_temperature') is not None:
             dynamics_config['subgoal_temperature'] = float(best_eval['subgoal_temperature'])
 
-    actor_config['lr'] = float(FLAGS.actor_spi_lr)
-    if float(FLAGS.spi_tau) >= 0.0:
-        actor_config['spi_tau'] = float(FLAGS.spi_tau)
-    spi_tau = float(actor_config['spi_tau'])
+    dynamics_config['subgoal_spi_enabled'] = True
+    dynamics_config['subgoal_spi_proposal_distribution'] = 'flow'
+    dynamics_config['subgoal_spi_proposal_loss_weight'] = 0.0
+    dynamics_config['subgoal_spi_select_best'] = bool(FLAGS.subgoal_spi_select_best)
+    dynamics_config['subgoal_spi_beta'] = float(dynamics_config.get('subgoal_spi_beta', 1.0))
+    dynamics_config['subgoal_spi_energy_norm_eps'] = float(
+        dynamics_config.get('subgoal_spi_energy_norm_eps', 1e-6)
+    )
+    dynamics_config['lr'] = float(FLAGS.subgoal_spi_lr)
+    if float(FLAGS.subgoal_spi_tau) >= 0.0:
+        dynamics_config['subgoal_spi_tau'] = float(FLAGS.subgoal_spi_tau)
+    spi_tau = float(dynamics_config.get('subgoal_spi_tau', 5.0))
     eval_n = int(dynamics_config.get('subgoal_eval_num_samples', 1))
     eval_temperature = float(dynamics_config.get('subgoal_temperature', 1.0))
+    # Match actor SPI: proposal sampling N/T from best_eval_meta (eval_n, temp).
+    spi_num_samples = int(FLAGS.subgoal_spi_num_samples)
+    if spi_num_samples <= 0:
+        spi_num_samples = eval_n
+    dynamics_config['subgoal_spi_num_samples'] = max(1, spi_num_samples)
+    dynamics_config['subgoal_temperature'] = float(eval_temperature)
 
-    batch_size = int(FLAGS.actor_spi_batch_size) if int(FLAGS.actor_spi_batch_size) > 0 else int(fg['batch_size'])
+    batch_size = int(FLAGS.subgoal_spi_batch_size) if int(FLAGS.subgoal_spi_batch_size) > 0 else int(fg['batch_size'])
     dynamics_config['batch_size'] = batch_size
     critic_config['batch_size'] = batch_size
     actor_config['batch_size'] = batch_size
@@ -440,47 +485,49 @@ def main(_):
         epoch = int(best_eval['epoch'])
     else:
         epoch = pick_epoch(-1, list_checkpoint_suffixes(dyn_dir))
-    dynamics_agent = restore_agent(dynamics_agent, str(dyn_dir), epoch)
+
+    dynamics_agent = _restore_dynamics_with_spi_net(dynamics_agent, str(dyn_dir), epoch)
     critic_agent = restore_agent(critic_agent, str(resolve_critic_checkpoint_dir(ckpt_dir)), epoch)
+    actor_dir = resolve_actor_checkpoint_dir(ckpt_dir, required=True)
+    actor_agent = restore_agent(actor_agent, str(actor_dir), epoch)
+
     dynamics_agent = dynamics_agent.replace(
         config=flax.core.FrozenDict(
             {
                 **dict(dynamics_agent.config),
+                'subgoal_spi_enabled': True,
+                'subgoal_spi_proposal_loss_weight': 0.0,
+                'subgoal_spi_tau': float(spi_tau),
+                'subgoal_spi_num_samples': int(spi_num_samples),
                 'subgoal_eval_num_samples': int(eval_n),
                 'subgoal_temperature': float(eval_temperature),
+                'lr': float(FLAGS.subgoal_spi_lr),
             }
         )
     )
-    if bool(FLAGS.init_actor):
-        print('[actor_spi] actor: random init (checkpoint restore skipped)', flush=True)
-    else:
-        actor_agent = restore_agent(
-            actor_agent, str(resolve_actor_checkpoint_dir(ckpt_dir, required=True)), epoch
-        )
-        print(f'[actor_spi] actor: restored from epoch {epoch}', flush=True)
 
-    if bool(FLAGS.reset_actor_optimizer):
-        actor_agent = actor_agent.replace(
-            actor=TrainState.create(
-                actor_agent.actor.model_def,
-                actor_agent.actor.params,
-                tx=optax.adam(float(FLAGS.actor_spi_lr)),
+    if bool(FLAGS.reset_dynamics_optimizer):
+        dynamics_agent = dynamics_agent.replace(
+            network=TrainState.create(
+                dynamics_agent.network.model_def,
+                dynamics_agent.network.params,
+                tx=optax.adam(float(FLAGS.subgoal_spi_lr)),
             )
         )
 
     tau_tag = _format_tau_tag(spi_tau)
     source_tag = f'epoch_{epoch}_n{eval_n}_t{_format_tau_tag(eval_temperature)}'
     if bool(FLAGS.use_best_params_bundle):
-        out_root = Path(FLAGS.actor_spi_out_root) / 'best_params'
+        out_root = Path(FLAGS.subgoal_spi_out_root) / 'best_params'
     elif int(epoch) >= 999999 or '1m_env_best' in str(ckpt_dir):
-        out_root = Path(FLAGS.actor_spi_out_root) / '1m'
+        out_root = Path(FLAGS.subgoal_spi_out_root) / '1m'
     else:
-        out_root = Path(FLAGS.actor_spi_out_root)
+        out_root = Path(FLAGS.subgoal_spi_out_root)
     out_dir = out_root / resolved_env / source_tag / f'tau_{tau_tag}' / f'seed_{seed}'
     if not out_dir.is_absolute():
         out_dir = _REPO / out_dir
-    actor_out_dir = out_dir / 'checkpoints' / 'actor'
-    actor_out_dir.mkdir(parents=True, exist_ok=True)
+    dynamics_out_dir = out_dir / 'checkpoints' / 'dynamics'
+    dynamics_out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / 'eval_results').mkdir(parents=True, exist_ok=True)
     cfg_used = ckpt_dir / 'config_used.yaml'
     _write_effective_metadata(
@@ -493,27 +540,31 @@ def main(_):
         spi_tau=spi_tau,
         batch_size=batch_size,
         best_eval=best_eval,
+        spi_num_samples=spi_num_samples,
     )
 
-    total_steps = int(FLAGS.debug_num_steps) if int(FLAGS.debug_num_steps) > 0 else int(FLAGS.actor_spi_steps)
-    log_interval = max(1, int(FLAGS.actor_spi_log_interval))
+    total_steps = int(FLAGS.debug_num_steps) if int(FLAGS.debug_num_steps) > 0 else int(FLAGS.subgoal_spi_steps)
+    log_interval = max(1, int(FLAGS.subgoal_spi_log_interval))
     eval_task_ids = parse_int_list(FLAGS.eval_task_ids)
-    eval_episodes = max(1, int(FLAGS.actor_spi_eval_episodes))
+    eval_episodes = max(1, int(FLAGS.subgoal_spi_eval_episodes))
 
     print(
-        f'[actor_spi] env={resolved_env} ckpt_dir={ckpt_dir} epoch={epoch} '
+        f'[subgoal_spi] env={resolved_env} ckpt_dir={ckpt_dir} epoch={epoch} '
         f'best_eval={best_eval and best_eval.get("eval_json", "")} '
         f'idm={best_eval and best_eval.get("idm")} actor={best_eval and best_eval.get("actor")} '
-        f'eval_n={eval_n} eval_T={eval_temperature} init_actor={bool(FLAGS.init_actor)} '
-        f'spi_pipeline={bool(FLAGS.use_spi_subgoal_pipeline)} '
-        f'tau={spi_tau} lr={float(FLAGS.actor_spi_lr)} batch={batch_size} steps={total_steps}',
+        f'eval_n={eval_n} eval_T={eval_temperature} proposal_N={spi_num_samples} '
+        f'tau={spi_tau} lr={float(FLAGS.subgoal_spi_lr)} batch={batch_size} steps={total_steps}',
         flush=True,
     )
-    print(f'[actor_spi] out_dir={out_dir}', flush=True)
+    print(f'[subgoal_spi] out_dir={out_dir}', flush=True)
 
-    actor_before = jax.device_get(actor_agent.actor.params)
+    params_before = jax.device_get(dynamics_agent.network.params)
+    spi_before = _module_params(params_before, 'modules_subgoal_spi_net')
+    subgoal_before = _module_params(params_before, 'modules_subgoal_net')
+    bridge_before = _module_params(params_before, 'modules_path_residual_net')
+    idm_before = _module_params(params_before, 'modules_idm_net')
     critic_before = jax.device_get(critic_agent.network.params)
-    dynamics_before = jax.device_get(dynamics_agent.network.params)
+    actor_before = jax.device_get(actor_agent.actor.params)
     csv_logger = CsvLogger(os.path.join(out_dir, 'train.csv'), flush_every_n=1)
 
     def _run_eval(step: int) -> dict[str, Any]:
@@ -547,29 +598,13 @@ def main(_):
     for step in range(1, total_steps + 1):
         idxs = _sample_shared_idxs(common_valid_starts, batch_size)
         dynamics_batch = dynamics_dataset.sample(batch_size, idxs=idxs)
-        if bool(FLAGS.use_spi_subgoal_pipeline):
-            dynamics_agent, actor_batch, _, _ = _build_spi_actor_batch_from_dynamics(
-                dynamics_agent,
-                critic_agent,
-                dynamics_batch,
-                actor_config,
-                spi_num_subgoal_samples=eval_n,
-                spi_subgoal_temperature=eval_temperature,
-            )
-            actor_batch_for_update, _ = _rescore_spi_actor_batch_for_update(
-                actor_batch, critic_agent, actor_config
-            )
-        else:
-            dynamics_agent, actor_batch, _, _ = _build_actor_batch_from_dynamics(
-                dynamics_agent, critic_agent, dynamics_batch, actor_config
-            )
-            actor_batch_for_update, _ = _rescore_actor_batch_for_update(
-                actor_batch, critic_agent, actor_config
-            )
-        actor_agent, actor_info = actor_agent.update(actor_batch_for_update, critic_agent)
+        dynamics_agent, dyn_info = dynamics_agent.update_subgoal_spi(
+            dynamics_batch,
+            critic_value_params=_extract_critic_value_params(critic_agent),
+        )
 
         if int(FLAGS.save_interval) > 0 and step % int(FLAGS.save_interval) == 0:
-            save_agent(actor_agent, str(actor_out_dir), step)
+            save_agent(dynamics_agent, str(dynamics_out_dir), step)
 
         do_eval = int(FLAGS.eval_interval) > 0 and step % int(FLAGS.eval_interval) == 0
         do_log = step % log_interval == 0 or step == total_steps or do_eval or int(FLAGS.debug_num_steps) > 0
@@ -580,46 +615,63 @@ def main(_):
                 final_metrics = metrics
 
         if do_log:
-            info = _to_floats(actor_info)
+            info = _to_floats(dyn_info)
             row = {
-                'actor_spi/loss': info.get('spi_actor/actor_loss', float('nan')),
-                'actor_spi/q_term': info.get('spi_actor/q_term', float('nan')),
-                'actor_spi/prox_term': info.get('spi_actor/prox_term', float('nan')),
-                'actor_spi/spi_tau': spi_tau,
-                'actor_spi/actor_action_norm': info.get('spi_actor/actor_action_norm', float('nan')),
-                'actor_spi/idm_action_norm': info.get('spi_actor/idm_action_norm', float('nan')),
-                'actor_spi/action_l2_to_idm': info.get('spi_actor/action_l2_to_idm', float('nan')),
-                'actor_spi/step': float(step),
+                'subgoal_spi/loss': info.get('phase1/subgoal_spi_loss', float('nan')),
+                'subgoal_spi/proposal_loss': info.get('phase1/subgoal_spi_proposal_loss', float('nan')),
+                'subgoal_spi/energy_mean': info.get('phase1/subgoal_spi_energy_mean', float('nan')),
+                'subgoal_spi/prox_mean': info.get('phase1/subgoal_spi_prox_mean', float('nan')),
+                'subgoal_spi/rho_entropy': info.get('phase1/subgoal_spi_rho_entropy', float('nan')),
+                'subgoal_spi/tau': spi_tau,
+                'subgoal_spi/eval_n': float(eval_n),
+                'subgoal_spi/eval_temperature': float(eval_temperature),
+                'subgoal_spi/proposal_n': float(spi_num_samples),
+                'subgoal_spi/step': float(step),
                 'time/total_sec': time.time() - first_time,
             }
             if metrics is not None:
-                row['actor_spi/eval_actor_success_rate'] = float(metrics.get('eval/success_rate_mean', float('nan')))
-                row['actor_spi/eval_idm_success_rate'] = float(metrics.get('eval_idm/success_rate_mean', float('nan')))
+                row['subgoal_spi/eval_spi_subgoal_actor'] = float(
+                    metrics.get('eval_spi_subgoal_actor/success_rate_mean', float('nan'))
+                )
+                row['subgoal_spi/eval_spi_subgoal_idm'] = float(
+                    metrics.get('eval_spi_subgoal_idm/success_rate_mean', float('nan'))
+                )
+                row['subgoal_spi/eval_flow_actor'] = float(
+                    metrics.get('eval_flow_actor/success_rate_mean', float('nan'))
+                )
+                row['subgoal_spi/eval_flow_idm'] = float(
+                    metrics.get('eval_flow_idm/success_rate_mean', float('nan'))
+                )
             csv_logger.log(row, step=step)
             print(
-                f'[actor_spi] step={step}/{total_steps} loss={row["actor_spi/loss"]:.4f} '
-                f'q={row["actor_spi/q_term"]:.4f} prox={row["actor_spi/prox_term"]:.4f} '
-                f'l2={row["actor_spi/action_l2_to_idm"]:.4f}',
+                f'[subgoal_spi] step={step}/{total_steps} loss={row["subgoal_spi/loss"]:.4f} '
+                f'energy={row["subgoal_spi/energy_mean"]:.4f} prox={row["subgoal_spi/prox_mean"]:.4f}',
                 flush=True,
             )
 
-    save_agent(actor_agent, str(actor_out_dir), total_steps)
+    save_agent(dynamics_agent, str(dynamics_out_dir), total_steps)
 
-    actor_after = jax.device_get(actor_agent.actor.params)
+    params_after = jax.device_get(dynamics_agent.network.params)
+    spi_after = _module_params(params_after, 'modules_subgoal_spi_net')
+    subgoal_after = _module_params(params_after, 'modules_subgoal_net')
+    bridge_after = _module_params(params_after, 'modules_path_residual_net')
+    idm_after = _module_params(params_after, 'modules_idm_net')
     critic_after = jax.device_get(critic_agent.network.params)
-    dynamics_after = jax.device_get(dynamics_agent.network.params)
-    actor_diff = summarize_param_diff(actor_before, actor_after)
-    critic_diff = summarize_param_diff(critic_before, critic_after)
-    dynamics_diff = summarize_param_diff(dynamics_before, dynamics_after)
-    if bool(FLAGS.freeze_non_actor):
+    actor_after = jax.device_get(actor_agent.actor.params)
+
+    if bool(FLAGS.freeze_non_subgoal_spi):
+        assert_frozen(subgoal_before, subgoal_after, name='subgoal_net', tol=1e-6)
+        assert_frozen(bridge_before, bridge_after, name='path_residual_net', tol=1e-6)
+        assert_frozen(idm_before, idm_after, name='idm_net', tol=1e-6)
         assert_frozen(critic_before, critic_after, name='critic', tol=1e-6)
-        assert_frozen(dynamics_before, dynamics_after, name='dynamics', tol=1e-6)
-        assert_trained(actor_before, actor_after, name='actor', min_abs=0.0)
-        print('[actor_spi] freeze check PASSED', flush=True)
+        assert_frozen(actor_before, actor_after, name='actor', tol=1e-6)
+        assert_trained(spi_before, spi_after, name='subgoal_spi_net', min_abs=0.0)
+        print('[subgoal_spi] freeze check PASSED', flush=True)
 
     if final_metrics is None:
         final_metrics = _run_eval(total_steps)
 
+    spi_diff = summarize_param_diff(spi_before, spi_after)
     meta = {
         'env': resolved_env,
         'requested_env': requested_env,
@@ -630,36 +682,40 @@ def main(_):
         'best_eval_actor': float(best_eval['actor']) if best_eval is not None else None,
         'subgoal_eval_num_samples': eval_n,
         'subgoal_temperature': eval_temperature,
-        'init_actor': bool(FLAGS.init_actor),
-        'use_spi_subgoal_pipeline': bool(FLAGS.use_spi_subgoal_pipeline),
+        'subgoal_spi_num_samples': spi_num_samples,
+        'subgoal_spi_select_best': bool(FLAGS.subgoal_spi_select_best),
         'use_best_params_bundle': bool(FLAGS.use_best_params_bundle),
         'checkpoint_bundle': str(ckpt_dir),
-        'spi_tau': spi_tau,
-        'actor_spi_lr': float(FLAGS.actor_spi_lr),
-        'actor_spi_steps': int(total_steps),
-        'actor_spi_batch_size': int(batch_size),
+        'subgoal_spi_tau': spi_tau,
+        'subgoal_spi_lr': float(FLAGS.subgoal_spi_lr),
+        'subgoal_spi_steps': int(total_steps),
+        'subgoal_spi_batch_size': int(batch_size),
         'seed': seed,
-        'actor_checkpoint': f'checkpoints/actor/params_{total_steps}.pkl',
-        'param_diff': {
-            'actor_max_abs': actor_diff['max_abs'],
-            'critic_max_abs': critic_diff['max_abs'],
-            'dynamics_max_abs': dynamics_diff['max_abs'],
-        },
+        'dynamics_checkpoint': f'checkpoints/dynamics/params_{total_steps}.pkl',
+        'param_diff': {'subgoal_spi_max_abs': spi_diff['max_abs']},
         'final_eval': {
-            'actor_success_rate_mean': float(final_metrics.get('eval/success_rate_mean', float('nan'))),
-            'idm_success_rate_mean': float(final_metrics.get('eval_idm/success_rate_mean', float('nan'))),
+            'spi_subgoal_actor': float(
+                final_metrics.get('eval_spi_subgoal_actor/success_rate_mean', float('nan'))
+            ),
+            'spi_subgoal_idm': float(
+                final_metrics.get('eval_spi_subgoal_idm/success_rate_mean', float('nan'))
+            ),
+            'flow_actor': float(final_metrics.get('eval_flow_actor/success_rate_mean', float('nan'))),
+            'flow_idm': float(final_metrics.get('eval_flow_idm/success_rate_mean', float('nan'))),
         },
     }
-    (out_dir / 'actor_spi_meta.yaml').write_text(
+    (out_dir / 'subgoal_spi_meta.yaml').write_text(
         yaml.safe_dump(meta, sort_keys=False, default_flow_style=False), encoding='utf-8'
     )
     csv_logger.close() if hasattr(csv_logger, 'close') else None
     print(
-        f"[actor_spi] FINAL actor={meta['final_eval']['actor_success_rate_mean']:.4f} "
-        f"idm={meta['final_eval']['idm_success_rate_mean']:.4f}",
+        f"[subgoal_spi] FINAL spi_actor={meta['final_eval']['spi_subgoal_actor']:.4f} "
+        f"spi_idm={meta['final_eval']['spi_subgoal_idm']:.4f} "
+        f"flow_actor={meta['final_eval']['flow_actor']:.4f} "
+        f"flow_idm={meta['final_eval']['flow_idm']:.4f}",
         flush=True,
     )
-    print(f'[actor_spi] DONE outputs={out_dir}', flush=True)
+    print(f'[subgoal_spi] DONE outputs={out_dir}', flush=True)
 
 
 if __name__ == '__main__':

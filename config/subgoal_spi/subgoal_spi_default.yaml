@@ -1,0 +1,28 @@
+# Subgoal SPI finetuning defaults (1M checkpoint bundle mode).
+#
+# Loads dynamics/critic/actor from checkpoints/1m_env_best/<env>/.
+# Random-init subgoal_spi_net; flow subgoal_net frozen as proposal teacher.
+# Proposal sampling N/T match actor SPI: eval_n + eval_temperature from best_eval_meta.
+
+pretrained_ckpt_dir: ''
+use_best_params_bundle: false
+best_params_json: docs/env_best_runs_choi/env_best_params.json
+checkpoint_bundle_root: docs/env_best_runs_choi/checkpoints
+
+subgoal_spi_steps: 100000
+subgoal_spi_lr: 0.0003
+subgoal_spi_tau: 5.0
+subgoal_spi_batch_size: 0
+subgoal_spi_num_samples: 0
+
+# Best-of-N: score the N flow candidates with the critic and use only the single
+# highest-energy candidate as the proximal target (one-hot rho), matching the
+# actor SPI best-of-N subgoal selection.
+subgoal_spi_select_best: true
+
+eval_interval: 50000
+save_interval: 50000
+subgoal_spi_eval_episodes: 25
+
+freeze_non_subgoal_spi: true
+reset_dynamics_optimizer: true

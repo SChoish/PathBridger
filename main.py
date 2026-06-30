@@ -827,6 +827,117 @@ def _build_actor_batch_from_dynamics(
     return dynamics_agent, actor_batch, coupling_info, timing
 
 
+def _build_spi_actor_batch_from_dynamics(
+    dynamics_agent: DynamicsAgent,
+    critic_agent: Any,
+    dynamics_batch: dict,
+    actor_config: Any,
+    *,
+    spi_num_subgoal_samples: int,
+    spi_subgoal_temperature: float,
+    plan_candidates: int | None = None,
+    plan_noise_scale: float | None = None,
+) -> tuple[DynamicsAgent, dict, dict, dict[str, float]]:
+    """SPI actor batch: sample N subgoals @ T → critic best → bridge/IDM proposals."""
+    obs = jnp.asarray(dynamics_batch['observations'], dtype=jnp.float32)
+    high_goals = jnp.asarray(dynamics_batch['high_actor_goals'], dtype=jnp.float32)
+    proposal_horizon = int(actor_config['actor_chunk_horizon'])
+    plan_n = max(1, int(FLAGS.plan_candidates if plan_candidates is None else plan_candidates))
+    noise_scale = float(FLAGS.plan_noise_scale if plan_noise_scale is None else plan_noise_scale)
+    if plan_n > 1:
+        noise_scale = float(plan_noise_scale if plan_noise_scale is not None else FLAGS.plan_noise_scale)
+    num_subgoals = max(1, int(spi_num_subgoal_samples))
+    include_zero = bool(dynamics_agent.config.get('subgoal_eval_include_zero_candidate', True))
+    score_mode = str(dynamics_agent.config.get('subgoal_eval_score_mode', 'product')).lower()
+
+    sub_rng, plan_rng = jax.random.split(dynamics_agent.rng)
+    subgoal_candidates, _ = dynamics_agent.sample_subgoal_candidates(
+        obs,
+        high_goals,
+        sub_rng,
+        num_candidates=num_subgoals,
+        include_mean=include_zero,
+        temperature_override=float(spi_subgoal_temperature),
+    )
+    subgoal_scores = critic_agent.score_transitive_subgoals(
+        obs,
+        subgoal_candidates,
+        high_goals,
+        network_params=critic_agent.network.params,
+        score_mode=score_mode,
+    )
+    best_subgoal_idx = jnp.argmax(subgoal_scores, axis=1)
+    best_subgoal = jnp.take_along_axis(
+        subgoal_candidates,
+        best_subgoal_idx[:, None, None],
+        axis=1,
+    )[:, 0, :]
+
+    candidate_actions, plan_rng = dynamics_agent.build_action_proposals_from_subgoal(
+        obs,
+        best_subgoal,
+        high_goals,
+        plan_rng,
+        proposal_horizon=proposal_horizon,
+        plan_candidates=plan_n,
+        sample_noise_scale=noise_scale,
+    )
+    dynamics_agent = dynamics_agent.replace(rng=plan_rng)
+    actor_batch = {
+        'observations': obs,
+        'spi_goals': jnp.asarray(best_subgoal, dtype=jnp.float32),
+        'candidate_partial_chunks': candidate_actions,
+        'valids': jnp.ones((obs.shape[0], proposal_horizon), dtype=jnp.float32),
+        'high_actor_goals': high_goals,
+    }
+    nan = jnp.full((), jnp.nan, dtype=jnp.float32)
+    coupling_info = {
+        'predicted_subgoal_norm': jnp.linalg.norm(best_subgoal, axis=-1).mean(),
+        'proposal_goal_norm_mean': jnp.linalg.norm(subgoal_candidates, axis=-1).mean(),
+        'proposal_goal_std_mean': subgoal_candidates.std(axis=1).mean(),
+        'critic_score_mean': nan,
+        'critic_score_max': nan,
+        'critic_score_min': nan,
+        'critic_score_gap_top1_top2': nan,
+        'proposal_count': jnp.asarray(float(candidate_actions.shape[1]), dtype=jnp.float32),
+        'spi_subgoal_num_samples': jnp.asarray(float(num_subgoals), dtype=jnp.float32),
+        'spi_subgoal_temperature': jnp.asarray(float(spi_subgoal_temperature), dtype=jnp.float32),
+    }
+    return dynamics_agent, actor_batch, coupling_info, {}
+
+
+def _rescore_spi_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_config: Any) -> tuple[dict, dict]:
+    """Rescore all bridge/IDM proposals and keep every candidate for SPI rho weighting."""
+    del actor_config
+    obs = jnp.asarray(actor_batch['observations'], dtype=jnp.float32)
+    goals = jnp.asarray(actor_batch['spi_goals'], dtype=jnp.float32)
+    high_goals = jnp.asarray(actor_batch.get('high_actor_goals', goals), dtype=jnp.float32)
+    candidates = jnp.asarray(actor_batch['candidate_partial_chunks'], dtype=jnp.float32)
+    valids = jnp.asarray(actor_batch['valids'], dtype=jnp.float32)
+    keep_topk = int(candidates.shape[1])
+    out_batch, stats = _rescore_with_stats_jit(
+        critic_agent,
+        obs,
+        goals,
+        goals,
+        candidates,
+        valids,
+        critic_agent.network.params,
+        keep_topk=keep_topk,
+        use_partial_critic=True,
+    )
+    stats = dict(stats)
+    stats['proposal_best_of_n'] = jnp.asarray(float(candidates.shape[1]), dtype=jnp.float32)
+    stats['proposal_pre_best_count'] = jnp.asarray(float(candidates.shape[1]), dtype=jnp.float32)
+    stats['proposal_post_best_count'] = jnp.asarray(float(keep_topk), dtype=jnp.float32)
+    stats['proposal_count'] = stats['proposal_post_best_count']
+    stats['coupling/proposal_q_score_mean'] = stats.get('critic_score_mean', jnp.zeros((), dtype=jnp.float32))
+    stats['coupling/proposal_v_score_mean'] = jnp.zeros((), dtype=jnp.float32)
+    stats['coupling/proposal_combined_score_mean'] = stats.get('critic_score_mean', jnp.zeros((), dtype=jnp.float32))
+    del high_goals
+    return out_batch, stats
+
+
 def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_config: Any) -> tuple[dict, dict]:
     obs = jnp.asarray(actor_batch['observations'], dtype=jnp.float32)
     goals = jnp.asarray(actor_batch['spi_goals'], dtype=jnp.float32)

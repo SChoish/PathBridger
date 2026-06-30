@@ -429,6 +429,27 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         return self.replace(network=new_network, rng=new_rng), info
 
+    @jax.jit
+    def update_subgoal_spi(self, batch, critic_value_params=None):
+        """Finetune only ``subgoal_spi_net`` using the main SPI subgoal loss."""
+        if not _subgoal_spi_enabled(self.config):
+            raise ValueError('update_subgoal_spi requires subgoal_spi_enabled=True.')
+        new_rng, rng = jax.random.split(self.rng)
+
+        def loss_fn(grad_params):
+            loss_sub, _, _, _, _, info = self._compute_subgoal_loss(
+                batch, grad_params, rng_fr=rng, critic_value_params=critic_value_params,
+            )
+            return loss_sub, info
+
+        grads, info = jax.grad(loss_fn, has_aux=True)(self.network.params)
+        masked_grads = {
+            key: value if key == 'modules_subgoal_spi_net' else jax.tree_util.tree_map(jnp.zeros_like, value)
+            for key, value in grads.items()
+        }
+        new_network = self.network.apply_gradients(grads=masked_grads)
+        return self.replace(network=new_network, rng=new_rng), info
+
     # ------------------------------------------------------------------
     # Forward-bridge planner (closed-form, endpoint-conditioned)
     # ------------------------------------------------------------------
@@ -1071,7 +1092,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             log_std = log_std[0]
         return mu, log_std
 
-    @partial(jax.jit, static_argnames=('num_candidates', 'include_mean'))
+    @partial(jax.jit, static_argnames=('num_candidates', 'include_mean', 'temperature_override'))
     def sample_subgoal_candidates(
         self,
         observations,
@@ -1080,6 +1101,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         *,
         num_candidates: int,
         include_mean: bool = True,
+        temperature_override: float | None = None,
     ):
         """Sample ``num_candidates`` subgoal endpoints.
 
@@ -1105,7 +1127,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         if sub_mode == 'flow':
             B, D = obs.shape
             noise_scale = float(self.config.get('subgoal_flow_noise_scale', 1.0))
-            temperature = float(self.config.get('subgoal_temperature', 1.0))
+            temperature = (
+                float(temperature_override)
+                if temperature_override is not None
+                else float(self.config.get('subgoal_temperature', 1.0))
+            )
             n_rand = num_candidates - 1 if include_mean else num_candidates
             z0 = jnp.zeros((B, 1 if include_mean else 0, D), dtype=jnp.float32)
             z_rand = jax.random.normal(rng, (B, n_rand, D), dtype=jnp.float32) * (noise_scale * temperature)
@@ -1139,7 +1165,12 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         out = self._subgoal_forward(obs, goals)
         if isinstance(out, tuple):
             mu_raw, log_std = out
-            std = jnp.exp(log_std) * float(self.config.get('subgoal_temperature', 1.0))
+            temperature = (
+                float(temperature_override)
+                if temperature_override is not None
+                else float(self.config.get('subgoal_temperature', 1.0))
+            )
+            std = jnp.exp(log_std) * temperature
             n_sample = num_candidates - 1 if include_mean else num_candidates
             if n_sample > 0:
                 eps = jax.random.normal(rng, (n_sample, mu_raw.shape[0], mu_raw.shape[-1]))
@@ -1306,6 +1337,68 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             candidate_trajectories.shape[0], candidate_trajectories.shape[1], proposal_horizon, -1
         )
         return mu, candidate_actions, candidate_goals, new_rng
+
+    @partial(jax.jit, static_argnames=('proposal_horizon', 'plan_candidates', 'sample_noise_scale'))
+    def build_action_proposals_from_subgoal(
+        self,
+        observations,
+        subgoal_abs,
+        high_actor_goals,
+        rng,
+        *,
+        proposal_horizon: int,
+        plan_candidates: int,
+        sample_noise_scale: float = 0.0,
+    ):
+        """Build bridge/IDM action-chunk proposals from a fixed absolute subgoal endpoint."""
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        goals = jnp.asarray(high_actor_goals, dtype=jnp.float32)
+        mu = jnp.asarray(subgoal_abs, dtype=jnp.float32)
+        use_full_bridge_prefix = int(proposal_horizon) < int(self.config['dynamics_N'])
+        plan_candidates = max(1, int(plan_candidates))
+
+        if plan_candidates == 1:
+            if use_full_bridge_prefix:
+                origin, z0, zK, anchor = self._shift_to_displacement_frame(obs, mu)
+                indices = jnp.arange(0, proposal_horizon + 1, dtype=jnp.int32)
+                traj_local = self._forward_bridge_path_at_indices(
+                    z0, zK, indices, planner=_planner_type(self.config), anchor=anchor,
+                )
+                sampled = {'trajectory': traj_local + origin[:, None, :]}
+            else:
+                sampled = self.sample_plan(
+                    obs,
+                    mu,
+                    rng,
+                    noise_scale=0.0,
+                    num_steps=proposal_horizon,
+                    goal=goals,
+                )
+            new_rng, _ = jax.random.split(rng)
+            candidate_trajectories = sampled['trajectory'][:, None, ...]
+        else:
+            new_rng, sample_rng = jax.random.split(rng)
+            candidate_trajectories = self.sample_plan_candidates(
+                obs,
+                mu,
+                sample_rng,
+                num_candidates=plan_candidates,
+                noise_scale=float(sample_noise_scale),
+                include_mean=True,
+                num_steps=None if use_full_bridge_prefix else proposal_horizon,
+                goal=goals,
+            )
+            if use_full_bridge_prefix:
+                candidate_trajectories = candidate_trajectories[:, :, : proposal_horizon + 1, :]
+
+        flat_trajectories = candidate_trajectories.reshape(
+            -1, candidate_trajectories.shape[2], candidate_trajectories.shape[3]
+        )
+        candidate_actions = self._idm_actions_from_trajectories(flat_trajectories, proposal_horizon)
+        candidate_actions = candidate_actions.reshape(
+            candidate_trajectories.shape[0], candidate_trajectories.shape[1], proposal_horizon, -1
+        )
+        return candidate_actions, new_rng
 
     @classmethod
     def create(cls, seed, ex_observations, config, ex_actions=None):
@@ -1853,7 +1946,14 @@ class DynamicsAgent(_DynamicsAgentCore):
                 s, candidate_abs, g_high, critic_value_params,
             )
             candidate_energy_sg = jax.lax.stop_gradient(candidate_energy)
-            rho = jax.nn.softmax(float(self.config.get('subgoal_spi_beta', 1.0)) * candidate_energy_sg, axis=1)
+            if bool(self.config.get('subgoal_spi_select_best', False)):
+                # Best-of-N: hard-select the single highest-energy candidate as the
+                # proximal target (one-hot rho), mirroring the actor SPI subgoal
+                # selection (critic argmax) instead of a Boltzmann-weighted mixture.
+                best_idx = jnp.argmax(candidate_energy_sg, axis=1)
+                rho = jax.nn.one_hot(best_idx, candidate_energy_sg.shape[1], axis=1, dtype=jnp.float32)
+            else:
+                rho = jax.nn.softmax(float(self.config.get('subgoal_spi_beta', 1.0)) * candidate_energy_sg, axis=1)
             rho = jax.lax.stop_gradient(rho)
             prox = jnp.sum(
                 rho * jnp.mean((pred_sg[:, None, :] - jax.lax.stop_gradient(candidate_raw)) ** 2, axis=-1),
@@ -2636,6 +2736,7 @@ def _get_common_config():
             subgoal_spi_tau=5.0,
             subgoal_spi_energy_norm_eps=1e-6,
             subgoal_spi_include_mean_candidate=True,
+            subgoal_spi_select_best=False,
             subgoal_spi_loss_weight=1.0,
             subgoal_spi_proposal_loss_weight=1.0,
             subgoal_eval_selection='zero_noise',
