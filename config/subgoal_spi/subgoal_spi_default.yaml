@@ -23,6 +23,7 @@ subgoal_spi_select_best: true
 eval_interval: 50000
 save_interval: 50000
 subgoal_spi_eval_episodes: 25
+eval_spi_subgoal_only: true
 
 freeze_non_subgoal_spi: true
 reset_dynamics_optimizer: true

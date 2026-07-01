@@ -1175,6 +1175,7 @@ def _evaluate_env_tasks(
     video_fps: int = 15,
     wandb_enabled: bool = False,
     subgoal_override_goal: bool = False,
+    eval_spi_subgoal_only: bool = False,
 ) -> dict[str, Any]:
     """OGBench-style eval: success is decided **only** by ``info['success']`` (any step). No tolerance diagnostic."""
     if not task_ids:
@@ -1203,17 +1204,23 @@ def _evaluate_env_tasks(
     eval_seed_base = int(dynamics_agent.config.get('subgoal_eval_seed', 0))
     eval_four_way = _subgoal_spi_enabled_config(dynamics_agent.config)
     primary_subgoal_source = 'spi' if eval_four_way else 'flow'
-    variants = [
-        ('flow', 'idm', 'eval_flow_idm'),
-        ('flow', 'actor', 'eval_flow_actor'),
-    ]
-    if eval_four_way:
-        variants.extend(
-            [
-                ('spi', 'idm', 'eval_spi_subgoal_idm'),
-                ('spi', 'actor', 'eval_spi_subgoal_actor'),
-            ]
-        )
+    if eval_four_way and eval_spi_subgoal_only:
+        variants = [
+            ('spi', 'idm', 'eval_spi_subgoal_idm'),
+            ('spi', 'actor', 'eval_spi_subgoal_actor'),
+        ]
+    else:
+        variants = [
+            ('flow', 'idm', 'eval_flow_idm'),
+            ('flow', 'actor', 'eval_flow_actor'),
+        ]
+        if eval_four_way:
+            variants.extend(
+                [
+                    ('spi', 'idm', 'eval_spi_subgoal_idm'),
+                    ('spi', 'actor', 'eval_spi_subgoal_actor'),
+                ]
+            )
     task_successes_by_key: dict[str, list[float]] = {metric_key: [] for _, _, metric_key in variants}
 
     def _eval_subgoal(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int, source: str) -> np.ndarray:

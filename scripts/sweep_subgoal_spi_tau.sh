@@ -23,8 +23,10 @@ else
 fi
 
 GPU_ID="${GPU_ID:-0}"
-PYTHON_BIN="${PYTHON_BIN:-/home/choi/miniconda3/envs/offrl/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/svcho/anaconda3/envs/offrl/bin/python}"
 WITH_CUDA="${ROOT}/scripts/with_jax_cuda.sh"
+SUBGOAL_SPI_CONFIG="${SUBGOAL_SPI_CONFIG:-config/subgoal_spi/subgoal_spi_default.yaml}"
+EVAL_SPI_SUBGOAL_ONLY="${EVAL_SPI_SUBGOAL_ONLY:-true}"
 SUBGOAL_SPI_STEPS="${SUBGOAL_SPI_STEPS:-100000}"
 SUBGOAL_SPI_LR="${SUBGOAL_SPI_LR:-0.0003}"
 SUBGOAL_SPI_BATCH_SIZE="${SUBGOAL_SPI_BATCH_SIZE:-0}"
@@ -56,10 +58,16 @@ for tau in "${TAUS[@]}"; do
   else
     extra_args+=(--nouse_best_params_bundle)
   fi
+  if [[ "${EVAL_SPI_SUBGOAL_ONLY}" == "true" ]]; then
+    extra_args+=(--eval_spi_subgoal_only)
+  else
+    extra_args+=(--noeval_spi_subgoal_only)
+  fi
   echo "[$(date -Is)] START tau=${tau}" | tee -a "${MASTER}"
   CUDA_VISIBLE_DEVICES="${GPU_ID}" bash "${WITH_CUDA}" "${PYTHON_BIN}" -u train_subgoal_spi.py \
     --env_name="${ENV_NAME}" \
     --seed="${SEED}" \
+    --subgoal_spi_config="${SUBGOAL_SPI_CONFIG}" \
     --subgoal_spi_tau="${tau}" \
     --subgoal_spi_steps="${SUBGOAL_SPI_STEPS}" \
     --subgoal_spi_lr="${SUBGOAL_SPI_LR}" \

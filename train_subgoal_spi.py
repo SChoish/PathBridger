@@ -75,6 +75,12 @@ flags.DEFINE_boolean('reset_dynamics_optimizer', True, 'Reinitialize dynamics op
 flags.DEFINE_integer('debug_num_steps', 0, 'If > 0, override total steps for a smoke test.')
 flags.DEFINE_string('subgoal_spi_out_root', 'checkpoints/subgoal_spi', 'Root dir for subgoal SPI outputs.')
 flags.DEFINE_integer('subgoal_spi_eval_episodes', 25, 'Episodes per task for eval.')
+flags.DEFINE_boolean(
+    'eval_spi_subgoal_only',
+    True,
+    'During subgoal SPI finetune eval, run only eval_spi_subgoal_idm/actor '
+    '(skip frozen flow baselines).',
+)
 flags.DEFINE_integer('subgoal_spi_log_interval', 500, 'Log every N steps.')
 flags.DEFINE_string('mujoco_gl', '', 'Optional MuJoCo GL backend, e.g. egl.')
 flags.DEFINE_string('subgoal_spi_config', '', 'Optional YAML setting subgoal SPI flags; CLI args win.')
@@ -579,6 +585,7 @@ def main(_):
             episodes_per_task=eval_episodes,
             wandb_enabled=False,
             subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
+            eval_spi_subgoal_only=bool(FLAGS.eval_spi_subgoal_only),
         )
         save_eval_results(
             out_dir,
