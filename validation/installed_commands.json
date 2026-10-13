@@ -1,0 +1,14 @@
+{
+  "passed": true,
+  "version": "0.2.2",
+  "commands": {
+    "pathbridger-3999-train": {
+      "passed": true,
+      "entry": "exec /home/shchoi/PathBridger-paper/.venv/bin/python /home/shchoi/PathBridger-preserved3999/.runtime-0.2.2/main.py \"$@\""
+    },
+    "pathbridger-3999-eval": {
+      "passed": true,
+      "entry": "exec /home/shchoi/PathBridger-paper/.venv/bin/python /home/shchoi/PathBridger-preserved3999/.runtime-0.2.2/evaluate.py \"$@\""
+    }
+  }
+}

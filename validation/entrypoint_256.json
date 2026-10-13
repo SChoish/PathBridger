@@ -1,0 +1,16 @@
+{
+  "plain_update": {
+    "passed": true,
+    "steps": 256,
+    "verification_kind": "manual_training_loop"
+  },
+  "reuse_train_buffers": {
+    "passed": true,
+    "steps": 256,
+    "verification_kind": "manual_training_loop"
+  },
+  "cli_verification": false,
+  "passed": true,
+  "corrected_from_invalid_commit": "1a5a3324a9c359a7d14f0f0987e9e44beb2c9057",
+  "note": "1a5a332 incorrectly passed modules_target_value to both sides. These results use the original helper on the legacy side and the matching deployment selector."
+}
