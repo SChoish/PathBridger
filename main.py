@@ -37,9 +37,7 @@ from utils.runtime import build_state_runtime
 FLAGS = flags.FLAGS
 
 _BATCH_SIZE = 1024
-_DEFAULT_CONFIG = str(
-    Path(__file__).resolve().parent / 'configs' / 'pbf_antmaze_medium.yaml'
-)
+_DEFAULT_CONFIG = str(Path(__file__).resolve().parent / 'configs' / 'pbf_antmaze_medium.yaml')
 
 flags.DEFINE_string('run_group', 'Debug', 'Experiment group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
@@ -58,18 +56,16 @@ flags.DEFINE_string(
 )
 flags.DEFINE_integer('train_steps', 1_000_000, 'Number of gradient updates.')
 flags.DEFINE_integer('log_interval', 5_000, 'Training CSV/W&B logging interval.')
+flags.DEFINE_integer('eval_interval', 0, 'In-process evaluation interval; zero disables it.')
 flags.DEFINE_integer(
-    'eval_interval', 0, 'In-process evaluation interval; zero disables it.'
+    'save_interval', 100_000, 'Checkpoint interval; 0 saves only the final checkpoint.'
 )
-flags.DEFINE_integer('save_interval', 100_000, 'Checkpoint interval; 0 saves only the final checkpoint.')
 flags.DEFINE_string(
     'extra_save_steps',
     '',
     'Comma-separated extra checkpoint steps (e.g. 800000,900000,1000000).',
 )
-flags.DEFINE_integer(
-    'eval_episodes', 50, 'Episodes per task for in-process evaluation.'
-)
+flags.DEFINE_integer('eval_episodes', 50, 'Episodes per task for in-process evaluation.')
 flags.DEFINE_string(
     'eval_protocol',
     HISTORICAL_EVALUATION_PROTOCOL,
@@ -112,9 +108,7 @@ def _write_run_config(
         'state_scale': np.asarray(state_scale, dtype=np.float32).tolist(),
         'initialization': initialization,
     }
-    if initialization.get('mode') == 'unified_resume' and os.path.isfile(
-        config_path
-    ):
+    if initialization.get('mode') == 'unified_resume' and os.path.isfile(config_path):
         with open(config_path, encoding='utf-8') as file:
             previous = json.load(file)
         origin = previous.get('initialization')
@@ -186,9 +180,7 @@ def main(_):
     action_free = bool(config.get('offline_action_free', False))
     if action_free:
         train_data = action_free_view(train_data)
-    agent, dataset, state_scale = build_state_runtime(
-        train_data, config, seed=FLAGS.seed
-    )
+    agent, dataset, state_scale = build_state_runtime(train_data, config, seed=FLAGS.seed)
     if FLAGS.restore_path:
         agent, restore_info = restore_agent(
             agent,
@@ -199,9 +191,7 @@ def main(_):
         )
         initialization = {
             'mode': 'unified_resume',
-            'checkpoint': str(
-                resolve_checkpoint(FLAGS.restore_path, FLAGS.restore_step)[0]
-            ),
+            'checkpoint': str(resolve_checkpoint(FLAGS.restore_path, FLAGS.restore_step)[0]),
             'step': restore_step,
             'restore_contract': restore_info,
         }
@@ -215,9 +205,7 @@ def main(_):
         exp_name = get_exp_name(
             FLAGS.seed,
             env_name=str(config.env_name),
-            agent_name=(
-            f'pathbridger_{config.endpoint_distribution}'
-        ),
+            agent_name=(f'pathbridger_{config.endpoint_distribution}'),
         )
         run_dir = os.path.abspath(
             os.path.join(FLAGS.save_dir, 'pathbridger', FLAGS.run_group, exp_name)
@@ -318,9 +306,7 @@ def main(_):
         marker = os.path.join(run_dir, f'EMERGENCY_SAVE_step{step}')
         try:
             with open(marker, 'w', encoding='utf-8') as file:
-                file.write(
-                    f'signal={stop_requested["signum"]} step={step}\n'
-                )
+                file.write(f'signal={stop_requested["signum"]} step={step}\n')
         except OSError:
             pass
         print(
@@ -395,7 +381,10 @@ def main(_):
                 interval_start = time.time()
                 train_logger.log(train_metrics, step=step)
                 if wandb_run is not None:
-                    wandb_run.log({f'training/{key}': value for key, value in train_metrics.items()}, step=step)
+                    wandb_run.log(
+                        {f'training/{key}': value for key, value in train_metrics.items()},
+                        step=step,
+                    )
 
             if do_eval:
                 eval_metrics = evaluate(
@@ -444,9 +433,7 @@ def main(_):
 def run():
     """Run the command-line training entry point."""
 
-    normalize_packaged_file_flag(
-        'agent', package_root=Path(__file__).resolve().parent
-    )
+    normalize_packaged_file_flag('agent', package_root=Path(__file__).resolve().parent)
     app.run(main)
 
 

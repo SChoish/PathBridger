@@ -128,9 +128,7 @@ def resolve_config(
 
     for raw in cli_overrides:
         if '=' not in raw:
-            raise ValueError(
-                f'CLI config override must use key=value syntax, got {raw!r}.'
-            )
+            raise ValueError(f'CLI config override must use key=value syntax, got {raw!r}.')
         key, text = raw.split('=', 1)
         key = key.strip()
         if not key:
@@ -150,7 +148,7 @@ def load_config(
     path = Path(preset_path).expanduser()
     if path.suffix.lower() not in {'.yaml', '.yml'}:
         raise ValueError(f'PathBridger presets must be YAML files, got: {path}')
-    from agents.pathbridger import get_config as get_agent_config
+    from agents.defaults import get_config as get_agent_config
 
     return resolve_config(
         get_agent_config(),

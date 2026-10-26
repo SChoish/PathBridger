@@ -35,8 +35,7 @@ def normalize_evaluation_protocol(protocol: str | None) -> str:
         return aliases[protocol]
     except KeyError as error:
         raise ValueError(
-            f'Unknown evaluation protocol {protocol!r}; expected one of '
-            f'{EVALUATION_PROTOCOLS}.'
+            f'Unknown evaluation protocol {protocol!r}; expected one of {EVALUATION_PROTOCOLS}.'
         ) from error
 
 
@@ -67,13 +66,10 @@ def evaluation_protocol_metadata(
         'temperature': float(temperature),
         'policy_jax_seed': int(seed),
         'environment_reset': (
-            'seed=seed*100000+task_id*1000+episode,options'
-            if deterministic
-            else 'options-only'
+            'seed=seed*100000+task_id*1000+episode,options' if deterministic else 'options-only'
         ),
         'action_space_seed': (
-            'stable evaluation action-space instance seeded with '
-            'seed*100000+task_id*1000+episode'
+            'stable evaluation action-space instance seeded with seed*100000+task_id*1000+episode'
             if deterministic
             else None
         ),
@@ -167,9 +163,7 @@ def _stable_action_space(env: Any) -> Any:
             'adapted per instance.'
         ) from error
     if unwrapped.action_space is not first or env.action_space is not first:
-        raise RuntimeError(
-            'deterministic-v1 failed to install a stable action-space instance.'
-        )
+        raise RuntimeError('deterministic-v1 failed to install a stable action-space instance.')
     return first
 
 
@@ -321,7 +315,9 @@ def evaluate(
             else:
                 observation, info = env.reset(options=reset_options)
             if not isinstance(info, Mapping) or 'goal' not in info:
-                raise RuntimeError(f'Environment reset for task {task_id} did not return info["goal"].')
+                raise RuntimeError(
+                    f'Environment reset for task {task_id} did not return info["goal"].'
+                )
             initial_observation = np.asarray(observation, dtype=np.float32)
             initial_goal = np.asarray(info['goal'], dtype=np.float32)
             success, rng, steps_executed = _evaluate_episode(
@@ -344,9 +340,7 @@ def evaluate(
                         'episode_index': int(episode),
                         'task_id': int(task_id),
                         'environment_seed': episode_seed,
-                        'initial_observation_sha256': _array_sha256(
-                            initial_observation
-                        ),
+                        'initial_observation_sha256': _array_sha256(initial_observation),
                         'goal_sha256': _array_sha256(initial_goal),
                         'steps_executed': int(steps_executed),
                         'success': bool(success),

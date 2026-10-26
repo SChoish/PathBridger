@@ -11,13 +11,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-
 MANUSCRIPT_TRAINING_PROTOCOL = 'manuscript-v1'
 REPORTED_RUN_LEGACY_TRAINING_PROTOCOL = 'reported-run-legacy-v1'
-SUPPORTED_TRAINING_PROTOCOLS = frozenset({
-    MANUSCRIPT_TRAINING_PROTOCOL,
-    REPORTED_RUN_LEGACY_TRAINING_PROTOCOL,
-})
+SUPPORTED_TRAINING_PROTOCOLS = frozenset(
+    {
+        MANUSCRIPT_TRAINING_PROTOCOL,
+        REPORTED_RUN_LEGACY_TRAINING_PROTOCOL,
+    }
+)
 
 
 def normalize_training_protocol(value: Any) -> str:

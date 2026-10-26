@@ -26,9 +26,7 @@ from utils.flax_utils import resolve_checkpoint, restore_agent
 from utils.runtime import build_state_runtime
 
 FLAGS = flags.FLAGS
-_DEFAULT_CONFIG = str(
-    Path(__file__).resolve().parent / 'configs' / 'pbf_antmaze_medium.yaml'
-)
+_DEFAULT_CONFIG = str(Path(__file__).resolve().parent / 'configs' / 'pbf_antmaze_medium.yaml')
 
 flags.DEFINE_string('checkpoint_dir', '', 'Checkpoint directory or exact .pkl file.')
 flags.DEFINE_integer(
@@ -93,11 +91,7 @@ def main(_):
         raise ValueError('checkpoint_step cannot be negative.')
     if FLAGS.episodes < 1:
         raise ValueError('episodes must be at least 1.')
-    task_ids = tuple(
-        int(token.strip())
-        for token in FLAGS.task_ids.split(',')
-        if token.strip()
-    )
+    task_ids = tuple(int(token.strip()) for token in FLAGS.task_ids.split(',') if token.strip())
     if not task_ids:
         raise ValueError('task_ids must contain at least one task id.')
     checkpoint_path, checkpoint_step = resolve_checkpoint(
@@ -160,9 +154,7 @@ def main(_):
         'eval_prefix_selection': str(config.eval_prefix_selection),
         'eval_num_prefix_samples': int(config.eval_num_prefix_samples),
         'eval_prefix_temperature': float(config.eval_prefix_temperature),
-        'eval_include_deterministic_prefix': bool(
-            config.eval_include_deterministic_prefix
-        ),
+        'eval_include_deterministic_prefix': bool(config.eval_include_deterministic_prefix),
         'prefix_rank': int(config.prefix_rank),
         'prefix_flow_steps': int(config.prefix_flow_steps),
         'eval_num_candidates': int(config.eval_num_candidates),
@@ -198,9 +190,7 @@ def main(_):
 def run():
     """Run the command-line evaluation entry point."""
 
-    normalize_packaged_file_flag(
-        'agent', package_root=Path(__file__).resolve().parent
-    )
+    normalize_packaged_file_flag('agent', package_root=Path(__file__).resolve().parent)
     app.run(main)
 
 

@@ -105,7 +105,9 @@ class CsvLogger:
     def _open(self, mode: str) -> None:
         self._file = self.path.open(mode, newline='', encoding='utf-8')
         if self._header is not None:
-            self._writer = csv.DictWriter(self._file, fieldnames=self._header, extrasaction='ignore')
+            self._writer = csv.DictWriter(
+                self._file, fieldnames=self._header, extrasaction='ignore'
+            )
 
     def log(self, row: Mapping[str, Any], step: int) -> None:
         record = {str(key): _csv_value(value) for key, value in row.items()}
@@ -147,9 +149,13 @@ def setup_wandb(
     try:
         import wandb
     except ImportError as error:
-        raise RuntimeError('Weights & Biases is optional; install PathBridger with the `tracking` extra.') from error
+        raise RuntimeError(
+            'Weights & Biases is optional; install PathBridger with the `tracking` extra.'
+        ) from error
 
-    wandb_dir = str(directory) if directory is not None else tempfile.mkdtemp(prefix='pathbridger-wandb-')
+    wandb_dir = (
+        str(directory) if directory is not None else tempfile.mkdtemp(prefix='pathbridger-wandb-')
+    )
     run_config = get_flag_dict() if config is None else _serializable(config)
     return wandb.init(
         project=project,

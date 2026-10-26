@@ -106,9 +106,7 @@ class TrainState(flax.struct.PyTreeNode):
         if self.tx is None:
             raise ValueError('Cannot apply gradients without an optimizer.')
         if isinstance(self.tx, Mapping):
-            raise ValueError(
-                'Module optimizers require apply_loss_fn(..., trainable_modules=...).'
-            )
+            raise ValueError('Module optimizers require apply_loss_fn(..., trainable_modules=...).')
         updates, opt_state = self.tx.update(grads, self.opt_state, self.params)
         params = optax.apply_updates(self.params, updates)
         return self.replace(step=self.step + 1, params=params, opt_state=opt_state, **kwargs)
@@ -209,9 +207,7 @@ def resolve_checkpoint(
 
     step = int(step)
     if step < 1:
-        raise ValueError(
-            'A checkpoint directory requires an explicit positive step.'
-        )
+        raise ValueError('A checkpoint directory requires an explicit positive step.')
     return path / f'params_{step}.pkl', step
 
 
@@ -230,10 +226,12 @@ def _checkpoint_metadata(agent: Any) -> dict[str, Any]:
         'training_objective_protocol': training_protocol_from_config(config),
     }
     if prefix_model == 'low_rank_gaussian':
-        metadata.update({
-            'prefix_rank': int(config['prefix_rank']),
-            'prefix_sigma_floor': float(config['prefix_sigma_floor']),
-        })
+        metadata.update(
+            {
+                'prefix_rank': int(config['prefix_rank']),
+                'prefix_sigma_floor': float(config['prefix_sigma_floor']),
+            }
+        )
     elif prefix_model == 'joint_flow':
         metadata['prefix_flow_steps'] = int(config['prefix_flow_steps'])
     return metadata
@@ -250,13 +248,10 @@ def _validate_checkpoint_metadata(
     prefix_model = str(agent.config['prefix_model'])
     if metadata is None:
         if prefix_model != 'deterministic':
-            raise ValueError(
-                'A stochastic prefix checkpoint requires architecture metadata.'
-            )
+            raise ValueError('A stochastic prefix checkpoint requires architecture metadata.')
         if (
             not inference_only
-            and training_protocol_from_config(agent.config)
-            != REPORTED_RUN_LEGACY_TRAINING_PROTOCOL
+            and training_protocol_from_config(agent.config) != REPORTED_RUN_LEGACY_TRAINING_PROTOCOL
         ):
             raise ValueError(
                 'Checkpoint has no training_objective_protocol metadata; '
@@ -291,11 +286,7 @@ def _validate_checkpoint_metadata(
         keys.extend(['prefix_rank', 'prefix_sigma_floor'])
     elif prefix_model == 'joint_flow':
         keys.append('prefix_flow_steps')
-    mismatches = [
-        key
-        for key in keys
-        if key not in metadata or metadata[key] != expected[key]
-    ]
+    mismatches = [key for key in keys if key not in metadata or metadata[key] != expected[key]]
     if mismatches:
         details = ', '.join(
             f'{key}: checkpoint={metadata.get(key)!r}, config={expected[key]!r}'
@@ -311,10 +302,7 @@ def _validate_checkpoint_metadata(
         rtol=1e-6,
         atol=1e-6,
     ):
-        raise ValueError(
-            'Checkpoint state_scale does not match the current training dataset.'
-        )
-
+        raise ValueError('Checkpoint state_scale does not match the current training dataset.')
 
 
 def save_agent(
@@ -368,9 +356,7 @@ def restore_agent(
     if not isinstance(payload, dict) or 'agent' not in payload:
         raise ValueError(f'Invalid PathBridger checkpoint: {checkpoint_path}')
     metadata = payload.get('metadata')
-    _validate_checkpoint_metadata(
-        agent, metadata, inference_only=inference_only
-    )
+    _validate_checkpoint_metadata(agent, metadata, inference_only=inference_only)
     checkpoint_protocol = (
         normalize_training_protocol(
             metadata.get(
@@ -387,9 +373,7 @@ def restore_agent(
         if str(agent.config['prefix_model']) != 'deterministic':
             raise ValueError('Legacy checkpoints cannot restore a stochastic prefix model.')
         agent_state = dict(agent_state)
-        agent_state['state_scale'] = flax.serialization.to_state_dict(
-            agent.state_scale
-        )
+        agent_state['state_scale'] = flax.serialization.to_state_dict(agent.state_scale)
     restored_agent = flax.serialization.from_state_dict(agent, agent_state)
     if 'numpy_random_state' in payload:
         np.random.set_state(payload['numpy_random_state'])
@@ -408,22 +392,14 @@ def restore_agent(
     else:
         sampler_resume = 'unavailable'
     restore_info = {
-        'checkpoint_schema_version': int(
-            payload.get('checkpoint_schema_version', 0)
-        ),
-        'numpy_random_state': (
-            'restored' if 'numpy_random_state' in payload else 'unavailable'
-        ),
-        'python_random_state': (
-            'restored' if 'python_random_state' in payload else 'unavailable'
-        ),
+        'checkpoint_schema_version': int(payload.get('checkpoint_schema_version', 0)),
+        'numpy_random_state': ('restored' if 'numpy_random_state' in payload else 'unavailable'),
+        'python_random_state': ('restored' if 'python_random_state' in payload else 'unavailable'),
         'sampler_resume': sampler_resume,
         'exact_sampler_resume_guaranteed': sampler_resume == 'schema-v2-exact',
         'checkpoint_training_objective_protocol': checkpoint_protocol,
         'requested_training_objective_protocol': requested_protocol,
-        'training_objective_protocol_match': (
-            checkpoint_protocol == requested_protocol
-        ),
+        'training_objective_protocol_match': (checkpoint_protocol == requested_protocol),
         'inference_only': bool(inference_only),
     }
     if return_info:

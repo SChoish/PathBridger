@@ -23,9 +23,7 @@ _MAZE_GOAL_XY_INDICES = (0, 1)
 
 def _env_goal_phi_kind(env_name: str | None) -> str:
     if env_name is None or not str(env_name).strip():
-        raise ValueError(
-            "goal_representation='phi' requires a non-empty OGBench environment name."
-        )
+        raise ValueError("goal_representation='phi' requires a non-empty OGBench environment name.")
     name = str(env_name).lower()
     if 'humanoidmaze' in name:
         return 'humanoidmaze'
@@ -39,7 +37,7 @@ def _env_goal_phi_kind(env_name: str | None) -> str:
         return 'cube'
     raise ValueError(
         f"goal_representation='phi' does not support env_name={env_name!r}; "
-        "expected antmaze, humanoidmaze, puzzle, cube, or scene."
+        'expected antmaze, humanoidmaze, puzzle, cube, or scene.'
     )
 
 
@@ -147,18 +145,14 @@ def normalize_phi_goal_obs_indices(raw: object) -> tuple[int, ...]:
     if raw is None:
         return ()
     if not isinstance(raw, (list, tuple)):
-        raise TypeError(
-            f'phi_goal_obs_indices must be a list or tuple, got {type(raw).__name__}.'
-        )
+        raise TypeError(f'phi_goal_obs_indices must be a list or tuple, got {type(raw).__name__}.')
     indices = tuple(int(index) for index in raw)
     if any(index < 0 for index in indices):
         raise ValueError(f'phi_goal_obs_indices must be non-negative, got {indices}.')
     return indices
 
 
-def infer_phi_goal_obs_indices(
-    env_name: str | None, obs_dim: int | None = None
-) -> tuple[int, ...]:
+def infer_phi_goal_obs_indices(env_name: str | None, obs_dim: int | None = None) -> tuple[int, ...]:
     """Infer task-relevant compact-observation indices when representable as a slice.
 
     Scene returns an empty tuple because its phi includes an argmax over each
@@ -203,19 +197,15 @@ def assert_phi_goal_obs_indices(
     if mode in ('full', 'raw', 'none', ''):
         return
     if mode not in ('phi', 'auto', 'goal_phi'):
-        raise ValueError(f"{where}: unknown goal representation {mode!r}.")
+        raise ValueError(f'{where}: unknown goal representation {mode!r}.')
 
     obs_dim = int(obs_dim)
     try:
         kind = _env_goal_phi_kind(env_name)
         if kind == 'puzzle' and not _button_state_indices(obs_dim):
-            raise ValueError(
-                f'obs_dim={obs_dim} is incompatible with compact puzzle observations.'
-            )
+            raise ValueError(f'obs_dim={obs_dim} is incompatible with compact puzzle observations.')
         if kind == 'cube' and not _cube_position_indices(obs_dim):
-            raise ValueError(
-                f'obs_dim={obs_dim} is incompatible with compact cube observations.'
-            )
+            raise ValueError(f'obs_dim={obs_dim} is incompatible with compact cube observations.')
         if kind == 'scene':
             _scene_layout(obs_dim, env_name)
         if kind in ('antmaze', 'humanoidmaze') and obs_dim < 2:
@@ -257,8 +247,7 @@ def goal_representation(
 
     if not indices:
         raise ValueError(
-            f"goal_representation='phi' is incompatible with env={env_name!r}, "
-            f'obs_dim={obs_dim}.'
+            f"goal_representation='phi' is incompatible with env={env_name!r}, obs_dim={obs_dim}."
         )
     return jnp.take(goals, jnp.asarray(indices, dtype=jnp.int32), axis=-1)
 
@@ -311,8 +300,7 @@ def goal_representation_np(
         expected_cursor = obs_dim - _SCENE_TAIL_DIM
         if cursor != expected_cursor:
             raise ValueError(
-                f'Inconsistent Scene layout: parsed through {cursor}, '
-                f'expected {expected_cursor}.'
+                f'Inconsistent Scene layout: parsed through {cursor}, expected {expected_cursor}.'
             )
         parts.append(np.take(goals, [obs_dim - 4, obs_dim - 2], axis=-1))
         return parts[0] if len(parts) == 1 else np.concatenate(parts, axis=-1)
@@ -327,8 +315,7 @@ def goal_representation_np(
         raise AssertionError(f'Unhandled phi kind {kind!r}.')
     if not indices:
         raise ValueError(
-            f"goal_representation='phi' is incompatible with env={env_name!r}, "
-            f'obs_dim={obs_dim}.'
+            f"goal_representation='phi' is incompatible with env={env_name!r}, obs_dim={obs_dim}."
         )
     return np.take(goals, indices, axis=-1)
 

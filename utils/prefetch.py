@@ -45,12 +45,9 @@ def submit_prefetched_batch(
     sampling mutates only the RNG exposed by get/set_rng_state.
     """
 
-    if not hasattr(sampler, 'get_rng_state') or not hasattr(
-        sampler, 'set_rng_state'
-    ):
+    if not hasattr(sampler, 'get_rng_state') or not hasattr(sampler, 'set_rng_state'):
         raise TypeError(
-            'An asynchronously prefetched sampler must expose '
-            'get_rng_state() and set_rng_state().'
+            'An asynchronously prefetched sampler must expose get_rng_state() and set_rng_state().'
         )
     sampler_rng_state = copy.deepcopy(sampler.get_rng_state())
     return PrefetchedBatch(

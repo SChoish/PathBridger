@@ -40,6 +40,17 @@ pathbridger-infer = "inference:run"
 
 [project.optional-dependencies]
 tracking = ["wandb"]
+dev = ["build>=1.2", "ruff==0.17.2"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.format]
+quote-style = "single"
 
 [tool.setuptools]
 py-modules = ["main", "evaluate", "inference"]

@@ -10,7 +10,6 @@ from jax.scipy.linalg import solve_triangular
 
 from utils.networks import MLP
 
-
 _HIDDEN_DIMS = (512, 512, 512)
 _LAYER_NORM = True
 
@@ -61,9 +60,8 @@ def low_rank_gaussian_nll(
     normalized = (targets - means) / sigmas
     whitened_factors = factors / sigmas[..., :, None]
     rank = factors.shape[-1]
-    gram = (
-        jnp.eye(rank, dtype=targets.dtype)
-        + jnp.einsum('...pr,...ps->...rs', whitened_factors, whitened_factors)
+    gram = jnp.eye(rank, dtype=targets.dtype) + jnp.einsum(
+        '...pr,...ps->...rs', whitened_factors, whitened_factors
     )
     cholesky = jnp.linalg.cholesky(gram)
     projected = jnp.einsum('...pr,...p->...r', whitened_factors, normalized)
@@ -73,23 +71,14 @@ def low_rank_gaussian_nll(
         lower=True,
     )[..., 0]
     mahalanobis = jnp.maximum(
-        jnp.sum(jnp.square(normalized), axis=-1)
-        - jnp.sum(jnp.square(solved), axis=-1),
+        jnp.sum(jnp.square(normalized), axis=-1) - jnp.sum(jnp.square(solved), axis=-1),
         0.0,
     )
-    log_determinant = (
-        2.0 * jnp.sum(jnp.log(sigmas), axis=-1)
-        + 2.0
-        * jnp.sum(
-            jnp.log(jnp.diagonal(cholesky, axis1=-2, axis2=-1)),
-            axis=-1,
-        )
+    log_determinant = 2.0 * jnp.sum(jnp.log(sigmas), axis=-1) + 2.0 * jnp.sum(
+        jnp.log(jnp.diagonal(cholesky, axis1=-2, axis2=-1)),
+        axis=-1,
     )
-    return 0.5 * (
-        targets.shape[-1] * jnp.log(2.0 * jnp.pi)
-        + log_determinant
-        + mahalanobis
-    )
+    return 0.5 * (targets.shape[-1] * jnp.log(2.0 * jnp.pi) + log_determinant + mahalanobis)
 
 
 class LowRankGaussianPrefix(nn.Module):

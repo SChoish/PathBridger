@@ -51,11 +51,7 @@ def export_inference_bundle(
     state_scale = np.asarray(agent.state_scale, dtype=np.float32)
     if state_scale.ndim != 1 or not np.all(np.isfinite(state_scale)):
         raise ValueError('agent.state_scale must be a finite 1D array.')
-    config = (
-        agent.config.to_dict()
-        if hasattr(agent.config, 'to_dict')
-        else dict(agent.config)
-    )
+    config = agent.config.to_dict() if hasattr(agent.config, 'to_dict') else dict(agent.config)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         'format': _INFERENCE_FORMAT,

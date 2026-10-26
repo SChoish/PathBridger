@@ -59,10 +59,7 @@ def _merge_compact_shards(
                 raise ValueError(f'Shard field {key!r} in {path} has no batch dimension.')
             merged_parts[key].append(array)
 
-    return {
-        key: np.concatenate(parts, axis=0)
-        for key, parts in merged_parts.items()
-    }
+    return {key: np.concatenate(parts, axis=0) for key, parts in merged_parts.items()}
 
 
 def _as_state_dataset(raw: Mapping[str, Any], *, split: str) -> Dataset:
@@ -98,16 +95,12 @@ def _local_npz_paths(
     conventional_roots = {'train', 'val', 'validation'}
     relative_parts = [path.relative_to(resolved_dir).parts for path in npz_paths]
     conventional_layout = all(
-        len(parts) == 1 or parts[0].lower() in conventional_roots
-        for parts in relative_parts
+        len(parts) == 1 or parts[0].lower() in conventional_roots for parts in relative_parts
     )
-    has_train_and_val = (
-        any(not _is_validation_file(path) for path in npz_paths)
-        and any(_is_validation_file(path) for path in npz_paths)
+    has_train_and_val = any(not _is_validation_file(path) for path in npz_paths) and any(
+        _is_validation_file(path) for path in npz_paths
     )
-    if resolved_dir.name.lower() == name or (
-        conventional_layout and has_train_and_val
-    ):
+    if resolved_dir.name.lower() == name or (conventional_layout and has_train_and_val):
         return npz_paths
     return []
 

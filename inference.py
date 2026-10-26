@@ -26,9 +26,7 @@ from utils.flax_utils import restore_agent
 from utils.runtime import build_state_runtime
 
 FLAGS = flags.FLAGS
-_DEFAULT_CONFIG = str(
-    Path(__file__).resolve().parent / 'configs' / 'pbf_antmaze_medium.yaml'
-)
+_DEFAULT_CONFIG = str(Path(__file__).resolve().parent / 'configs' / 'pbf_antmaze_medium.yaml')
 
 flags.DEFINE_string('checkpoint_dir', '', 'Training checkpoint directory or exact file.')
 flags.DEFINE_integer('checkpoint_step', 0, 'Training checkpoint step.')
@@ -41,7 +39,9 @@ flags.DEFINE_integer('seed', 0, 'Inference PRNG seed.')
 flags.DEFINE_integer('num_candidates', 0, 'Override Best-of-N; zero uses resolved config.')
 flags.DEFINE_float('temperature', -1.0, 'Override temperature; negative uses resolved config.')
 flags.DEFINE_multi_string(
-    'config_override', [], 'Highest-priority training-checkpoint config key=value override; repeatable.'
+    'config_override',
+    [],
+    'Highest-priority training-checkpoint config key=value override; repeatable.',
 )
 
 flags.DEFINE_string(
@@ -101,9 +101,7 @@ def _from_training_checkpoint():
 
 def main(_):
     if bool(FLAGS.checkpoint_dir) == bool(FLAGS.inference_bundle):
-        raise ValueError(
-            'Provide exactly one source: checkpoint_dir or inference_bundle.'
-        )
+        raise ValueError('Provide exactly one source: checkpoint_dir or inference_bundle.')
     if FLAGS.inference_bundle and FLAGS.export_path:
         raise ValueError('export_path is only valid with a training checkpoint.')
     if FLAGS.inference_bundle and FLAGS.config_override:
@@ -160,9 +158,7 @@ def main(_):
 
     num_candidates = FLAGS.num_candidates or int(config.eval_num_candidates)
     temperature = (
-        float(config.eval_temperature)
-        if FLAGS.temperature < 0.0
-        else float(FLAGS.temperature)
+        float(config.eval_temperature) if FLAGS.temperature < 0.0 else float(FLAGS.temperature)
     )
     action_chunks = agent.sample_action_chunks(
         observations=observations,
@@ -179,9 +175,7 @@ def main(_):
 
 
 def run():
-    normalize_packaged_file_flag(
-        'agent', package_root=Path(__file__).resolve().parent
-    )
+    normalize_packaged_file_flag('agent', package_root=Path(__file__).resolve().parent)
     app.run(main)
 
 
