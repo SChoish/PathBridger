@@ -37,8 +37,6 @@ Paper = "https://arxiv.org/abs/2608.29061"
 pathbridger-train = "main:run"
 pathbridger-eval = "evaluate:run"
 pathbridger-infer = "inference:run"
-pathbridger-state-manifest = "scripts.run_state_manifest:main"
-pathbridger-state-aggregate = "scripts.aggregate_state_evaluations:main"
 
 [project.optional-dependencies]
 tracking = ["wandb"]
@@ -48,10 +46,10 @@ py-modules = ["main", "evaluate", "inference"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agents*", "configs*", "envs*", "manifests*", "scripts*", "utils*"]
+include = ["agents*", "configs*", "envs*", "utils*"]
 
 [tool.setuptools.package-data]
-manifests = ["state/*.yaml"]
+configs = ["*.yaml"]
 
 [tool.setuptools.data-files]
 "share/pathbridger/assets" = ["assets/architecture.jpg"]

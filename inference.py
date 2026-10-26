@@ -8,12 +8,12 @@ from pathlib import Path
 import jax
 import numpy as np
 from absl import app, flags
-from ml_collections import config_flags
 
 from agents import PathBridgerAgent
 from envs.env_utils import make_env_and_datasets
 from utils.config import (
     config_sha256,
+    load_config,
     normalize_packaged_file_flag,
     resolve_config,
 )
@@ -22,27 +22,17 @@ from utils.deployment import (
     inference_bundle_spec,
     restore_inference_bundle,
 )
-from utils.flax_utils import initialize_from_legacy_pathbridger, restore_agent
+from utils.flax_utils import restore_agent
 from utils.runtime import build_state_runtime
 
 FLAGS = flags.FLAGS
 _DEFAULT_CONFIG = str(
-    Path(__file__).resolve().parent / 'configs' / 'pbf' / 'antmaze_medium.py'
+    Path(__file__).resolve().parent / 'configs' / 'pbf_antmaze_medium.yaml'
 )
 
 flags.DEFINE_string('checkpoint_dir', '', 'Training checkpoint directory or exact file.')
 flags.DEFINE_integer('checkpoint_step', 0, 'Training checkpoint step.')
 flags.DEFINE_string('inference_bundle', '', 'Self-contained inference bundle.')
-flags.DEFINE_string(
-    'legacy_dynamics_checkpoint',
-    '',
-    'Exact split legacy dynamics checkpoint; requires legacy_critic_checkpoint.',
-)
-flags.DEFINE_string(
-    'legacy_critic_checkpoint',
-    '',
-    'Exact split legacy critic checkpoint; requires legacy_dynamics_checkpoint.',
-)
 flags.DEFINE_string('export_path', '', 'Optional path for an exported inference bundle.')
 flags.DEFINE_string('input_path', '', 'NPZ containing observations and goals arrays.')
 flags.DEFINE_string('output_path', '', 'Output NPZ path for action_chunks.')
@@ -50,18 +40,14 @@ flags.DEFINE_string('dataset_dir', '', 'OGBench data; required only for a traini
 flags.DEFINE_integer('seed', 0, 'Inference PRNG seed.')
 flags.DEFINE_integer('num_candidates', 0, 'Override Best-of-N; zero uses resolved config.')
 flags.DEFINE_float('temperature', -1.0, 'Override temperature; negative uses resolved config.')
-flags.DEFINE_string(
-    'config_yaml', '', 'Optional strict YAML overlay for a training checkpoint.'
-)
 flags.DEFINE_multi_string(
     'config_override', [], 'Highest-priority training-checkpoint config key=value override; repeatable.'
 )
 
-config_flags.DEFINE_config_file(
+flags.DEFINE_string(
     'agent',
     _DEFAULT_CONFIG,
     'Training-checkpoint environment/method preset; ignored for a bundle.',
-    lock_config=False,
 )
 
 
@@ -77,49 +63,28 @@ def _from_bundle():
         config,
         state_scale=spec['state_scale'],
     )
-    migration = (spec.get('provenance') or {}).get('legacy_migration')
-    return (
-        restore_inference_bundle(agent, FLAGS.inference_bundle),
-        config,
-        spec,
-        migration,
-    )
+    return restore_inference_bundle(agent, FLAGS.inference_bundle), config, spec
 
 
 def _from_training_checkpoint():
-    config = resolve_config(
+    config = load_config(
         FLAGS.agent,
-        yaml_path=FLAGS.config_yaml,
         cli_overrides=FLAGS.config_override,
     )
     _, train_data, _ = make_env_and_datasets(
         str(config.env_name), dataset_dir=FLAGS.dataset_dir or None
     )
     agent, _, _ = build_state_runtime(train_data, config, seed=FLAGS.seed)
-    migration = None
-    checkpoint_restore = None
-    if FLAGS.legacy_dynamics_checkpoint:
-        agent, migration = initialize_from_legacy_pathbridger(
-            agent,
-            FLAGS.legacy_dynamics_checkpoint,
-            FLAGS.legacy_critic_checkpoint,
-            return_info=True,
-        )
-    else:
-        agent, checkpoint_restore = restore_agent(
-            agent,
-            FLAGS.checkpoint_dir,
-            FLAGS.checkpoint_step,
-            return_info=True,
-            inference_only=True,
-        )
+    agent, checkpoint_restore = restore_agent(
+        agent,
+        FLAGS.checkpoint_dir,
+        FLAGS.checkpoint_step,
+        return_info=True,
+        inference_only=True,
+    )
     action_dim = int(np.asarray(train_data['actions']).shape[-1])
     if FLAGS.export_path:
-        provenance = {}
-        if migration is not None:
-            provenance['legacy_migration'] = migration
-        if checkpoint_restore is not None:
-            provenance['checkpoint_restore'] = checkpoint_restore
+        provenance = {'checkpoint_restore': checkpoint_restore}
         export_inference_bundle(
             agent,
             FLAGS.export_path,
@@ -131,29 +96,17 @@ def _from_training_checkpoint():
         'action_dim': action_dim,
         'checkpoint_restore': checkpoint_restore,
     }
-    return agent, config, spec, migration
+    return agent, config, spec
 
 
 def main(_):
-    legacy_dynamics = bool(FLAGS.legacy_dynamics_checkpoint)
-    legacy_critic = bool(FLAGS.legacy_critic_checkpoint)
-    if legacy_dynamics != legacy_critic:
+    if bool(FLAGS.checkpoint_dir) == bool(FLAGS.inference_bundle):
         raise ValueError(
-            'legacy_dynamics_checkpoint and legacy_critic_checkpoint must be '
-            'provided together.'
-        )
-    legacy_pair = legacy_dynamics and legacy_critic
-    source_count = sum(
-        (bool(FLAGS.checkpoint_dir), bool(FLAGS.inference_bundle), legacy_pair)
-    )
-    if source_count != 1:
-        raise ValueError(
-            'Provide exactly one source: checkpoint_dir, inference_bundle, or '
-            'the complete legacy dynamics/critic checkpoint pair.'
+            'Provide exactly one source: checkpoint_dir or inference_bundle.'
         )
     if FLAGS.inference_bundle and FLAGS.export_path:
         raise ValueError('export_path is only valid with a training checkpoint.')
-    if FLAGS.inference_bundle and (FLAGS.config_yaml or FLAGS.config_override):
+    if FLAGS.inference_bundle and FLAGS.config_override:
         raise ValueError(
             'A bundle config is immutable; use num_candidates or temperature '
             'for deployment-time sampling overrides.'
@@ -163,11 +116,10 @@ def main(_):
     if FLAGS.num_candidates < 0:
         raise ValueError('num_candidates cannot be negative.')
 
-    migration = None
     if FLAGS.inference_bundle:
-        agent, config, spec, migration = _from_bundle()
+        agent, config, spec = _from_bundle()
     else:
-        agent, config, spec, migration = _from_training_checkpoint()
+        agent, config, spec = _from_training_checkpoint()
 
     if not FLAGS.input_path:
         if FLAGS.output_path:
@@ -177,7 +129,6 @@ def main(_):
             'env_name': str(config.env_name),
             'endpoint_distribution': str(config.endpoint_distribution),
             'config_sha256': config_sha256(config),
-            'legacy_migration': migration,
             'checkpoint_restore': spec.get('checkpoint_restore'),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))

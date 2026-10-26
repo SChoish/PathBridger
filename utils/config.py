@@ -140,6 +140,25 @@ def resolve_config(
     return ml_collections.ConfigDict(resolved)
 
 
+def load_config(
+    preset_path: str | Path,
+    *,
+    cli_overrides: Sequence[str] = (),
+) -> ml_collections.ConfigDict:
+    """Load one strict YAML preset on top of the complete agent schema."""
+
+    path = Path(preset_path).expanduser()
+    if path.suffix.lower() not in {'.yaml', '.yml'}:
+        raise ValueError(f'PathBridger presets must be YAML files, got: {path}')
+    from agents.pathbridger import get_config as get_agent_config
+
+    return resolve_config(
+        get_agent_config(),
+        yaml_path=path,
+        cli_overrides=cli_overrides,
+    )
+
+
 def config_sha256(config: Mapping[str, Any]) -> str:
     payload = json.dumps(
         _plain(config), sort_keys=True, separators=(',', ':'), allow_nan=False
@@ -160,7 +179,7 @@ def write_resolved_config(
     payload = {
         'config': _plain(config),
         'config_sha256': config_sha256(config),
-        'precedence': ['preset/default', 'legacy_agent_cli', 'yaml', 'cli'],
+        'precedence': ['agent-defaults', 'preset-yaml', 'cli'],
         'sources': _plain(sources or {}),
     }
     temporary = output.with_suffix(output.suffix + '.tmp')
@@ -172,6 +191,7 @@ def write_resolved_config(
 
 __all__ = [
     'config_sha256',
+    'load_config',
     'normalize_packaged_file_flag',
     'resolve_config',
     'write_resolved_config',

@@ -14,12 +14,11 @@ import jax
 import numpy as np
 import tqdm
 from absl import app, flags
-from ml_collections import config_flags
 
 from envs.env_utils import make_env_and_datasets
 from utils.config import (
+    load_config,
     normalize_packaged_file_flag,
-    resolve_config,
     write_resolved_config,
 )
 from utils.datasets import action_free_view
@@ -30,13 +29,7 @@ from utils.evaluation import (
     evaluation_protocol_metadata,
     normalize_evaluation_protocol,
 )
-from utils.flax_utils import (
-    initialize_from_legacy_pathbridger,
-    resolve_checkpoint,
-    restore_agent,
-    save_agent,
-    validate_initialization_paths,
-)
+from utils.flax_utils import resolve_checkpoint, restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 from utils.prefetch import resolve_stop_boundary, submit_prefetched_batch
 from utils.runtime import build_state_runtime
@@ -45,7 +38,7 @@ FLAGS = flags.FLAGS
 
 _BATCH_SIZE = 1024
 _DEFAULT_CONFIG = str(
-    Path(__file__).resolve().parent / 'configs' / 'pbf' / 'antmaze_medium.py'
+    Path(__file__).resolve().parent / 'configs' / 'pbf_antmaze_medium.yaml'
 )
 
 flags.DEFINE_string('run_group', 'Debug', 'Experiment group.')
@@ -53,18 +46,6 @@ flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('save_dir', 'exp/', 'Root output directory.')
 flags.DEFINE_string('dataset_dir', '', 'Optional OGBench dataset directory.')
 flags.DEFINE_string('restore_path', '', 'Checkpoint directory or exact .pkl file.')
-flags.DEFINE_string(
-    'legacy_dynamics_checkpoint',
-    '',
-    'Exact split legacy dynamics checkpoint used only as a fresh-run '
-    'parameter initializer; requires legacy_critic_checkpoint.',
-)
-flags.DEFINE_string(
-    'legacy_critic_checkpoint',
-    '',
-    'Exact split legacy critic checkpoint used only as a fresh-run '
-    'parameter initializer; requires legacy_dynamics_checkpoint.',
-)
 flags.DEFINE_integer(
     'restore_step',
     0,
@@ -97,16 +78,14 @@ flags.DEFINE_string(
 flags.DEFINE_boolean('use_wandb', False, 'Enable optional Weights & Biases logging.')
 flags.DEFINE_boolean('use_tqdm', True, 'Show a training progress bar.')
 flags.DEFINE_boolean('async_prefetch', True, 'Overlap host batch sampling with accelerator work.')
-flags.DEFINE_string('config_yaml', '', 'Optional strict YAML overlay.')
 flags.DEFINE_multi_string(
     'config_override', [], 'Highest-priority config key=value override; repeatable.'
 )
 
-config_flags.DEFINE_config_file(
+flags.DEFINE_string(
     'agent',
     _DEFAULT_CONFIG,
     'PathBridger agent and paper-reproduction environment config.',
-    lock_config=False,
 )
 
 
@@ -164,12 +143,8 @@ def _validate_runtime_flags() -> None:
         raise ValueError('train_steps must be at least 1.')
     if FLAGS.restore_step < 0:
         raise ValueError('restore_step cannot be negative.')
-    validate_initialization_paths(
-        restore_path=FLAGS.restore_path,
-        restore_step=FLAGS.restore_step,
-        legacy_dynamics_checkpoint=FLAGS.legacy_dynamics_checkpoint,
-        legacy_critic_checkpoint=FLAGS.legacy_critic_checkpoint,
-    )
+    if FLAGS.restore_step and not FLAGS.restore_path:
+        raise ValueError('restore_step requires restore_path.')
     if FLAGS.log_interval < 1:
         raise ValueError('log_interval must be at least 1.')
     if FLAGS.eval_interval < 0:
@@ -185,12 +160,10 @@ def _validate_runtime_flags() -> None:
 
 def main(_):
     _validate_runtime_flags()
-    legacy_pair = bool(FLAGS.legacy_dynamics_checkpoint)
     eval_protocol = normalize_evaluation_protocol(FLAGS.eval_protocol)
     extra_save_steps = _parse_extra_save_steps(FLAGS.extra_save_steps)
-    config = resolve_config(
+    config = load_config(
         FLAGS.agent,
-        yaml_path=FLAGS.config_yaml,
         cli_overrides=FLAGS.config_override,
     )
 
@@ -232,24 +205,6 @@ def main(_):
             'step': restore_step,
             'restore_contract': restore_info,
         }
-    elif legacy_pair:
-        agent, migration = initialize_from_legacy_pathbridger(
-            agent,
-            FLAGS.legacy_dynamics_checkpoint,
-            FLAGS.legacy_critic_checkpoint,
-            legacy_inference_staging=False,
-            return_info=True,
-        )
-        initialization = {
-            'mode': 'legacy_parameter_init',
-            'step': 0,
-            'migration_contract': migration,
-        }
-        print(
-            '[init] loaded legacy split parameters; optimizer and all host/'
-            'sampler RNG states start fresh',
-            flush=True,
-        )
     else:
         initialization = {'mode': 'random'}
 
@@ -261,7 +216,7 @@ def main(_):
             FLAGS.seed,
             env_name=str(config.env_name),
             agent_name=(
-            f'pathbridger_{config.endpoint_distribution}_{config.prefix_model}'
+            f'pathbridger_{config.endpoint_distribution}'
         ),
         )
         run_dir = os.path.abspath(
@@ -274,9 +229,7 @@ def main(_):
         os.path.join(run_dir, 'resolved_config.json'),
         config,
         sources={
-            'preset': FLAGS['agent'].config_filename,
-            'legacy_agent_cli': dict(FLAGS['agent'].override_values),
-            'yaml': FLAGS.config_yaml or None,
+            'preset_yaml': FLAGS.agent,
             'cli': list(FLAGS.config_override),
         },
     )

@@ -1,1 +1,2 @@
 include CITATION.cff
+recursive-include configs *.yaml

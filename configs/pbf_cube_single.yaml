@@ -1,0 +1,35 @@
+env_name: cube-single-play-v0
+endpoint_distribution: flow
+training_objective_protocol: reported-run-legacy-v1
+horizon: 40
+discount: 0.99
+actor_p:
+- 0.0
+- 0.0
+- 1.0
+- 0.0
+critic_p:
+- 0.0
+- 1.0
+- 0.0
+- 0.0
+endpoint_value_scale: 5.0
+value_distance_weight_power: 0.7
+path_weight_beta: 0.0
+path_weight_min: 0.1
+path_weight_warmup: 100000
+path_weight_ramp: 100000
+path_distance_cap_multiplier: 2.0
+prefix_model: deterministic
+prefix_loss_weight: 1.0
+prefix_rank: 8
+prefix_sigma_floor: 0.001
+prefix_scale_floor: 0.001
+prefix_flow_steps: 8
+eval_num_candidates: 1
+eval_temperature: 0.0
+eval_prefix_selection: sample_one
+eval_num_prefix_samples: 1
+eval_prefix_temperature: 1.0
+eval_include_deterministic_prefix: false
+offline_action_free: false

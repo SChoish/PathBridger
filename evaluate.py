@@ -7,13 +7,12 @@ import json
 from pathlib import Path
 
 from absl import app, flags
-from ml_collections import config_flags
 
 from envs.env_utils import make_env_and_datasets
 from utils.config import (
     config_sha256,
+    load_config,
     normalize_packaged_file_flag,
-    resolve_config,
 )
 from utils.datasets import dataset_identity
 from utils.evaluation import (
@@ -23,33 +22,15 @@ from utils.evaluation import (
     evaluation_protocol_metadata,
     normalize_evaluation_protocol,
 )
-from utils.evaluation_provenance import (
-    bind_execution_provenance,
-    load_execution_provenance,
-)
-from utils.flax_utils import (
-    initialize_from_legacy_pathbridger,
-    resolve_checkpoint,
-    restore_agent,
-)
+from utils.flax_utils import resolve_checkpoint, restore_agent
 from utils.runtime import build_state_runtime
 
 FLAGS = flags.FLAGS
 _DEFAULT_CONFIG = str(
-    Path(__file__).resolve().parent / 'configs' / 'pbf' / 'antmaze_medium.py'
+    Path(__file__).resolve().parent / 'configs' / 'pbf_antmaze_medium.yaml'
 )
 
 flags.DEFINE_string('checkpoint_dir', '', 'Checkpoint directory or exact .pkl file.')
-flags.DEFINE_string(
-    'legacy_dynamics_checkpoint',
-    '',
-    'Exact split legacy dynamics checkpoint; requires legacy_critic_checkpoint.',
-)
-flags.DEFINE_string(
-    'legacy_critic_checkpoint',
-    '',
-    'Exact split legacy critic checkpoint; requires legacy_dynamics_checkpoint.',
-)
 flags.DEFINE_integer(
     'checkpoint_step',
     0,
@@ -74,21 +55,14 @@ flags.DEFINE_string(
     '',
     'Optional JSON path for per-episode reset/result hashes.',
 )
-flags.DEFINE_string(
-    'execution_provenance_path',
-    '',
-    'Optional immutable JSON provenance input embedded in the result.',
-)
-flags.DEFINE_string('config_yaml', '', 'Optional strict YAML overlay.')
 flags.DEFINE_multi_string(
     'config_override', [], 'Highest-priority config key=value override; repeatable.'
 )
 
-config_flags.DEFINE_config_file(
+flags.DEFINE_string(
     'agent',
     _DEFAULT_CONFIG,
     'PathBridger paper-reproduction config used by the checkpoint.',
-    lock_config=False,
 )
 
 
@@ -113,19 +87,8 @@ def _aggregation_config_sha256(config) -> str:
 
 
 def main(_):
-    legacy_dynamics = bool(FLAGS.legacy_dynamics_checkpoint)
-    legacy_critic = bool(FLAGS.legacy_critic_checkpoint)
-    if legacy_dynamics != legacy_critic:
-        raise ValueError(
-            'legacy_dynamics_checkpoint and legacy_critic_checkpoint must be '
-            'provided together.'
-        )
-    legacy_pair = legacy_dynamics and legacy_critic
-    if bool(FLAGS.checkpoint_dir) == legacy_pair:
-        raise ValueError(
-            'Provide exactly one of checkpoint_dir or the complete legacy '
-            'dynamics/critic checkpoint pair.'
-        )
+    if not FLAGS.checkpoint_dir:
+        raise ValueError('checkpoint_dir is required.')
     if FLAGS.checkpoint_step < 0:
         raise ValueError('checkpoint_step cannot be negative.')
     if FLAGS.episodes < 1:
@@ -137,42 +100,15 @@ def main(_):
     )
     if not task_ids:
         raise ValueError('task_ids must contain at least one task id.')
-    checkpoint_source = (
-        FLAGS.legacy_dynamics_checkpoint
-        if legacy_pair
-        else FLAGS.checkpoint_dir
-    )
     checkpoint_path, checkpoint_step = resolve_checkpoint(
-        checkpoint_source,
+        FLAGS.checkpoint_dir,
         FLAGS.checkpoint_step,
     )
-    checkpoint_files = []
-    if legacy_pair:
-        critic_path, critic_step = resolve_checkpoint(
-            FLAGS.legacy_critic_checkpoint,
-            FLAGS.checkpoint_step,
-        )
-        if critic_step != checkpoint_step:
-            raise ValueError(
-                'Legacy dynamics and critic checkpoint steps differ: '
-                f'{checkpoint_step} vs {critic_step}.'
-            )
-        checkpoint_files.extend(
-            [
-                _file_identity(checkpoint_path, role='legacy-dynamics'),
-                _file_identity(critic_path, role='legacy-critic'),
-            ]
-        )
-        checkpoint_kind = 'legacy-split'
-    else:
-        checkpoint_files.append(
-            _file_identity(checkpoint_path, role='unified')
-        )
-        checkpoint_kind = 'unified'
+    checkpoint_files = [_file_identity(checkpoint_path, role='unified')]
+    checkpoint_kind = 'unified'
 
-    config = resolve_config(
+    config = load_config(
         FLAGS.agent,
-        yaml_path=FLAGS.config_yaml,
         cli_overrides=FLAGS.config_override,
     )
     eval_protocol = normalize_evaluation_protocol(FLAGS.eval_protocol)
@@ -181,23 +117,13 @@ def main(_):
         dataset_dir=FLAGS.dataset_dir or None,
     )
     agent, _, _ = build_state_runtime(train_data, config, seed=FLAGS.seed)
-    migration = None
-    checkpoint_restore = None
-    if legacy_pair:
-        agent, migration = initialize_from_legacy_pathbridger(
-            agent,
-            FLAGS.legacy_dynamics_checkpoint,
-            FLAGS.legacy_critic_checkpoint,
-            return_info=True,
-        )
-    else:
-        agent, checkpoint_restore = restore_agent(
-            agent,
-            FLAGS.checkpoint_dir,
-            FLAGS.checkpoint_step,
-            return_info=True,
-            inference_only=True,
-        )
+    agent, checkpoint_restore = restore_agent(
+        agent,
+        FLAGS.checkpoint_dir,
+        FLAGS.checkpoint_step,
+        return_info=True,
+        inference_only=True,
+    )
 
     episode_records = [] if FLAGS.trace_path else None
     metrics = evaluate(
@@ -243,17 +169,11 @@ def main(_):
         'eval_temperature': float(config.eval_temperature),
         'config_sha256': config_sha256(config),
         'aggregation_config_sha256': _aggregation_config_sha256(config),
-        'legacy_migration': migration,
         'checkpoint_restore': checkpoint_restore,
         'evaluation_protocol_version': eval_protocol,
         'effective_evaluation': effective_evaluation,
         **{f'evaluation/{key}': value for key, value in metrics.items()},
     }
-    execution_provenance = load_execution_provenance(FLAGS.execution_provenance_path)
-    if execution_provenance is not None:
-        result['execution_provenance'] = bind_execution_provenance(
-            result, execution_provenance
-        )
     text = json.dumps(result, indent=2, sort_keys=True)
     print(text)
     if FLAGS.output_path:
