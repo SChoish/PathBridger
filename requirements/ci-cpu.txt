@@ -1,0 +1,11 @@
+# Tested CPU smoke-test constraints (Python 3.12); not the original paper GPU stack.
+# Usage: pip install -c requirements/ci-cpu.txt -e ".[dev]"
+jax==0.12.0.1
+jaxlib==0.12.0.1
+flax==0.12.10
+optax==0.2.8
+numpy==2.5.4
+ogbench==1.2.1
+gymnasium==1.4.0
+ml-collections==1.1.0
+PyYAML==6.0.3

@@ -102,6 +102,11 @@ Pretrained checkpoints and datasets are not bundled. The original run SHA was
 not recorded, so these presets do not claim byte-identical historical training.
 The PBG Scene preset is reconstructed from its surviving run record.
 
+See [the reproduction guide](docs/reproduction.md) for the full preset table,
+seed-ordered experiment commands, evaluation contracts, and the scope of the
+implementation checks. [Optional extensions](docs/extensions.md) are documented
+separately from the default PBF/PBG execution path.
+
 ## Citation
 
 See [`CITATION.cff`](CITATION.cff).

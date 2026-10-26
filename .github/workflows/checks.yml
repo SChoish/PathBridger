@@ -1,0 +1,36 @@
+name: Source and runtime checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      JAX_PLATFORMS: cpu
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      XLA_FLAGS: --xla_cpu_multi_thread_eigen=false --xla_force_host_platform_device_count=1
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements/ci-cpu.txt
+      - name: Install the tested CPU stack
+        run: python -m pip install -c requirements/ci-cpu.txt -e ".[dev]"
+      - name: Check source formatting
+        run: |
+          ruff check .
+          ruff format --check .
+          python -m compileall -q agents envs utils scripts tests main.py evaluate.py inference.py
+      - name: Check presets, runtime, checkpoint resume, and reproduction commands
+        run: python -m unittest discover -s tests -v
+      - name: Build source and wheel distributions
+        run: python -m build
