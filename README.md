@@ -107,6 +107,13 @@ seed-ordered experiment commands, evaluation contracts, and the scope of the
 implementation checks. [Optional extensions](docs/extensions.md) are documented
 separately from the default PBF/PBG execution path.
 
+## Ongoing research
+
+We are investigating two follow-up directions that extend PathBridger:
+
+- **Skill Learning and Composition:** Investigating how to learn reusable skills from offline trajectories and compose them for long-horizon goal-conditioned tasks.
+- **Latent-Space Bridge Planning:** Exploring learned representations and geometrically structured latent spaces for goal-conditioned bridge generation and short-horizon execution.
+
 ## Citation
 
 See [`CITATION.cff`](CITATION.cff).
