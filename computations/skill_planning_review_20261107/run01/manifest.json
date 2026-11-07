@@ -1,0 +1,160 @@
+{
+  "schema_version": 2,
+  "claim_id": "PB_SKILL_FACTUAL_PARTITION_AND_SCOPE_20261107",
+  "repository": {
+    "commit": "ef96085f4c6ce47b3bab1020288b31a7f6a0cb61",
+    "dirty": true
+  },
+  "command": [
+    "python",
+    "computations/skill_planning_review_20261107/verify_contract.py",
+    "--result",
+    "computations/skill_planning_review_20261107/run01/result.json"
+  ],
+  "environment": {
+    "software": [
+      {
+        "name": "runner-python",
+        "version": "3.12.14"
+      },
+      {
+        "name": "Python",
+        "version": "3.12.14"
+      },
+      {
+        "name": "jax",
+        "version": "0.12.0.1"
+      },
+      {
+        "name": "jaxlib",
+        "version": "0.12.0.1"
+      },
+      {
+        "name": "flax",
+        "version": "0.12.12"
+      },
+      {
+        "name": "optax",
+        "version": "0.2.8"
+      },
+      {
+        "name": "numpy",
+        "version": "2.3.5"
+      }
+    ],
+    "hardware": "Linux-6.18.57-x86_64-with-glibc2.39"
+  },
+  "mathematics": {
+    "assertion_tested": "Exact factual first-hit/terminal-potential partition on default lengths; implementation float32 targets; parent loss normalization; a deterministic counterexample to unconditional executed-policy labels.",
+    "bounds": {
+      "cut": 5,
+      "duration_max": 40,
+      "duration_min": 5,
+      "float32_absolute_tolerance": 5e-07
+    },
+    "coefficient_domain": "Rational exact arithmetic for scalar checks; IEEE float32 for JAX return/first_hit implementation.",
+    "conventions": "gamma^T for hits including t=0 and t=d, otherwise gamma^d times one shared terminal potential; k=5; no environment or optimizer.",
+    "inputs": [
+      "SChoish/PathBridger@ede2b8a5b39f367f8ecf8f14003aa0ace880b18b",
+      "d in {5,10,15,20,25,30,35,40}, hit in {0,...,d,None}, gamma in {9/10,99/100,1}, terminal in {0,3/10,1}",
+      "Balanced illustrative batch B=256, 224 non-base durations; deterministic one-dimensional accumulator toy"
+    ],
+    "non_claims": [
+      "No theorem of skill execution preservation or Q generalization.",
+      "No actual PB checkpoint restoration, OGBench rollout, formal optimization or independent review.",
+      "The toy counterexample is not an observed learned-model failure.",
+      "Local imported git base differs from the authoritative remote source; six reviewed source files were byte-compared with the named remote revision."
+    ]
+  },
+  "randomness": {
+    "generator": "",
+    "seed": null,
+    "used": false
+  },
+  "run": {
+    "started_at": "2026-11-07T14:05:01.792014+00:00",
+    "runtime_seconds": 1.870524,
+    "exit_status": 0,
+    "status": "completed",
+    "timeout_seconds": 45.0,
+    "max_output_bytes": 262144,
+    "resource_limits": {
+      "memory_bytes": null,
+      "cpu_seconds": 30,
+      "max_cores": 2,
+      "max_threads": 1
+    },
+    "missing_results": [],
+    "invalid_results": []
+  },
+  "execution_artifacts": [
+    "computations/skill_planning_review_20261107/verify_contract.py",
+    "skill_extensions/planner.py",
+    "skill_extensions/models.py",
+    "utils/networks.py"
+  ],
+  "input_artifacts": [
+    {
+      "path": "computations/skill_planning_review_20261107/verify_contract.py",
+      "sha256": "016e00697d269fe282c13c1b42a2c37da49da01dd5bca36bb55df72dc9819865",
+      "sha256_after": "016e00697d269fe282c13c1b42a2c37da49da01dd5bca36bb55df72dc9819865"
+    },
+    {
+      "path": "skill_extensions/planner.py",
+      "sha256": "839d9727551f0f6780761d8781f9b8e797c5354dd674f65281d959bf33e37150",
+      "sha256_after": "839d9727551f0f6780761d8781f9b8e797c5354dd674f65281d959bf33e37150"
+    },
+    {
+      "path": "skill_extensions/models.py",
+      "sha256": "acfde79bdbe6ba80f8fdeb1e175f12b6abf3543ce5fee14bae52328f1ec6f683",
+      "sha256_after": "acfde79bdbe6ba80f8fdeb1e175f12b6abf3543ce5fee14bae52328f1ec6f683"
+    },
+    {
+      "path": "utils/networks.py",
+      "sha256": "5d5de2e703d2fdb17e697af936be70f95ab74ddaf9f4ac9a630fb8a242b4f81a",
+      "sha256_after": "5d5de2e703d2fdb17e697af936be70f95ab74ddaf9f4ac9a630fb8a242b4f81a"
+    }
+  ],
+  "output_directory": "computations/skill_planning_review_20261107/run01",
+  "declared_results": [
+    "computations/skill_planning_review_20261107/run01/result.json"
+  ],
+  "outputs": [
+    {
+      "path": "computations/skill_planning_review_20261107/run01/stdout.txt",
+      "sha256": "3e140602817eec4af53961cc24cd4c13647faded0c3220cfd555eb64ec24c72f",
+      "kind": "log"
+    },
+    {
+      "path": "computations/skill_planning_review_20261107/run01/stderr.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "kind": "log"
+    },
+    {
+      "path": "computations/skill_planning_review_20261107/run01/result.json",
+      "sha256": "bc5466dea463fe234bb617d69cfb0adec99cbca61a00a210ce99cc873f23b97e",
+      "kind": "result"
+    }
+  ],
+  "checks": [
+    {
+      "check": "input hashes unchanged",
+      "passed": true
+    },
+    {
+      "check": "process exited successfully within enforced limits",
+      "passed": true
+    },
+    {
+      "check": "declared result files are present and regular",
+      "passed": true
+    }
+  ],
+  "result": "Run completed; mathematical assertion requires interpretation and review.",
+  "residual_risks": [
+    "Command success does not establish the mathematical interpretation.",
+    "Only listed input artifacts are pinned; external dependencies need recorded versions.",
+    "The thread cap uses conventional environment variables; a child program may ignore them.",
+    "The POSIX CPU-time limit is per process, not an aggregate descendant budget."
+  ]
+}

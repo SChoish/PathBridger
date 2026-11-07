@@ -1,0 +1,62 @@
+{
+  "claim_id": "PB_SKILL_FACTUAL_PARTITION_AND_SCOPE_20261107",
+  "execution_artifacts": [
+    "computations/skill_planning_review_20261107/verify_contract.py",
+    "skill_extensions/planner.py",
+    "skill_extensions/models.py",
+    "utils/networks.py"
+  ],
+  "mathematics": {
+    "assertion_tested": "Exact factual first-hit/terminal-potential partition on default lengths; implementation float32 targets; parent loss normalization; a deterministic counterexample to unconditional executed-policy labels.",
+    "bounds": {
+      "cut": 5,
+      "duration_max": 40,
+      "duration_min": 5,
+      "float32_absolute_tolerance": 5e-07
+    },
+    "coefficient_domain": "Rational exact arithmetic for scalar checks; IEEE float32 for JAX return/first_hit implementation.",
+    "conventions": "gamma^T for hits including t=0 and t=d, otherwise gamma^d times one shared terminal potential; k=5; no environment or optimizer.",
+    "inputs": [
+      "SChoish/PathBridger@ede2b8a5b39f367f8ecf8f14003aa0ace880b18b",
+      "d in {5,10,15,20,25,30,35,40}, hit in {0,...,d,None}, gamma in {9/10,99/100,1}, terminal in {0,3/10,1}",
+      "Balanced illustrative batch B=256, 224 non-base durations; deterministic one-dimensional accumulator toy"
+    ],
+    "non_claims": [
+      "No theorem of skill execution preservation or Q generalization.",
+      "No actual PB checkpoint restoration, OGBench rollout, formal optimization or independent review.",
+      "The toy counterexample is not an observed learned-model failure.",
+      "Local imported git base differs from the authoritative remote source; six reviewed source files were byte-compared with the named remote revision."
+    ]
+  },
+  "randomness": {
+    "generator": "",
+    "seed": null,
+    "used": false
+  },
+  "software": [
+    {
+      "name": "Python",
+      "version": "3.12.14"
+    },
+    {
+      "name": "jax",
+      "version": "0.12.0.1"
+    },
+    {
+      "name": "jaxlib",
+      "version": "0.12.0.1"
+    },
+    {
+      "name": "flax",
+      "version": "0.12.12"
+    },
+    {
+      "name": "optax",
+      "version": "0.2.8"
+    },
+    {
+      "name": "numpy",
+      "version": "2.3.5"
+    }
+  ]
+}

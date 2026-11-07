@@ -1,0 +1,59 @@
+{
+  "actual_environment_steps": 0,
+  "algorithm_modified": false,
+  "checks": [
+    {
+      "command": "JAX_PLATFORMS=cpu python -m pytest tests/test_skill_planner.py -q",
+      "runtime_seconds": 32.56,
+      "scope": "fake PB teacher, small JAX updates, mocked environment; not formal training or OGBench",
+      "status": "passed",
+      "tests_passed": 11,
+      "warnings": 6
+    },
+    {
+      "command": "python -m pytest tests/test_config.py -q",
+      "exit_status": 2,
+      "reason": "ModuleNotFoundError: ml_collections",
+      "status": "collection_failed"
+    },
+    {
+      "command": "python -m ruff check .",
+      "status": "passed"
+    },
+    {
+      "command": "python -m compileall -q skill_extensions skill_main.py utils/skill_data.py computations/skill_planning_review_20261107/verify_contract.py",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "validate_manifest.py computations/skill_planning_review_20261107/run01/manifest.json --root .",
+      "run_status": "completed",
+      "status": "passed"
+    }
+  ],
+  "dependency_install_attempted": false,
+  "formal_training_updates": 0,
+  "provenance": "self-review; no independent reviewer",
+  "reviewed_commit": "ede2b8a5b39f367f8ecf8f14003aa0ace880b18b",
+  "source_comparison": {
+    "all_six_equal": true,
+    "method": "remote github_fetch_file UTF-8 content at exact commit compared byte-for-byte with local read_text",
+    "sha256": {
+      "skill_configs/common.json": "5115062c2f6d0bfe149a7a76c71bff63b057abab7f65974838c9762115cdd550",
+      "skill_extensions/models.py": "acfde79bdbe6ba80f8fdeb1e175f12b6abf3543ce5fee14bae52328f1ec6f683",
+      "skill_extensions/planner.py": "839d9727551f0f6780761d8781f9b8e797c5354dd674f65281d959bf33e37150",
+      "skill_extensions/runtime.py": "3cc17b1d9a72a2ed84c443c3b1ced68303c6019369decddadea8356671671255",
+      "skill_main.py": "9212d88679462a830f3cbad925c70b3d5d4848981974f5c8ce388ea88b638adb",
+      "utils/skill_data.py": "8ce12bb7c7cf3c0700aa4e34952dff51946600b67dfa2869d197b70a23f6d2e1"
+    }
+  },
+  "unverified": [
+    "actual trained PB bundle restoration",
+    "actual OGBench archive/GPU smoke",
+    "native task performance",
+    "decoded-skill versus factual transition correspondence"
+  ]
+}

@@ -156,3 +156,11 @@ global의 endpoint 미호출, subgoal 입력, 짝지은 모의 환경 평가·�
 실제 PB bundle 복원과 OGBench 성능·기존 전체 regression suite는 아직 검증하지 못했다.
 필요한 의존성 설치가 자동 승인 심사에서 거절되어 추가 설치 없이 가능한 검사만 수행했다.
 검증된 수치 동작과 실제 학습·성능을 구분한다. 새 정식 학습/rollout은 시작하지 않았다.
+
+## 학습 전 재검토
+
+[수학·구현 재검토](skill_planning_review_20261107_KO.md)와
+[검사 범위](skill_planning_review_checks_20261107.json)를 추가했다.
+작은 pilot은 가능하나 factual label과 decoded 실행의 대응은 조건부다.
+기본 계수 1에서도 부모당 split/anchor BCE 비중이 같지 않음을 검산했다.
+정식 학습·실환경 평가는 아직 시작하지 않았고 알고리즘 소스는 변경하지 않았다.
