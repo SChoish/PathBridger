@@ -5,3 +5,4 @@ recursive-include scripts *.py *.sh
 recursive-include requirements *.txt
 recursive-include tests *.py *.json
 recursive-include configs *.yaml
+recursive-include skill_configs *.json

@@ -109,6 +109,12 @@ separately from the default PBF/PBG execution path.
 
 ## Ongoing research
 
+An opt-in [variable-duration skill extension](docs/skill_planning_20261107_KO.md)
+implements subgoal-conditioned and final-goal-conditioned execution on a frozen
+PB base. It uses a shared full-plan skill critic and executes only a five-step
+decoded prefix before replanning. This is experimental code; no benchmark
+improvement is claimed. The original PBF/PBG paths and presets remain unchanged.
+
 We are investigating two follow-up directions that extend PathBridger:
 
 - **Skill Learning and Composition:** Investigating how to learn reusable skills from offline trajectories and compose them for long-horizon goal-conditioned tasks.

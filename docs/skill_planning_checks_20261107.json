@@ -1,0 +1,36 @@
+{
+  "date_kst": "2026-11-07",
+  "base_commit": "943819864628832c93ea0a35e6f549db50060849",
+  "scope": "CPU numerical and mock-environment integration checks; fake PB teacher",
+  "new_tests": {
+    "command": "PYTHONPATH=.:<existing-jax-site-packages> JAX_PLATFORMS=cpu python -m pytest tests/test_skill_planner.py -q",
+    "passed": 11,
+    "warnings": "6 optax.global_norm deprecation warnings",
+    "covered": [
+      "variable-length masks and episode boundaries",
+      "complete-episode duplicate detection",
+      "first-hit discounted return and stop-gradient",
+      "state-independent split and one-shot chunk output shape",
+      "disjoint representation/value/proposal optimizers and frozen PB",
+      "global mode never invokes endpoint proposal or PB value during inference",
+      "full parent Q argmax and duration coverage",
+      "subgoal mode uses selected endpoint",
+      "checkpoint and sampler/optimizer exact resume",
+      "matched-seed two-mode mock evaluation with clipping and step cap",
+      "masked padding does not affect representation gradients"
+    ]
+  },
+  "static_checks": {
+    "ruff_check_repository": "passed",
+    "compileall": "passed",
+    "diff_whitespace": "passed"
+  },
+  "blocked": {
+    "existing_test_config_collection": "ModuleNotFoundError: ml_collections",
+    "dependency_installation": "automatic approval review rejected PyPI installation, citing offline-only constraint and external code introduction; no alternate download attempted",
+    "actual_pb_bundle_and_ogbench_integration": "not verified"
+  },
+  "formal_optimizer_updates": 0,
+  "actual_environment_steps": 0,
+  "new_performance_claim": null
+}
