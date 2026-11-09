@@ -15,9 +15,14 @@ from utils.skill_data import episode_fingerprints
 
 
 class ActionWindowSampler:
-    def __init__(self, dataset, *, seed, goal_config=None, boundary_kind=None):
+    def __init__(self, dataset, *, seed, goal_config=None, boundary_kind=None, horizon=20):
         self.dataset = dataset
         self.rng = np.random.RandomState(seed)
+        if horizon not in (5, 20):
+            raise ValueError('only five-step decoder or 20-step program windows are supported')
+        if horizon != 20 and (goal_config is not None or boundary_kind is not None):
+            raise ValueError('short decoder windows do not carry macro-Q labels')
+        self.horizon = horizon
         self.boundary_kind = boundary_kind
         if boundary_kind not in (None, 'timeout', 'terminal', 'field'):
             raise ValueError('boundary_kind must be timeout, terminal, or field')
@@ -36,11 +41,11 @@ class ActionWindowSampler:
         bad_prefix = np.r_[0, np.cumsum(~valid_action)]
         starts = []
         for first, final in zip(firsts, finals, strict=True):
-            candidates = np.arange(first, final - 20 + 1)
-            starts.extend(candidates[bad_prefix[candidates + 20] == bad_prefix[candidates]])
+            candidates = np.arange(first, final - horizon + 1)
+            starts.extend(candidates[bad_prefix[candidates + horizon] == bad_prefix[candidates]])
         self.starts = np.asarray(starts, np.int64)
         if not len(self.starts):
-            raise ValueError('no complete valid 20-step windows')
+            raise ValueError(f'no complete valid {horizon}-step windows')
         self.allowed_starts = np.zeros(len(obs), bool)
         self.allowed_starts[self.starts] = True
         if boundary_kind == 'field' and 'true_terminals' not in dataset:
@@ -79,8 +84,10 @@ class ActionWindowSampler:
             or not self.allowed_starts[starts].all()
         ):
             raise ValueError('invalid or cross-episode source window')
-        states = np.asarray(self.dataset['observations'][starts[:, None] + np.arange(21)])
-        actions = np.asarray(self.dataset['actions'][starts[:, None] + np.arange(20)])
+        states = np.asarray(
+            self.dataset['observations'][starts[:, None] + np.arange(self.horizon + 1)]
+        )
+        actions = np.asarray(self.dataset['actions'][starts[:, None] + np.arange(self.horizon)])
         result = {'states': states.astype(np.float32), 'actions': actions.astype(np.float32)}
         if self.goal_sampler is not None:
             goals = np.asarray(

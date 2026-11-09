@@ -33,8 +33,9 @@ latent가 아니라 view이다. 학습된 compact splitter/합성/시간 일반�
   새 archive에서 관측 정규화를 다시 fit해 frozen decoder에 적용하지 않는다.
 - donor의 latent_dim, width, max_duration, observation_dim, action_dim, checkpoint SHA,
   representation_step과 smoke 여부를 검사한다. 상태·행동 encoder를 가져오지 않는다.
-- 지원 donor schema는 pathbridger-variable-skill-v1이다. 최신 서버 schema가 다르면
-  명시적인 export adapter가 필요하다. 이를 자동 추정하지 않는다.
+- 지원 donor schema는 pathbridger-variable-skill-v1과 pathbridger-action-decoder-v1이다.
+  후자는 체크포인트가 없는 머신의 action-only 짧은 실행기 학습으로 생성한다.
+  다른 서버 schema는 명시적인 export adapter가 필요하다. 이를 자동 추정하지 않는다.
 - pickle 입력은 신뢰하는 본인 파일에 한정하며, 정확한 SHA 검사를 역직렬화 전에 한다.
 
 단계 1에서 encoder/reader는 새로 학습하므로 과거 warm-start 부모 encoder의
@@ -44,6 +45,7 @@ latent가 아니라 view이다. 학습된 compact splitter/합성/시간 일반�
 
 | 단계 | 주 표적 | 갱신 | 동결 |
 |---|---|---|---|
+| decoder (기존 donor가 없을 때) | 5-step 기록 action MSE | 짧은 action encoder + decoder | train-fit normalizer |
 | representation | 기록 action MSE | 새 action encoder + reader 또는 recursive splitter | donor decoder와 원래 normalizer |
 | G1 | 같은 source/start에서 첫 프로그램 실행 비교 | 없음 | 모든 파라미터 |
 | proposal | 원래 부모 code 분포의 conditional FM | flow만 | encoder/reader/decoder |
@@ -52,6 +54,51 @@ latent가 아니라 view이다. 학습된 compact splitter/합성/시간 일반�
 
 단계별 optimizer state를 별도로 보관한다. active parameter subtree만 미분·갱신한다.
 frozen decoder의 파라미터를 고정하되 입력 code에 대한 derivative는 유지한다.
+
+### 체크포인트 없는 머신: 짧은 실행기부터 학습
+
+기존 decoder 자산이 없으면 `--stage decoder`를 먼저 실행한다.
+PB, 기존 encoder, 분해기, Q, proposal checkpoint는 필요하지 않다.
+
+\[
+z=e_\omega(a_{t:t+5}),\qquad
+\mathcal L_{\rm short}=\mathbb E_{t\sim\mathcal D_{\rm train}}
+\frac{1}{5A}\|D_\delta((s_t-\mu)/\sigma,z,5)-a_{t:t+5}\|_F^2.
+\]
+
+5-step 유효 window의 시작점을 균등 표집한다. 짧은 BiGRU도 action과 길이만 받으며,
+관측은 decoder 시작 상태의 조건으로만 쓴다. encoder/decoder 모두 새로 초기화한다.
+하나의 손실로 둘을 함께 갱신하고, 완성한 decoder 및 관측 normalizer를 이후 A/B에서 동결한다.
+GaussianHead는 기존 ChunkDecoder와의 호환을 위해 유지하지만 MSE는 mean 출력만 쓰므로
+log_std 출력은 학습/배포에 사용하지 않는다. 짧은 encoder는 자산에 함께 보존하되
+부모 encoder의 가중치나 optimizer로 이식하지 않는다. G1의 direct-child oracle reference를
+만들 때에는 이 짧은 action-only encoder를 사용할 수 있다.
+
+설계 의도와 근거를 구분한다.
+
+- **준비 학습:** 임의 초기화 decoder를 곧바로 고정하면 행동 좌표계가 학습되지 않는다.
+  짧은 action autoencoding으로 실행기 좌표를 먼저 학습하는 것은 이 파일럿의 직접 설계이다.
+  MSE는 고정 등방 Gaussian 관측모형의 음의 로그우도에서 상수와 양의 배수를 뺀 목적이다.
+  가변 분산 학습이나 KL 정규화를 추가해야 한다는 근거로 사용하지 않는다.
+- **문헌 연결:** OPAL [R5]의 오프라인 primitive 사전학습 후 downstream 학습이라는 순서를
+  참고한다. 이 구현의 action-only 입력, 결정론적 chunk decoder, KL 없는 MSE를 OPAL이
+  증명했다고 주장하지 않는다. 원문의 primitive 정책/변분 목적을 그대로 구현한 것도 아니다.
+- **관측 정규화:** 기존 train-only `fit_skill_normalization`을 한 번 적용한다.
+  평균/표준편차는 표현 비교 팔에 공유하고 scale 하한은 기존 1e-3이다.
+  validation은 fit이나 checkpoint 선택에 쓰지 않는다.
+- **예산:** decoder seed 0, 100k updates를 종전 표현 사전학습의 100k 예산에서 차용한다.
+  이는 최초 실행 예산이며 충분성/최적성의 이론적 근거는 없다. 실제 종료는 최종 100k로 고정한다.
+  이후 A/B는 각각 seed 0/1/2, 20k updates, batch256, lr3e-4이다.
+  5-step, 16D, width200 및 clipping 10은 기존 실행기/표현 파일럿 설정을 재사용한다.
+- **비교 범위:** 이 준비 학습은 과거 상태·행동 encoder를 쓴 100k donor와 다른 실험이다.
+  새 두 팔 사이에서 executor를 통제하며, 과거 성공률과 직접 비교해 개선으로 판정하지 않는다.
+  세 표현 seed도 하나의 실행기 seed 0에 조건부이므로 세 독립 end-to-end seed라고 부르지 않는다.
+
+교차 episode, terminal dummy action 및 invalid row를 제외한다. 짧은 decoder 학습은 완전한
+5-step window를 모두 사용하며 20-step window가 없는 episode tail도 제외하지 않는다.
+완료 자산은 `pathbridger-action-decoder-v1` 형식이며 decoder, 짧은 encoder, normalization,
+optimizer, sampler RNG, 데이터/소스 provenance를 저장한다. SHA를 확인한 뒤 import한다.
+이는 행동 복원 목적과 자산 연결의 구현이며 환경 실행 보존이나 장기 성공을 보장하지 않는다.
 
 ### Representation
 
@@ -162,7 +209,46 @@ https://arxiv.org/pdf/2512.10926v2
 기록 실행과 실제 실행 분포의 구분에 사용한다. 5-step feedback을 사용하는 본 구조에
 원문의 open-loop 보장을 그대로 적용하지 않는다.
 
+[R5] Ajay, Kumar, Agrawal, Levine, Nachum (2021), OPAL: Offline Primitive Discovery
+for Accelerating Offline Reinforcement Learning. https://arxiv.org/abs/2010.13611
+오프라인 primitive 사전학습 → downstream 학습의 큰 순서에 대한 참고문헌이다.
+본 action-only 결정론적 준비 학습의 보장으로 원문의 결과를 이식하지 않는다.
+
 ## 7. 실행 경로
+
+### 체크포인트가 없는 머신
+
+GPU용 JAX를 해당 머신에 맞게 설치한 뒤 `pip install -e .`를 실행한다.
+환경 이름은 이전 실험과 같은 것을 명시하며 이 스크립트에는 환경 기본값이 없다.
+아래는 환경 이름/실제 경로를 지정한 실행 형식이다.
+
+~~~bash
+ENV_NAME="$ENV_NAME" GPU=0 PYTHON=python \
+  DATA_DIR="$LOCAL_OGBENCH_DATA" OUT_ROOT="$FRESH_RUN_ROOT" \
+  bash scripts/train_action_from_scratch.sh
+~~~
+
+이 wrapper만 OGBench의 기존 loader를 호출한다. 필요하면 공개 archive를 내려받고
+원래 train/validation 분리를 유지해 compact NPZ로 저장하며 환경 step은 호출하지 않는다.
+이미 compact NPZ가 있으면 다운로드/환경 생성 없이 다음으로 시작한다.
+
+~~~bash
+TRAIN="$TRAIN" VALIDATION="$VALIDATION" GPU=0 PYTHON=python \
+  OUT_ROOT="$FRESH_RUN_ROOT" bash scripts/train_action_from_scratch.sh
+~~~
+
+순서는 짧은 실행기 seed0 100k → reader/recursive × 표현 seed0/1/2 각20k이다.
+총 220k offline gradient updates이며 일곱 런을 GPU 하나에서 순차 실행한다.
+stage별 checkpoint, 로그, manifest 및 패키지/코드 기록을 남긴다.
+기본 checkpoint 간격은 decoder 10k, 표현 1k이다. 기존 output을 덮어쓰지 않는다.
+예외가 발생하면 큐가 멈춘다. proposal/Q 또는 G1을 자동 실행/통과 처리하지 않는다.
+decoder와 표현 단계 모두 `--input-checkpoint`/`--input-sha256` 및 새로운 `--output`으로
+재개할 수 있으며 `--updates`는 추가 횟수가 아닌 해당 단계의 총 종료 update이다.
+
+`SMOKE=1 DECODER_UPDATES=1 REPRESENTATION_UPDATES=1 BATCH_SIZE=2`는
+CPU에서 bounded 연결 검사만 한다. smoke 자산은 정식 학습 donor로 사용할 수 없다.
+
+### 이미 학습된 donor가 있는 머신
 
 아래 명령은 실제 donor/data가 있는 호스트에서 사용할 명세이며, 이 문서 작성 중
 서버에 제출하거나 정식 학습을 시작한 명령이 아니다.
@@ -205,3 +291,7 @@ sampler/resume, train-only root 통계, 20/5 commitment와 3-stage CLI smoke가 
 정식 20k/seed 학습, 실제 donor import, GPU stack, OGBench G1 rollout/성공률은
 아직 검증하지 않았다. synthetic CLI/수치 검증을 실제 환경 성공으로 보고하지 않는다.
 균형 트리 백업, learned switching, prior/code KL, online data 추가는 구현하지 않았다.
+
+추가 from-scratch 검증은 tests/test_action_decoder.py에 둔다. 완전한 5-step tail 사용,
+action-only 짧은 encoder, 초기 checkpoint 없는 준비 학습, optimizer/RNG exact resume,
+준비 자산의 실제 representation handoff 및 decoder/normalizer 동결을 검사한다.

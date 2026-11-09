@@ -78,6 +78,10 @@ def run_train(args):
         raise ValueError('smoke permits at most three updates per stage')
     if not args.smoke and jax.default_backend() != 'gpu':
         raise RuntimeError('formal training requires GPU; CPU is for bounded --smoke checks')
+    if args.stage == 'decoder':
+        from skill_extensions.action_decoder import run_decoder_train
+
+        return run_decoder_train(args)
     output = Path(args.output)
     if output.exists():
         raise FileExistsError('use a fresh output directory, including for resumed runs')
@@ -225,7 +229,9 @@ def sampler_diagnostic(agent, sampler, batch_size):
 
 def run():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--stage', required=True, choices=('representation', 'proposal', 'value'))
+    parser.add_argument(
+        '--stage', required=True, choices=('decoder', 'representation', 'proposal', 'value')
+    )
     parser.add_argument('--train-npz', required=True, type=Path)
     parser.add_argument('--validation-npz', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)

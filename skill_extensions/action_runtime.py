@@ -22,6 +22,7 @@ SOURCE_FILES = (
     'skill_extensions/action_policy.py',
     'action_skill_main.py',
     'skill_extensions/action_diagnostics.py',
+    'skill_extensions/action_decoder.py',
     'skill_extensions/models.py',
     'utils/networks.py',
     'utils/datasets.py',
@@ -50,9 +51,13 @@ def import_decoder(path, expected_sha256, *, allow_smoke=False):
         raise ValueError('decoder donor SHA256 mismatch')
     with Path(path).open('rb') as stream:
         donor = pickle.load(stream)
-    if donor.get('format') != 'pathbridger-variable-skill-v1':
-        raise ValueError('unsupported donor format; export a legacy skill checkpoint explicitly')
-    if donor.get('representation_step', 0) < 1 or (donor.get('smoke') and not allow_smoke):
+    kind = donor.get('format')
+    if kind not in ('pathbridger-variable-skill-v1', 'pathbridger-action-decoder-v1'):
+        raise ValueError('unsupported donor format; use an explicit skill or action-decoder asset')
+    step = donor.get(
+        'decoder_step' if kind == 'pathbridger-action-decoder-v1' else 'representation_step', 0
+    )
+    if step < 1 or (donor.get('smoke') and not allow_smoke):
         raise ValueError('formal decoder donor must be a trained non-smoke representation')
     config = donor['config']
     # Parent encoder, splitter, Q, proposal, and optimizer state are deliberately not copied.
@@ -62,12 +67,17 @@ def import_decoder(path, expected_sha256, *, allow_smoke=False):
         'scale': np.asarray(donor['scale'], np.float32),
         'latent_dim': config['latent_dim'],
         'width': config['width'],
-        'max_duration': max(config['durations']),
+        'max_duration': (
+            config['max_duration']
+            if kind == 'pathbridger-action-decoder-v1'
+            else max(config['durations'])
+        ),
         'observation_dim': donor['observation_dim'],
         'action_dim': donor['action_dim'],
         'donor_sha256': expected_sha256,
         'donor_smoke': bool(donor.get('smoke')),
-        'donor_representation_step': donor['representation_step'],
+        'donor_representation_step': step,
+        'donor_format': kind,
     }
     asset['decoder_parameter_sha256'] = tree_digest(asset['params'])
     return asset
