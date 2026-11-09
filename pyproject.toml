@@ -38,6 +38,7 @@ pathbridger-train = "main:run"
 pathbridger-eval = "evaluate:run"
 pathbridger-infer = "inference:run"
 pathbridger-skill = "skill_main:run"
+pathbridger-action-skill = "action_skill_main:run"
 
 [project.optional-dependencies]
 tracking = ["wandb"]
@@ -57,7 +58,7 @@ combine-as-imports = true
 quote-style = "single"
 
 [tool.setuptools]
-py-modules = ["main", "evaluate", "inference", "skill_main"]
+py-modules = ["main", "evaluate", "inference", "skill_main", "action_skill_main"]
 
 [tool.setuptools.packages.find]
 where = ["."]

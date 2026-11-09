@@ -1,0 +1,8 @@
+# Independently exercised CPU contract-check stack, not the paper GPU environment.
+jax==0.4.35
+jaxlib==0.4.35
+flax==0.10.2
+optax==0.2.4
+numpy==2.5.4
+ml-collections==1.0.0
+pytest==8.4.2
