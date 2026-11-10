@@ -37,12 +37,10 @@ Paper = "https://arxiv.org/abs/2608.29061"
 pathbridger-train = "main:run"
 pathbridger-eval = "evaluate:run"
 pathbridger-infer = "inference:run"
-pathbridger-skill = "skill_main:run"
-pathbridger-action-skill = "action_skill_main:run"
 
 [project.optional-dependencies]
 tracking = ["wandb"]
-dev = ["build>=1.2", "ruff==0.17.2", "pytest>=7"]
+dev = ["build>=1.2", "ruff==0.17.2"]
 
 [tool.ruff]
 target-version = "py310"
@@ -58,15 +56,14 @@ combine-as-imports = true
 quote-style = "single"
 
 [tool.setuptools]
-py-modules = ["main", "evaluate", "inference", "skill_main", "action_skill_main"]
+py-modules = ["main", "evaluate", "inference"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agents*", "configs*", "envs*", "utils*", "skill_extensions*", "skill_configs*"]
+include = ["agents*", "configs*", "envs*", "utils*"]
 
 [tool.setuptools.package-data]
 configs = ["*.yaml"]
-skill_configs = ["*.json"]
 
 [tool.setuptools.data-files]
 "share/pathbridger/assets" = ["assets/architecture.jpg"]
